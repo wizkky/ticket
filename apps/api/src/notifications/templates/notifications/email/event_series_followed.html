@@ -1,0 +1,13 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<p>{% blocktranslate with follower=context.follower_name series=context.event_series_name %}<strong>{{ follower }}</strong> started following <strong>{{ series }}</strong>.{% endblocktranslate %}</p>
+
+<div class="card">
+    <h3 style="margin-top: 0;">{% trans "Follower Details" %}</h3>
+    <div class="info-row"><span class="label">{% trans "Name:" %}</span> {{ context.follower_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Email:" %}</span> {{ context.follower_email }}</div>
+    <div class="info-row"><span class="label">{% trans "Series:" %}</span> {{ context.event_series_name }}</div>
+</div>
+{% endblock %}

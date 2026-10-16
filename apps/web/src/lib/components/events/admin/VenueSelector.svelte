@@ -1,0 +1,243 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { createQuery } from '@tanstack/svelte-query';
+	import { organizationadminvenuesListVenues } from '$lib/api/generated/sdk.gen';
+	import type { VenueDetailSchema, VenueSchema } from '$lib/api/generated/types.gen';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { Building2, ChevronDown, X, MapPin, Users } from '@lucide/svelte';
+	import { cn } from '$lib/utils/cn';
+
+	interface Props {
+		organizationSlug: string;
+		selectedVenue: VenueSchema | null;
+		onSelect: (venue: VenueDetailSchema | null) => void;
+		disabled?: boolean;
+		class?: string;
+	}
+
+	const {
+		organizationSlug,
+		selectedVenue,
+		onSelect,
+		disabled = false,
+		class: className
+	}: Props = $props();
+
+	const accessToken = $derived(authStore.accessToken);
+
+	// Dropdown state
+	let isOpen = $state(false);
+	let searchQuery = $state('');
+
+	// Fetch venues from the organization
+	const venuesQuery = createQuery<VenueDetailSchema[]>(() => ({
+		queryKey: ['organization-venues', organizationSlug],
+		queryFn: async () => {
+			const response = await organizationadminvenuesListVenues({
+				path: { slug: organizationSlug },
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				throw new Error('Failed to load venues');
+			}
+
+			return response.data?.results || [];
+		},
+		enabled: !!accessToken
+	}));
+
+	// Filter venues based on search query
+	const filteredVenues = $derived.by(() => {
+		const venues = venuesQuery.data || [];
+		if (!searchQuery.trim()) return venues;
+
+		const query = searchQuery.toLowerCase().trim();
+		return venues.filter(
+			(venue) =>
+				venue.name.toLowerCase().includes(query) ||
+				venue.address?.toLowerCase().includes(query) ||
+				venue.city?.name?.toLowerCase().includes(query)
+		);
+	});
+
+	function handleSelect(venue: VenueDetailSchema | null) {
+		onSelect(venue);
+		isOpen = false;
+		searchQuery = '';
+	}
+
+	function handleClear(e: Event) {
+		e.stopPropagation();
+		onSelect(null);
+	}
+
+	function handleKeydown(e: KeyboardEvent) {
+		if (e.key === 'Escape') {
+			isOpen = false;
+		}
+	}
+
+	// Format city display
+	function formatCity(venue: VenueDetailSchema): string {
+		if (!venue.city) return venue.address || '';
+		const parts = [venue.city.name];
+		if (venue.city.country) parts.push(venue.city.country);
+		if (venue.address) return `${venue.address}, ${parts.join(', ')}`;
+		return parts.join(', ');
+	}
+</script>
+
+<svelte:window onkeydown={handleKeydown} />
+
+<div class={cn('relative', className)}>
+	<label class="mb-1.5 block text-sm font-medium">
+		<span class="flex items-center gap-2">
+			<Building2 class="h-4 w-4" aria-hidden="true" />
+			{m['venueSelector.label']()}
+		</span>
+	</label>
+
+	<!-- Trigger -->
+	<div
+		class={cn(
+			'flex h-10 w-full items-center rounded-md border border-input bg-background text-sm transition-colors',
+			'focus-within:border-ring focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2',
+			disabled && 'cursor-not-allowed opacity-50',
+			isOpen && 'border-ring ring-2 ring-ring ring-offset-2'
+		)}
+	>
+		<button
+			type="button"
+			onclick={() => (isOpen = !isOpen)}
+			{disabled}
+			aria-expanded={isOpen}
+			aria-haspopup="listbox"
+			class="flex h-full min-w-0 flex-1 items-center justify-between px-3 py-2 text-left focus:outline-none disabled:cursor-not-allowed"
+		>
+			{#if selectedVenue}
+				<span class="flex items-center gap-2 truncate">
+					<Building2 class="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+					<span class="truncate font-medium">{selectedVenue.name}</span>
+				</span>
+			{:else}
+				<span class="text-muted-foreground">
+					{m['venueSelector.placeholder']()}
+				</span>
+				<ChevronDown class="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
+			{/if}
+		</button>
+		{#if selectedVenue}
+			<button
+				type="button"
+				onclick={handleClear}
+				{disabled}
+				class="ml-2 mr-3 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:cursor-not-allowed"
+				aria-label={m['venueSelector.clear']()}
+			>
+				<X class="h-4 w-4" />
+			</button>
+		{/if}
+	</div>
+
+	<!-- Dropdown -->
+	{#if isOpen}
+		<div
+			class="absolute z-50 mt-1 w-full rounded-md border bg-popover shadow-lg"
+			role="listbox"
+			aria-label={m['venueSelector.selectVenue']()}
+		>
+			<!-- Search input -->
+			<div class="border-b p-2">
+				<input
+					type="search"
+					bind:value={searchQuery}
+					placeholder={m['venueSelector.searchPlaceholder']()}
+					class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+				/>
+			</div>
+
+			<!-- Venue list -->
+			<div class="max-h-64 overflow-y-auto p-1">
+				{#if venuesQuery.isLoading}
+					<div class="flex items-center justify-center py-6">
+						<div
+							class="h-5 w-5 animate-spin rounded-full border-2 border-primary border-t-transparent"
+						></div>
+					</div>
+				{:else if venuesQuery.error}
+					<div class="py-4 text-center text-sm text-destructive">
+						{m['venueSelector.error']()}
+					</div>
+				{:else if filteredVenues.length === 0}
+					<div class="py-4 text-center text-sm text-muted-foreground">
+						{searchQuery ? m['venueSelector.noResults']() : m['venueSelector.empty']()}
+					</div>
+				{:else}
+					<!-- Option to clear selection -->
+					{#if selectedVenue}
+						<button
+							type="button"
+							onclick={() => handleSelect(null)}
+							class="flex w-full items-center gap-2 rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent"
+							role="option"
+							aria-selected="false"
+						>
+							<X class="h-4 w-4" aria-hidden="true" />
+							{m['venueSelector.clearSelection']()}
+						</button>
+					{/if}
+
+					{#each filteredVenues as venue (venue.id)}
+						<button
+							type="button"
+							onclick={() => handleSelect(venue)}
+							class={cn(
+								'flex w-full flex-col gap-1 rounded-md px-3 py-2 text-left text-sm hover:bg-accent',
+								selectedVenue?.id === venue.id && 'bg-accent'
+							)}
+							role="option"
+							aria-selected={selectedVenue?.id === venue.id}
+						>
+							<span class="flex items-center gap-2 font-medium">
+								<Building2 class="h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
+								{venue.name}
+							</span>
+							<span class="flex items-center gap-4 text-xs text-muted-foreground">
+								{#if venue.city || venue.address}
+									<span class="flex items-center gap-1">
+										<MapPin class="h-3 w-3" aria-hidden="true" />
+										{formatCity(venue)}
+									</span>
+								{/if}
+								{#if venue.capacity}
+									<span class="flex items-center gap-1">
+										<Users class="h-3 w-3" aria-hidden="true" />
+										{venue.capacity}
+									</span>
+								{/if}
+							</span>
+						</button>
+					{/each}
+				{/if}
+			</div>
+		</div>
+	{/if}
+
+	<p class="mt-1 text-xs text-muted-foreground">
+		{m['venueSelector.help']()}
+	</p>
+</div>
+
+<!-- Click outside to close -->
+{#if isOpen}
+	<button
+		type="button"
+		class="fixed inset-0 z-40 cursor-default bg-transparent"
+		onclick={() => (isOpen = false)}
+		aria-hidden="true"
+		tabindex="-1"
+	></button>
+{/if}

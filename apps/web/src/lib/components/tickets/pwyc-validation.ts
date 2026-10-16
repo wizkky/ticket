@@ -1,0 +1,84 @@
+/**
+ * Pure PWYC amount validation for the purchase dialogs.
+ *
+ * No runes here — plain functions so this stays unit-testable.
+ */
+import * as m from '$lib/paraglide/messages.js';
+import type { TierSchemaWithId } from '$lib/types/tickets';
+import { formatMoney } from '$lib/utils/format';
+
+export type PwycValidationError = 'empty' | 'invalid' | 'below_min' | 'above_max';
+
+export interface PwycValidation {
+	valid: boolean;
+	error: PwycValidationError | null;
+}
+
+export interface PwycBounds {
+	minAmount: number;
+	maxAmount: number | null;
+}
+
+/**
+ * Derives the buyer-facing PWYC amount bounds for a tier: min falls back to
+ * the tier's flat price when no explicit `pwyc_min` is set (and to 1 if
+ * neither parses), max is the parsed `pwyc_max` or null when absent/invalid.
+ */
+export function pwycBounds(
+	tier: Pick<TierSchemaWithId, 'price' | 'pwyc_min' | 'pwyc_max'>
+): PwycBounds {
+	const parsedMin = parseFloat(tier.pwyc_min ?? tier.price);
+	const minAmount = Number.isNaN(parsedMin) ? 1 : parsedMin;
+
+	const parsedMax = tier.pwyc_max != null ? parseFloat(tier.pwyc_max) : NaN;
+	const maxAmount = Number.isNaN(parsedMax) ? null : parsedMax;
+
+	return { minAmount, maxAmount };
+}
+
+export function validatePwycAmount(
+	raw: string,
+	minAmount: number,
+	maxAmount: number | null
+): PwycValidation {
+	const trimmed = raw.trim();
+	if (!trimmed) return { valid: false, error: 'empty' };
+	const value = parseFloat(trimmed);
+	if (isNaN(value)) return { valid: false, error: 'invalid' };
+	if (value < minAmount) return { valid: false, error: 'below_min' };
+	if (maxAmount !== null && value > maxAmount) return { valid: false, error: 'above_max' };
+	return { valid: true, error: null };
+}
+
+/** Quick-amount suggestions: min/midpoint/max, or min multiples when uncapped. */
+export function pwycSuggestions(minAmount: number, maxAmount: number | null): number[] {
+	if (maxAmount !== null) {
+		return [minAmount, Math.round((minAmount + maxAmount) / 2), maxAmount];
+	}
+	return [minAmount, minAmount * 2, minAmount * 3];
+}
+
+/** Localized inline error for an invalid PWYC amount. */
+export function pwycErrorMessage(
+	error: PwycValidationError | null,
+	currency: string,
+	minAmount: number,
+	maxAmount: number | null
+): string {
+	switch (error) {
+		case 'empty':
+			return m['ticketConfirmationDialog.errorEnterAmount']();
+		case 'invalid':
+			return m['ticketConfirmationDialog.errorValidNumber']();
+		case 'below_min':
+			return m['ticketConfirmationDialog.errorMinAmount']({
+				amount: formatMoney(minAmount, currency)
+			});
+		case 'above_max':
+			return m['ticketConfirmationDialog.errorMaxAmount']({
+				amount: formatMoney(maxAmount, currency)
+			});
+		default:
+			return m['ticketConfirmationDialog.errorInvalidAmount']();
+	}
+}

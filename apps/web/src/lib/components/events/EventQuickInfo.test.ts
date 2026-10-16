@@ -1,0 +1,307 @@
+import { render, screen } from '@testing-library/svelte';
+import { describe, it, expect } from 'vitest';
+import EventQuickInfo from './EventQuickInfo.svelte';
+import type { EventDetailSchema } from '$lib/api/generated/types.gen';
+
+// Mock event data
+const mockEvent: EventDetailSchema = {
+	id: 'test-event-1',
+	name: 'Test Event',
+	slug: 'test-event',
+	event_type: 'public',
+	visibility: 'public',
+	status: 'open',
+	organization: {
+		id: 'org-1',
+		name: 'Test Organization',
+		slug: 'test-org',
+		city: { id: 1, name: 'San Francisco', country: 'USA' },
+		description: 'Test organization',
+		logo: null,
+		cover_art: null,
+		website: null,
+		social_links: {},
+		created_at: '2025-01-01T00:00:00Z'
+	},
+	city: {
+		id: 1,
+		name: 'San Francisco',
+		country: 'USA'
+	},
+	start: '2025-10-25T19:00:00Z',
+	end: '2025-10-25T22:00:00Z',
+	description: 'Test event description',
+	invitation_message: null,
+	max_attendees: 100,
+	attendee_count: 45,
+	rsvp_before: '2025-10-24T19:00:00Z',
+	address: '123 Test St',
+	tags: ['networking', 'tech'],
+	logo: null,
+	cover_art: null,
+	requires_ticket: false,
+	potluck_open: false,
+	waitlist_open: false,
+	event_series: null
+};
+
+describe('EventQuickInfo', () => {
+	it('renders with required props', () => {
+		render(EventQuickInfo, { props: { event: mockEvent } });
+
+		// Check that event date is rendered
+		expect(screen.getByText(/Oct 25/i)).toBeInTheDocument();
+
+		// Check that location is rendered
+		expect(screen.getByText('San Francisco, USA')).toBeInTheDocument();
+	});
+
+	it('displays event type correctly', () => {
+		render(EventQuickInfo, { props: { event: mockEvent } });
+		expect(screen.getByText('Public Event')).toBeInTheDocument();
+	});
+
+	it('displays private event type', () => {
+		const privateEvent = { ...mockEvent, event_type: 'private' as const };
+		render(EventQuickInfo, { props: { event: privateEvent } });
+		expect(screen.getByText('Invitation only')).toBeInTheDocument();
+	});
+
+	it('displays members-only event type', () => {
+		const membersEvent = { ...mockEvent, event_type: 'members-only' as const };
+		render(EventQuickInfo, { props: { event: membersEvent } });
+		expect(screen.getByText('Members Only')).toBeInTheDocument();
+	});
+
+	it('displays capacity information when max_attendees is set', () => {
+		render(EventQuickInfo, { props: { event: mockEvent } });
+		expect(screen.getByText('45 / 100 spots taken')).toBeInTheDocument();
+	});
+
+	it('does not display capacity when max_attendees is not set', () => {
+		const eventWithoutCapacity = { ...mockEvent, max_attendees: 0 };
+		render(EventQuickInfo, { props: { event: eventWithoutCapacity } });
+		expect(screen.queryByText(/spots taken/i)).not.toBeInTheDocument();
+	});
+
+	// #825: `max_attendees` / `attendee_count` are withheld (null) when the
+	// organizer hides capacity or the attendee count.
+	it('does not display capacity when max_attendees is withheld', () => {
+		const eventWithheldCapacity = { ...mockEvent, max_attendees: null };
+		render(EventQuickInfo, { props: { event: eventWithheldCapacity } });
+		expect(screen.queryByText(/spots taken/i)).not.toBeInTheDocument();
+		// Falls back to the raw count, which is still disclosed here
+		expect(screen.getByText('45 attending')).toBeInTheDocument();
+	});
+
+	it('does not display capacity when attendee_count is withheld', () => {
+		const eventWithheldCount = { ...mockEvent, attendee_count: null };
+		render(EventQuickInfo, { props: { event: eventWithheldCount } });
+		expect(screen.queryByText(/spots taken/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/attending/i)).not.toBeInTheDocument();
+		expect(screen.queryByText('Limited spots remaining')).not.toBeInTheDocument();
+	});
+
+	it('displays warning when capacity is near limit', () => {
+		const nearCapacityEvent = { ...mockEvent, max_attendees: 100, attendee_count: 95 };
+		render(EventQuickInfo, { props: { event: nearCapacityEvent } });
+
+		expect(screen.getByText('95 / 100 spots taken')).toBeInTheDocument();
+		expect(screen.getByText('Limited spots remaining')).toBeInTheDocument();
+	});
+
+	// #814: the relative phrase carries its own preposition ("in 7 days"), so it
+	// must stand alone under the "RSVP Deadline" label — never composed into an
+	// "RSVP by {deadline}" string, which doubled the preposition in every locale.
+	it('displays RSVP deadline when rsvp_before is set in the future', () => {
+		// Use a future deadline relative to "now" — past deadlines render "RSVP closed"
+		const futureDeadline = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+		const eventWithFutureDeadline = { ...mockEvent, rsvp_before: futureDeadline };
+		render(EventQuickInfo, { props: { event: eventWithFutureDeadline } });
+		expect(screen.getByText('RSVP Deadline')).toBeInTheDocument();
+		// The relative phrase is the whole content of its own element — nothing
+		// prefixes it (a few ms of drift floors "7 days" to 6, hence the \d+).
+		expect(screen.getByText(/^in \d+ days$/)).toBeInTheDocument();
+		expect(screen.queryByText(/RSVP by/i)).not.toBeInTheDocument();
+	});
+
+	it('shows the absolute cutoff alongside the relative deadline', () => {
+		const eventWithFutureDeadline = {
+			...mockEvent,
+			rsvp_before: '2099-10-24T19:00:00Z',
+			timezone: 'UTC'
+		};
+		const { container } = render(EventQuickInfo, { props: { event: eventWithFutureDeadline } });
+
+		// Textual month, never a numeric one (no DD/MM vs MM/DD ambiguity)
+		expect(screen.getByText(/Oct 24, 2099/)).toBeInTheDocument();
+		// The machine-readable instant rides on a <time datetime>
+		expect(container.querySelector('time[datetime="2099-10-24T19:00:00Z"]')).toBeInTheDocument();
+	});
+
+	it('displays "RSVP closed" when rsvp_before is in the past', () => {
+		const pastDeadline = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+		const eventWithPastDeadline = { ...mockEvent, rsvp_before: pastDeadline };
+		render(EventQuickInfo, { props: { event: eventWithPastDeadline } });
+		expect(screen.getByText('RSVP closed')).toBeInTheDocument();
+		// The exact cutoff stays discoverable even once the deadline has passed
+		expect(screen.getByText('RSVP Deadline')).toBeInTheDocument();
+	});
+
+	it('does not display RSVP deadline when rsvp_before is not set', () => {
+		const eventWithoutDeadline = { ...mockEvent, rsvp_before: null };
+		render(EventQuickInfo, { props: { event: eventWithoutDeadline } });
+		expect(screen.queryByText(/RSVP/i)).not.toBeInTheDocument();
+	});
+
+	it('shows the address when there is no city', () => {
+		const eventWithoutCity = { ...mockEvent, city: null };
+		render(EventQuickInfo, { props: { event: eventWithoutCity } });
+		expect(screen.getByText('123 Test St')).toBeInTheDocument();
+	});
+
+	it('shows "Location TBD" when there is no city and no address', () => {
+		const eventWithoutLocation = { ...mockEvent, city: null, address: null };
+		render(EventQuickInfo, { props: { event: eventWithoutLocation } });
+		expect(screen.getByText('Location TBD')).toBeInTheDocument();
+	});
+
+	it('handles city without country', () => {
+		const eventWithCityOnly = {
+			...mockEvent,
+			city: { id: 1, name: 'San Francisco', country: null }
+		};
+		render(EventQuickInfo, { props: { event: eventWithCityOnly } });
+		expect(screen.getByText('San Francisco')).toBeInTheDocument();
+		expect(screen.queryByText(/USA/)).not.toBeInTheDocument();
+	});
+
+	it('applies custom className', () => {
+		const { container } = render(EventQuickInfo, {
+			props: { event: mockEvent, class: 'custom-class' }
+		});
+		const quickInfoDiv = container.querySelector('.custom-class');
+		expect(quickInfoDiv).toBeInTheDocument();
+	});
+
+	it('renders in compact variant by default', () => {
+		const { container } = render(EventQuickInfo, { props: { event: mockEvent } });
+		const quickInfoDiv = container.querySelector('.space-y-2.text-sm');
+		expect(quickInfoDiv).toBeInTheDocument();
+	});
+
+	it('renders in detailed variant when specified', () => {
+		const { container } = render(EventQuickInfo, {
+			props: { event: mockEvent, variant: 'detailed' }
+		});
+		const quickInfoDiv = container.querySelector('.space-y-3.text-base');
+		expect(quickInfoDiv).toBeInTheDocument();
+	});
+
+	it('has proper ARIA structure', () => {
+		render(EventQuickInfo, { props: { event: mockEvent } });
+
+		// Check for list structure
+		const list = screen.getByRole('list', { name: /event quick information/i });
+		expect(list).toBeInTheDocument();
+
+		// Check for list items
+		const items = screen.getAllByRole('listitem');
+		expect(items.length).toBeGreaterThan(0);
+	});
+
+	it('uses semantic time elements', () => {
+		const { container } = render(EventQuickInfo, { props: { event: mockEvent } });
+
+		// Check for time element with datetime attribute
+		const timeElements = container.querySelectorAll('time[datetime]');
+		expect(timeElements.length).toBeGreaterThan(0);
+	});
+
+	it('marks icons as decorative with aria-hidden', () => {
+		const { container } = render(EventQuickInfo, { props: { event: mockEvent } });
+
+		// All SVG icons should have aria-hidden="true"
+		const icons = container.querySelectorAll('svg[aria-hidden="true"]');
+		expect(icons.length).toBeGreaterThan(0);
+	});
+});
+
+// #690: capacity/count may be withheld (#825), but `is_full` is always public.
+describe('EventQuickInfo — capacity disclosure', () => {
+	it('shows "Event full" when the numbers are withheld but is_full is set', () => {
+		const event = { ...mockEvent, max_attendees: null, attendee_count: null, is_full: true };
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.getByText(/Event full/i)).toBeInTheDocument();
+	});
+
+	it('omits the capacity row when the numbers are withheld and it is not full', () => {
+		const event = { ...mockEvent, max_attendees: null, attendee_count: null, is_full: false };
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.queryByText(/Event full/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/spots taken/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/attending/i)).not.toBeInTheDocument();
+	});
+
+	it('prefers the real tally over the is_full fallback when both are known', () => {
+		const event = { ...mockEvent, max_attendees: 50, attendee_count: 50, is_full: true };
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.getByText(/50 \/ 50 spots taken/i)).toBeInTheDocument();
+	});
+});
+
+// #830 (BE #869): virtual attendance is a per-event fact buyers see up front.
+describe('EventQuickInfo — virtual events', () => {
+	it('shows the virtual-event row when is_virtual is set', () => {
+		const event = { ...mockEvent, is_virtual: true };
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.getByText(/Virtual event/i)).toBeInTheDocument();
+	});
+
+	it('omits the virtual-event row for physical events', () => {
+		render(EventQuickInfo, { props: { event: mockEvent } });
+		expect(screen.queryByText(/Virtual event/i)).not.toBeInTheDocument();
+	});
+
+	it('renders a URL address as a clickable join link and keeps it out of the location line', () => {
+		const event = { ...mockEvent, is_virtual: true, address: 'https://meet.example.com/room/42' };
+		render(EventQuickInfo, { props: { event } });
+		const link = screen.getByRole('link', { name: /Open event link/i });
+		expect(link).toHaveAttribute('href', 'https://meet.example.com/room/42');
+		expect(link).toHaveAttribute('target', '_blank');
+		expect(link).toHaveAttribute('rel', expect.stringContaining('noopener'));
+		// The location line falls back to the city — never the raw URL as text.
+		expect(screen.getByText('San Francisco, USA')).toBeInTheDocument();
+	});
+
+	it('keeps a plain-text address as location and renders no join link', () => {
+		const event = { ...mockEvent, is_virtual: true, address: 'Backstage entrance, Hall 2' };
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.queryByRole('link', { name: /Open event link/i })).not.toBeInTheDocument();
+		expect(screen.getByText('Backstage entrance, Hall 2')).toBeInTheDocument();
+	});
+
+	it('never linkifies a javascript: address', () => {
+		const event = { ...mockEvent, is_virtual: true, address: 'javascript:alert(1)' };
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.queryByRole('link', { name: /Open event link/i })).not.toBeInTheDocument();
+	});
+
+	it('drops the location row when only a join link remains', () => {
+		const event = {
+			...mockEvent,
+			is_virtual: true,
+			city: null,
+			address: 'https://meet.example.com/room/42'
+		};
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.getByRole('link', { name: /Open event link/i })).toBeInTheDocument();
+		expect(screen.queryByText(/Location TBD/i)).not.toBeInTheDocument();
+	});
+
+	it('does not linkify a URL address on a physical event', () => {
+		const event = { ...mockEvent, is_virtual: false, address: 'https://example.com/not-a-place' };
+		render(EventQuickInfo, { props: { event } });
+		expect(screen.queryByRole('link', { name: /Open event link/i })).not.toBeInTheDocument();
+	});
+});

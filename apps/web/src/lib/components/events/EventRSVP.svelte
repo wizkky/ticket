@@ -1,0 +1,604 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { createMutation, useQueryClient } from '@tanstack/svelte-query';
+	import { eventpublicattendanceRsvpEvent } from '$lib/api/generated/sdk.gen';
+	import type { UserEventStatus } from '$lib/utils/eligibility';
+	import {
+		isRSVP,
+		isEligibility,
+		isUserStatusResponse,
+		isEligibilityRefusal,
+		getEligibilityRefusalMessage
+	} from '$lib/utils/eligibility';
+	import { extractApiErrorDetail, isErrorDetail } from '$lib/utils/api-error-detail';
+	import { cn } from '$lib/utils/cn';
+	import RSVPButtons from './RSVPButtons.svelte';
+	import RsvpNoteDialog from './RsvpNoteDialog.svelte';
+	import ConfirmDialog from '../common/ConfirmDialog.svelte';
+	import IneligibilityMessage from './IneligibilityMessage.svelte';
+	import { Check, AlertCircle } from '@lucide/svelte';
+	import { page } from '$app/state';
+	import { invalidateAll } from '$app/navigation';
+	import { resolve } from '$app/paths';
+
+	import type {
+		EventDetailSchema,
+		EventRsvpSchema,
+		EventTokenSchema
+	} from '$lib/api/generated/types.gen';
+
+	interface Props {
+		eventId: string;
+		eventName: string;
+		userStatus: UserEventStatus | null;
+		isAuthenticated: boolean;
+		/**
+		 * Whether the event requires a ticket. Non-null on EventDetailSchema but
+		 * `boolean | null` on list/summary schemas, where `null` means unknown.
+		 * The RSVP gate fails closed on null (treats it as ticketed).
+		 */
+		requiresTicket: boolean | null;
+		event?: EventDetailSchema;
+		eventTokenDetails?: EventTokenSchema | null;
+		onGuestRsvpClick?: () => void;
+		/** Refresh eligibility after an invitation request succeeds (the gate
+		 * renders from parent-owned userStatus, which nothing else updates). */
+		onInvitationRequestSuccess?: () => void;
+		onWhitelistRequestSuccess?: () => void;
+		class?: string;
+	}
+
+	let {
+		eventId,
+		eventName,
+		userStatus = $bindable(),
+		isAuthenticated,
+		requiresTicket,
+		event,
+		eventTokenDetails,
+		onGuestRsvpClick,
+		onInvitationRequestSuccess,
+		onWhitelistRequestSuccess,
+		class: className
+	}: Props = $props();
+
+	const queryClient = useQueryClient();
+
+	// Store initial status for reset functionality
+	const initialStatus = $state<UserEventStatus | null>(userStatus);
+	let showSuccess = $state(false);
+	let successMessage = $state('');
+	let successType = $state<'yes' | 'maybe' | 'no'>('yes');
+	let errorMessage = $state<string | null>(null);
+	// Track the user's RSVP answer separately (backend only returns status, not the answer)
+	let userAnswer = $state<'yes' | 'no' | 'maybe' | null>(null);
+	// Warning dialog state
+	let showWarningDialog = $state(false);
+	let pendingAnswer = $state<'yes' | 'no' | 'maybe' | null>(null);
+	let claimedItemsCount = $state<number>(0);
+
+	// RSVP-note capture (only when the organizer opted in on the event)
+	const acceptsNotes = $derived(event?.accept_rsvp_notes === true);
+	let showNoteDialog = $state(false);
+	let noteDialogAnswer = $state<'yes' | 'no' | 'maybe'>('yes');
+	// Set when the organizer disabled notes mid-flight and the RSVP was
+	// re-submitted without the note (see the mutation's 400 fallback).
+	let noteNotSaved = $state(false);
+
+	// Last known stored note — from my-status on load, from the RSVP response
+	// after a submit (onSuccess writes it back into userStatus). Prefilling it
+	// in the dialog is what prevents accidental clears: every submission
+	// overwrites the stored note wholesale.
+	const currentNote = $derived.by(() => {
+		if (!userStatus) return '';
+		if (isUserStatusResponse(userStatus)) return userStatus.rsvp?.note ?? '';
+		if (isRSVP(userStatus)) return userStatus.note ?? '';
+		return '';
+	});
+
+	/**
+	 * The RSVP endpoint declares `EventUserEligibility | ErrorDetail` at 400
+	 * (backend #824). The eligibility branch carries `allowed`/`reason_code`; the
+	 * `{detail}` branch is what a note sent to an event that no longer accepts
+	 * notes produces (alongside capacity and RSVP-note rejections). Detect the
+	 * latter by shape, not wording — and never mistake an eligibility refusal for
+	 * it, which would silently re-submit the RSVP the backend just refused.
+	 */
+	function isNoteRejection(error: unknown): boolean {
+		return isErrorDetail(error) && !isEligibilityRefusal(error);
+	}
+
+	// Mutation: RSVP to event
+	const rsvpMutation = createMutation(() => ({
+		mutationFn: async ({ answer, note }: { answer: 'yes' | 'no' | 'maybe'; note?: string }) => {
+			let response = await eventpublicattendanceRsvpEvent({
+				path: { event_id: eventId, answer },
+				...(note !== undefined ? { body: { note } } : {})
+			});
+
+			// The organizer disabled notes mid-flight: the RSVP itself is still
+			// valid, so retry once without the note and tell the user it was
+			// dropped rather than failing the whole action.
+			if (note !== undefined && response.error && isNoteRejection(response.error)) {
+				noteNotSaved = true;
+				response = await eventpublicattendanceRsvpEvent({
+					path: { event_id: eventId, answer }
+				});
+			}
+
+			if (response.error || !response.data) {
+				// Narrow the 400 union before reading it. An eligibility refusal is
+				// kept as `cause` so onError can re-seat it into `userStatus` and let
+				// the ineligibility CTA re-render with the backend's next_step.
+				if (isEligibilityRefusal(response.error)) {
+					const reason =
+						getEligibilityRefusalMessage(response.error) ?? m['eventRSVP.submitFailed']();
+					throw new Error(reason, { cause: response.error });
+				}
+				throw new Error(extractApiErrorDetail(response.error) ?? m['eventRSVP.submitFailed']());
+			}
+
+			return response.data;
+		},
+		onMutate: async ({ answer }: { answer: 'yes' | 'no' | 'maybe'; note?: string }) => {
+			// Clear any previous errors
+			errorMessage = null;
+			showSuccess = false;
+
+			// Optimistic update: set to the user's answer
+			const previousStatus = userStatus;
+
+			// Set optimistic status with the user's answer
+			userStatus = {
+				event_id: eventId,
+				status: answer
+			} as { event_id: string; status: 'yes' | 'no' | 'maybe' };
+
+			return { previousStatus };
+		},
+		onSuccess: (
+			data: EventRsvpSchema,
+			{ answer }: { answer: 'yes' | 'no' | 'maybe'; note?: string }
+		) => {
+			// Determine if this is a new RSVP or a change
+			const wasAttending = userStatus && isRSVP(userStatus) && userStatus.status === 'yes';
+			const isNowAttending = answer === 'yes';
+
+			// Update local status with server response (backend returns the user's
+			// answer in status field, and echoes the stored note — which keeps the
+			// derived currentNote prefill fresh for the next dialog open)
+			userStatus = data;
+
+			// Store the user's answer and type for styling
+			userAnswer = data.status;
+			successType = data.status;
+
+			// Update event attendee count if event object is provided.
+			// The count is withheld (`null`) when the event hides it (#825); there
+			// is no baseline to adjust in that case, and arithmetic on it would
+			// produce NaN, so leave it withheld.
+			const currentCount = event?.attendee_count;
+			if (event && currentCount != null) {
+				if (!wasAttending && isNowAttending) {
+					// User was not attending, now is attending: +1
+					event.attendee_count = currentCount + 1;
+				} else if (wasAttending && !isNowAttending) {
+					// User was attending, now is not: -1
+					event.attendee_count = Math.max(0, currentCount - 1);
+				}
+			}
+
+			// Show success message
+			if (answer === 'yes') {
+				successMessage = m['eventRSVP.goingTo']({ eventName });
+			} else if (answer === 'maybe') {
+				successMessage = m['eventRSVP.mightAttend']({ eventName });
+			} else {
+				successMessage = m['eventRSVP.notAttending']({ eventName });
+			}
+
+			showSuccess = true;
+
+			// Invalidate queries to refresh data
+			queryClient.invalidateQueries({ queryKey: ['event', eventId, 'status'] });
+
+			// Refresh page data to update visibility-dependent fields (address, maps URLs, etc.)
+			// This re-runs the +page.server.ts load function with the new RSVP status
+			invalidateAll();
+
+			// Auto-hide success message after 5 seconds
+			setTimeout(() => {
+				showSuccess = false;
+			}, 5000);
+		},
+		onError: (
+			error: Error,
+			_variables: { answer: 'yes' | 'no' | 'maybe'; note?: string },
+			context: { previousStatus: UserEventStatus | null } | undefined
+		) => {
+			// Rollback optimistic update
+			if (context?.previousStatus !== undefined) {
+				userStatus = context.previousStatus;
+			}
+
+			// The backend refused on eligibility grounds and told us why: adopt the
+			// fresh eligibility payload so the ineligibility message and its CTA
+			// re-render against the *current* next_step instead of the stale one the
+			// page was loaded with.
+			const refusal: unknown = error.cause;
+			if (isEligibilityRefusal(refusal)) {
+				userStatus = refusal;
+			}
+
+			// Show error message
+			errorMessage = error.message || m['eventRSVP.submitFailed']();
+			showSuccess = false;
+		}
+	}));
+
+	/**
+	 * Check if user has claimed potluck items
+	 */
+	async function checkClaimedItems(): Promise<number> {
+		try {
+			const response = await fetch(`/api/events/${eventId}/potluck`, {
+				credentials: 'include'
+			});
+			if (!response.ok) return 0;
+
+			const items = await response.json();
+			const claimedByUser = items.filter((item: { is_owned: boolean }) => item.is_owned);
+			return claimedByUser.length;
+		} catch {
+			return 0;
+		}
+	}
+
+	/**
+	 * Handle RSVP selection
+	 */
+	async function handleRSVPSelect(answer: 'yes' | 'no' | 'maybe'): Promise<void> {
+		noteNotSaved = false;
+
+		// Check if user is changing from "yes" to "maybe" or "no"
+		const wasAttendingYes = currentRsvpAnswer === 'yes';
+		const isChangingToNotYes = answer === 'maybe' || answer === 'no';
+
+		if (wasAttendingYes && isChangingToNotYes) {
+			// Check if user has claimed items
+			const count = await checkClaimedItems();
+			claimedItemsCount = count;
+
+			if (count > 0) {
+				// Show warning dialog
+				pendingAnswer = answer;
+				showWarningDialog = true;
+				return;
+			}
+		}
+
+		// No warning needed — capture a note first when the event accepts them
+		if (acceptsNotes) {
+			openNoteDialog(answer);
+			return;
+		}
+		rsvpMutation.mutate({ answer });
+	}
+
+	/**
+	 * Open the note-capture dialog for the chosen answer
+	 */
+	function openNoteDialog(answer: 'yes' | 'no' | 'maybe'): void {
+		noteDialogAnswer = answer;
+		showNoteDialog = true;
+	}
+
+	/**
+	 * Handle note dialog confirmation
+	 */
+	function handleNoteConfirm(note: string): void {
+		showNoteDialog = false;
+		rsvpMutation.mutate({ answer: noteDialogAnswer, note });
+	}
+
+	/**
+	 * Handle note dialog cancellation — no RSVP is submitted
+	 */
+	function handleNoteCancel(): void {
+		showNoteDialog = false;
+	}
+
+	/**
+	 * Handle warning dialog confirmation
+	 */
+	function handleWarningConfirm(): void {
+		showWarningDialog = false;
+		if (!pendingAnswer) return;
+		const answer = pendingAnswer;
+		pendingAnswer = null;
+		if (acceptsNotes) {
+			openNoteDialog(answer);
+			return;
+		}
+		rsvpMutation.mutate({ answer });
+	}
+
+	/**
+	 * Handle warning dialog cancellation
+	 */
+	function handleWarningCancel(): void {
+		showWarningDialog = false;
+		pendingAnswer = null;
+	}
+
+	/**
+	 * Handle changing RSVP response
+	 */
+	function handleChangeResponse(): void {
+		showSuccess = false;
+		userStatus = initialStatus;
+	}
+
+	/**
+	 * Handle retry after error
+	 */
+	function handleRetry(): void {
+		errorMessage = null;
+		// User can try again by clicking a button
+	}
+
+	// Computed: Determine current state
+	const currentRsvpAnswer = $derived.by(() => {
+		// First check if we have a locally stored answer (from this session)
+		if (userAnswer) return userAnswer;
+
+		if (!userStatus) return null;
+
+		// New format: UserEventStatusResponse with rsvp field
+		if (isUserStatusResponse(userStatus)) {
+			const status = userStatus.rsvp?.status;
+			if (status === 'yes' || status === 'no' || status === 'maybe') {
+				return status;
+			}
+			return null;
+		}
+
+		// Legacy format: direct RSVP object
+		if (!isRSVP(userStatus)) return null;
+
+		// The backend returns the answer in the status field
+		// Status is 'yes' | 'no' | 'maybe' for RSVP responses
+		const status = userStatus.status as string;
+		if (status === 'yes' || status === 'no' || status === 'maybe') {
+			return status;
+		}
+
+		return null;
+	});
+
+	const hasExistingRsvp = $derived.by(() => {
+		if (!userStatus) return false;
+		// New format: UserEventStatusResponse with rsvp field
+		if (isUserStatusResponse(userStatus)) {
+			return !!userStatus.rsvp;
+		}
+		// Legacy format: direct RSVP object
+		return isRSVP(userStatus);
+	});
+
+	const eligibilityStatus = $derived.by(() => {
+		if (!userStatus) return null;
+		if (!isEligibility(userStatus)) return null;
+		return userStatus;
+	});
+
+	const isEligible = $derived.by(() => {
+		// User is eligible if:
+		// 1. They have an eligibility status that says allowed
+		// 2. OR they already have an RSVP (they can change it)
+		if (hasExistingRsvp) return true;
+		if (eligibilityStatus && eligibilityStatus.allowed) return true;
+		return false;
+	});
+
+	const shouldShowButtons = $derived.by(() => {
+		// Show buttons if eligible and not in success state
+		return isEligible && !showSuccess;
+	});
+
+	const shouldShowIneligibleMessage = $derived.by(() => {
+		// Show ineligible message if user has eligibility status and is not allowed
+		return eligibilityStatus && !eligibilityStatus.allowed && !showSuccess;
+	});
+
+	// Show RSVP only when the event is explicitly known to be non-ticketed.
+	// `requiresTicket` is non-null on EventDetailSchema, but list/summary
+	// schemas type it as `boolean | null`. A null value means "unknown", so we
+	// fail closed (treat as ticketed) to avoid rendering RSVP on a ticketed
+	// event reached from a list surface, which would 400 on submit (issue #430).
+	const shouldRender = $derived(requiresTicket === false);
+
+	// Check if we should show guest button instead of regular RSVP
+	const shouldShowGuestButton = $derived(
+		!isAuthenticated && event?.can_attend_without_login && onGuestRsvpClick
+	);
+
+	// Check if we should show login prompt (user not authenticated and event requires login)
+	const shouldShowLoginPrompt = $derived(
+		!isAuthenticated && event && !event.can_attend_without_login
+	);
+
+	// Post-login return target. Read from the request URL rather than `window`
+	// so the server-rendered link already carries it (an empty returnUrl makes
+	// safeReturnUrl fall back to /dashboard for pre-hydration clicks).
+	const currentPath = $derived(page.url.pathname + page.url.search);
+</script>
+
+<!--
+  Event RSVP Component
+
+  Smart component managing RSVP state, API calls, and eligibility logic.
+  Handles three states:
+  1. Not eligible: Show helpful message + CTA
+  2. Already RSVP'd: Show confirmation + change option
+  3. Eligible to RSVP: Show active buttons
+
+  @component
+  @example
+  <EventRSVP
+    eventId={event.id}
+    eventName={event.name}
+    initialStatus={userStatus}
+    isAuthenticated={true}
+    requiresTicket={false}
+  />
+-->
+{#if shouldRender}
+	<div class={cn('space-y-4', className)}>
+		<!-- Success State -->
+		{#if showSuccess && successMessage}
+			<div
+				class={cn(
+					// Tints at 10% composite to ~the page colour, so the copy keeps
+					// `text-foreground` and the token contract's AA guarantee.
+					'flex items-start gap-3 rounded-md p-4 text-foreground',
+					successType === 'yes' && 'bg-success/10',
+					successType === 'maybe' && 'bg-highlight/10',
+					successType === 'no' && 'bg-destructive/10'
+				)}
+				role="status"
+				aria-live="polite"
+			>
+				<Check class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
+				<div class="flex-1">
+					<p class="font-extrabold">{successMessage}</p>
+					{#if noteNotSaved}
+						<p class="mt-1 text-sm">{m['eventRSVP.noteNotSaved']()}</p>
+					{/if}
+					<button
+						type="button"
+						onclick={handleChangeResponse}
+						class={cn(
+							'mt-2 text-sm underline hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2',
+							successType === 'yes' && 'focus-visible:ring-success',
+							successType === 'maybe' && 'focus-visible:ring-highlight',
+							successType === 'no' && 'focus-visible:ring-destructive'
+						)}
+					>
+						{m['eventRSVP.changeResponse']()}
+					</button>
+				</div>
+			</div>
+		{/if}
+
+		<!-- Error State -->
+		{#if errorMessage && !showSuccess}
+			<div
+				class="flex items-start gap-3 rounded-md bg-destructive/10 p-4 text-destructive"
+				role="alert"
+				aria-live="assertive"
+			>
+				<AlertCircle class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
+				<div class="flex-1">
+					<p class="font-semibold">{m['eventRSVP.rsvpFailed']()}</p>
+					<p class="mt-1 text-sm">{errorMessage}</p>
+					<button
+						type="button"
+						onclick={handleRetry}
+						class="mt-2 text-sm underline hover:no-underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive focus-visible:ring-offset-2"
+					>
+						{m['eventRSVP.tryAgain']()}
+					</button>
+				</div>
+			</div>
+		{/if}
+
+		<!-- Ineligible State -->
+		{#if shouldShowIneligibleMessage && eligibilityStatus && event}
+			<IneligibilityMessage
+				eligibility={eligibilityStatus}
+				{eventId}
+				eventSlug={event.slug}
+				organizationSlug={event.organization.slug}
+				organizationName={event.organization.name}
+				{eventTokenDetails}
+				applyBefore={event.apply_before}
+				{onInvitationRequestSuccess}
+				{onWhitelistRequestSuccess}
+			/>
+		{/if}
+
+		<!-- Login Prompt (for unauthenticated users when event requires login) -->
+		{#if shouldShowLoginPrompt}
+			<div class="space-y-3">
+				<h3 class="text-sm font-semibold">{m['eventRSVP.willYouAttend']()}</h3>
+				<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+				<a
+					href={`${resolve('/(public)/login', {})}?returnUrl=${encodeURIComponent(currentPath)}`}
+					class="flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-3 font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+				>
+					{m['eventRSVP.loginToRSVP']()}
+				</a>
+				<!-- eslint-enable svelte/no-navigation-without-resolve -->
+				<p class="text-center text-xs text-muted-foreground">
+					{m['eventRSVP.loginToRSVPDescription']()}
+				</p>
+			</div>
+		{/if}
+
+		<!-- Guest RSVP Button (for unauthenticated users when event allows it) -->
+		{#if shouldShowGuestButton}
+			<div class="space-y-3">
+				<h3 class="text-sm font-semibold">{m['eventRSVP.willYouAttend']()}</h3>
+				<button
+					type="button"
+					onclick={onGuestRsvpClick}
+					class="w-full rounded-md bg-primary px-4 py-3 font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
+				>
+					{m['guest_attendance.submit_rsvp']()}
+				</button>
+				<p class="text-center text-xs text-muted-foreground">
+					{m['guest_attendance.rsvp_description']()}
+				</p>
+			</div>
+		{/if}
+
+		<!-- RSVP Buttons (always shown when eligible, even if already RSVP'd) -->
+		{#if shouldShowButtons && !shouldShowGuestButton && !shouldShowLoginPrompt}
+			<div class="space-y-3">
+				<h3 class="text-sm font-semibold">{m['eventRSVP.willYouAttend']()}</h3>
+				<RSVPButtons
+					onSelect={handleRSVPSelect}
+					currentAnswer={currentRsvpAnswer}
+					isLoading={rsvpMutation.isPending}
+					isEligible={true}
+					disabled={false}
+				/>
+			</div>
+		{/if}
+	</div>
+
+	<!-- Optional-note capture before submitting the RSVP -->
+	<RsvpNoteDialog
+		open={showNoteDialog}
+		answer={noteDialogAnswer}
+		initialNote={currentNote}
+		isSubmitting={rsvpMutation.isPending}
+		onConfirm={handleNoteConfirm}
+		onCancel={handleNoteCancel}
+	/>
+
+	<!-- Warning Dialog for Claimed Items -->
+	<ConfirmDialog
+		isOpen={showWarningDialog}
+		title={m['eventRSVP.unclaimPotluckItemsTitle']()}
+		message={claimedItemsCount === 1
+			? m['eventRSVP.unclaimPotluckItemsMessageOne']()
+			: m['eventRSVP.unclaimPotluckItemsMessageMany']({ count: claimedItemsCount })}
+		confirmText={m['eventRSVP.yesChangeRsvp']()}
+		cancelText={m['eventRSVP.cancel']()}
+		variant="warning"
+		onConfirm={handleWarningConfirm}
+		onCancel={handleWarningCancel}
+	/>
+{/if}

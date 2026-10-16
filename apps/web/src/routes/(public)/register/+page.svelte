@@ -1,0 +1,555 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import { enhance } from '$app/forms';
+	import { invalidateAll } from '$app/navigation';
+	import { page } from '$app/state';
+	import { onMount } from 'svelte';
+	import type { ActionData, PageData } from './$types';
+	import PasswordStrengthIndicator from '$lib/components/forms/PasswordStrengthIndicator.svelte';
+	import ReferralCodeInput from '$lib/components/referral/ReferralCodeInput.svelte';
+	import { Card, CardContent } from '$lib/components/ui/card';
+	import AuthBandLayout from '$lib/components/auth/AuthBandLayout.svelte';
+	import SsoProviderButtons from '$lib/components/auth/SsoProviderButtons.svelte';
+	import Turnstile from '$lib/components/auth/Turnstile.svelte';
+	import { Eye, EyeOff, Gift, Loader2, Sparkles, ArrowRight } from '@lucide/svelte';
+	import * as m from '$lib/paraglide/messages.js';
+	import { SeoHead } from '$lib/seo';
+	import { withReturnUrl } from '$lib/utils/safe-redirect';
+
+	interface Props {
+		data: PageData;
+		form: ActionData;
+	}
+
+	const { data, form }: Props = $props();
+
+	/*
+	 * Referral-program invite (FE #938): `?referral_invite=<id>` resolved
+	 * server-side to the invited email. The backend enrolls by matching the
+	 * verified email, so the field is LOCKED to it — editing it would silently
+	 * produce an ordinary account and leave the invite unused. A stale or
+	 * unknown id simply yields `null` here and the normal form renders.
+	 */
+	const referralInvite = $derived(data.referralInvite);
+
+	// Form state
+	let email = $state(form?.email || data.referralInvite?.email || '');
+	let password = $state('');
+	let confirmPassword = $state('');
+	let acceptTerms = $state(false);
+	let showPassword = $state(false);
+	let showConfirmPassword = $state(false);
+	let isSubmitting = $state(false);
+	let turnstile = $state<ReturnType<typeof Turnstile> | null>(null);
+
+	// Referral code: URL param takes priority, then cookie fallback
+	const initialReferralCode = $derived(
+		page.url.searchParams.get('ref') || data.referralCodeFromCookie || ''
+	);
+	let referralCode = $state('');
+
+	// Both "log in" links keep the return target (see login/+page.svelte).
+	const loginHref = $derived(
+		withReturnUrl(resolve('/(public)/login', {}), page.url.searchParams.get('returnUrl'))
+	);
+
+	// Password validation - calculated directly to avoid cross-component binding timing issues
+	// that can occur in some browsers (e.g., Brave on mobile) with $bindable + $effect patterns
+	const isPasswordValid = $derived(
+		password.length >= 8 &&
+			/[A-Z]/.test(password) &&
+			/[a-z]/.test(password) &&
+			/\d/.test(password) &&
+			/[!@#$%^&*(),.?":{}|<>\-[\]=]/.test(password)
+	);
+
+	// Error handling - type assertion needed due to ActionData union
+	const errors = $derived((form?.errors || {}) as Record<string, string>);
+	const hasErrors = $derived(errors && Object.keys(errors).length > 0);
+
+	// Demo mode: the registration form is reachable, but gated behind a nudge
+	// overlay pushing the ready-made demo accounts (#600). data.demo is SSR'd, so
+	// the overlay renders on the initial paint with no hydration-time swap. An
+	// explicit "Register anyway" click reveals the form underneath. Non-demo
+	// backends never see the overlay.
+	let nudgeDismissed = $state(false);
+	const showNudge = $derived(data.demo && !nudgeDismissed);
+
+	// Focus management for the modal nudge (WCAG): trap Tab between its two
+	// controls, dismiss on Escape, and hand focus to the form on dismiss.
+	let nudgeCta = $state<HTMLAnchorElement | null>(null);
+	let nudgeDismiss = $state<HTMLButtonElement | null>(null);
+
+	function dismissNudge() {
+		nudgeDismissed = true;
+		// Focus synchronously — a deferred handoff (rAF/timeout) can fire
+		// seconds late under load and steal focus from a field the user (or a
+		// password manager) is already typing into, spraying keystrokes into
+		// the email field. The input exists in the DOM under the overlay, so
+		// it is focusable right now.
+		document.getElementById('email')?.focus();
+	}
+
+	function onNudgeKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			dismissNudge();
+			return;
+		}
+		if (event.key !== 'Tab' || !nudgeCta || !nudgeDismiss) return;
+		if (event.shiftKey && document.activeElement === nudgeCta) {
+			event.preventDefault();
+			nudgeDismiss.focus();
+		} else if (!event.shiftKey && document.activeElement === nudgeDismiss) {
+			event.preventDefault();
+			nudgeCta.focus();
+		}
+	}
+
+	// Move focus into the overlay once it is shown.
+	$effect(() => {
+		if (showNudge) nudgeCta?.focus();
+	});
+
+	// Check if form is valid for submission
+	const canSubmit = $derived(
+		email.length > 0 &&
+			password.length > 0 &&
+			isPasswordValid &&
+			confirmPassword === password &&
+			acceptTerms &&
+			!isSubmitting
+	);
+
+	// Sync browser autofill/form restoration with reactive state.
+	// Chrome may fill fields before Svelte hydration (SSR) or restore them
+	// from bfcache/session restore without firing input events.
+	let formEl: HTMLFormElement | null = null;
+
+	function syncFormValues() {
+		const get = (id: string) => document.getElementById(id) as HTMLInputElement | null;
+		const emailEl = get('email');
+		const passwordEl = get('password');
+		const confirmEl = get('confirmPassword');
+		const termsEl = get('acceptTerms');
+
+		if (referralInvite) {
+			// `readonly` stops KEYSTROKES, not scripts. A password manager or an
+			// autofill extension can write `.value` directly, which `bind:value`
+			// never sees and which this very function would then copy into
+			// `email` — registering under an address that does not match the
+			// invite, so the backend silently leaves the invite unused and the
+			// user sees no error. Put the invited address back instead of
+			// syncing away from it.
+			if (emailEl && emailEl.value !== referralInvite.email) {
+				emailEl.value = referralInvite.email;
+			}
+		} else if (emailEl && emailEl.value !== email) {
+			email = emailEl.value;
+		}
+		if (passwordEl && passwordEl.value !== password) password = passwordEl.value;
+		if (confirmEl && confirmEl.value !== confirmPassword) confirmPassword = confirmEl.value;
+		if (termsEl && termsEl.checked !== acceptTerms) acceptTerms = termsEl.checked;
+	}
+
+	onMount(() => {
+		const currentFormEl = formEl;
+		// Check for autofill after hydration at staggered intervals
+		const t1 = setTimeout(syncFormValues, 100);
+		const t2 = setTimeout(syncFormValues, 1000);
+
+		// A value written into the DOM during the hydration-settling window
+		// (browser autofill, password managers) fires its input event before
+		// Svelte's bindings listen, so $state never learns about it and the
+		// submit button stays disabled. The timers above only cover the first
+		// second — recover continuously instead: any later native activity on
+		// the form (typing in another field, focus moving, a checkbox toggle)
+		// re-runs the sync and picks up whatever the bindings missed.
+		const syncEvents = ['input', 'change', 'focusout'] as const;
+		if (currentFormEl) {
+			for (const evt of syncEvents) currentFormEl.addEventListener(evt, syncFormValues);
+		}
+
+		// Handle bfcache restoration (back/forward navigation)
+		const handlePageShow = (e: PageTransitionEvent) => {
+			if (e.persisted) {
+				isSubmitting = false;
+				setTimeout(syncFormValues, 50);
+			}
+		};
+		window.addEventListener('pageshow', handlePageShow);
+
+		return () => {
+			clearTimeout(t1);
+			clearTimeout(t2);
+			if (currentFormEl) {
+				for (const evt of syncEvents) currentFormEl.removeEventListener(evt, syncFormValues);
+			}
+			window.removeEventListener('pageshow', handlePageShow);
+		};
+	});
+</script>
+
+<SeoHead config={data.seo} />
+
+{#if showNudge}
+	<!-- Demo nudge overlay: pushes the ready-made demo accounts, with a dismiss
+	     action that reveals the registration form underneath (#600). -->
+	<div
+		class="fixed inset-0 z-50 flex items-center justify-center bg-background/80 p-4 backdrop-blur-sm"
+		role="dialog"
+		aria-modal="true"
+		aria-labelledby="demo-nudge-title"
+		aria-describedby="demo-nudge-body"
+		tabindex="-1"
+		onkeydown={onNudgeKeydown}
+	>
+		<div
+			class="w-full max-w-md space-y-6 rounded-lg border-2 border-border bg-card p-6 text-center shadow-poster-lg"
+		>
+			<!-- Poster-tinted chip, same recipe as EmptyState's internal chip
+			     (audited pair bg-poster-purple / text-poster-white, mode-inert by
+			     the imagery rule). Decorative — the dialog already has an
+			     accessible name from demo-nudge-title. -->
+			<span
+				aria-hidden="true"
+				class="mx-auto flex h-14 w-14 -rotate-2 items-center justify-center rounded-2xl bg-poster-purple text-poster-white shadow-poster"
+			>
+				<Sparkles class="h-7 w-7" />
+			</span>
+			<div class="space-y-2">
+				<h2 id="demo-nudge-title" class="text-xl font-bold tracking-tight">
+					{m['register.demoNudgeTitle']()}
+				</h2>
+				<p id="demo-nudge-body" class="text-sm text-muted-foreground">
+					{m['register.demoNudgeBody']()}
+				</p>
+			</div>
+			<div class="space-y-3">
+				<!-- eslint-disable svelte/no-navigation-without-resolve -- href is resolve() output; withReturnUrl only appends the ?returnUrl= query -->
+				<a
+					bind:this={nudgeCta}
+					href={loginHref}
+					class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					<span>{m['register.demoNudgeUseAccount']()}</span>
+					<ArrowRight class="h-4 w-4" aria-hidden="true" />
+				</a>
+				<!-- eslint-enable svelte/no-navigation-without-resolve -->
+				<button
+					bind:this={nudgeDismiss}
+					type="button"
+					onclick={dismissNudge}
+					class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					{m['register.demoNudgeRegisterAnyway']()}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+<!-- Colour-block band + floating card (uplift). The nudge overlay above, the
+     form logic, field ids and aria wiring are untouched — shell only. -->
+<AuthBandLayout
+	kicker={m['register.kicker']()}
+	title={m['register.createAccount']()}
+	subtitle={m['register.joinRevel']()}
+>
+	<Card>
+		<CardContent class="space-y-6 p-6 sm:p-8">
+			{#if referralInvite}
+				<!-- Poster-tinted invite banner: `bg-poster-purple text-poster-white`
+				     is the audited, mode-inert imagery pair already used by the demo
+				     nudge chip on this same page. -->
+				<div class="rounded-lg bg-poster-purple p-4 text-poster-white">
+					<p class="flex items-center gap-2 font-bold">
+						<Gift class="h-5 w-5 shrink-0" aria-hidden="true" />
+						{m['register.referralInviteTitle']()}
+					</p>
+					<p class="mt-2 text-sm">
+						{m['register.referralInviteBody']({ code: referralInvite.code })}
+					</p>
+				</div>
+			{/if}
+
+			<!-- Error Summary -->
+			{#if hasErrors && errors.form}
+				<div role="alert" class="rounded-md border border-destructive bg-destructive/10 p-4">
+					<p class="text-sm font-medium text-destructive">{errors.form}</p>
+				</div>
+			{/if}
+
+			<!-- Registration Form -->
+			<form
+				method="POST"
+				bind:this={formEl}
+				use:enhance={({ formData }) => {
+					// Last line of defence for the locked invite email: whatever ended
+					// up in the DOM, the invite's own address is what gets posted.
+					// Only the enhanced path can do this — see syncFormValues.
+					if (referralInvite) formData.set('email', referralInvite.email);
+
+					// Prevent duplicate submissions
+					if (isSubmitting) return;
+					isSubmitting = true;
+
+					// Safety timeout: reset isSubmitting if the response never arrives
+					// (e.g., network hang, browser extension interference)
+					const safetyTimeout = setTimeout(() => {
+						isSubmitting = false;
+					}, 30_000);
+
+					return async ({ result, update }) => {
+						clearTimeout(safetyTimeout);
+						isSubmitting = false;
+						// Turnstile tokens are single-use: any outcome that keeps us on
+						// this page needs a fresh one for the retry.
+						if (result.type !== 'redirect') turnstile?.reset();
+						await update();
+						// No widget because the site key couldn't be read at load time:
+						// enhance doesn't re-run load on failure, so do it here, or every
+						// retry in this tab would be rejected until a full reload.
+						if (result.type === 'failure' && !data.turnstileSiteKey) await invalidateAll();
+					};
+				}}
+				class="space-y-6"
+			>
+				<!-- Email Field -->
+				<div class="space-y-2">
+					<label for="email" class="block text-sm font-medium">
+						{m['register.emailAddress']()}
+					</label>
+					<!-- `readonly`, never `disabled`: a disabled input submits no value,
+					     which would post an empty email and lose the invite entirely. The
+					     tinted background is the "locked" cue; the text stays full-strength
+					     rather than muted, because this is an address the reader has to
+					     check character by character.
+					     `aria-describedby` lists the hint BEFORE the error: screen readers
+					     read the ids in the order given, and the hint paragraph is the one
+					     that renders first in the DOM. -->
+					<input
+						id="email"
+						name="email"
+						type="email"
+						autocomplete={referralInvite ? 'off' : 'email'}
+						required
+						readonly={!!referralInvite}
+						bind:value={email}
+						aria-invalid={!!errors.email}
+						aria-describedby={[
+							referralInvite ? 'email-invite-hint' : null,
+							errors.email ? 'email-error' : null
+						]
+							.filter(Boolean)
+							.join(' ') || undefined}
+						disabled={isSubmitting}
+						class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground read-only:bg-muted focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.email
+							? 'border-destructive'
+							: ''}"
+						placeholder={m['register.emailPlaceholder']()}
+					/>
+					{#if referralInvite}
+						<p id="email-invite-hint" class="text-sm text-muted-foreground">
+							{m['register.referralInviteEmailLocked']()}
+						</p>
+					{/if}
+					{#if errors.email}
+						<p id="email-error" class="text-sm text-destructive" role="alert">
+							{errors.email}
+						</p>
+					{/if}
+				</div>
+
+				<!-- Password Field -->
+				<div class="space-y-2">
+					<label for="password" class="block text-sm font-medium">
+						{m['register.password']()}
+					</label>
+					<div class="relative">
+						<input
+							id="password"
+							name="password"
+							type={showPassword ? 'text' : 'password'}
+							autocomplete="new-password"
+							required
+							bind:value={password}
+							onpaste={() => {
+								// Ensure paste always works on mobile
+								// This explicit handler prevents any interference from browser autofill
+								// that might block paste operations on iOS Safari
+							}}
+							aria-invalid={!!errors.password}
+							aria-describedby={errors.password
+								? 'password-error password-requirements'
+								: 'password-requirements'}
+							disabled={isSubmitting}
+							class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 pr-10 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.password
+								? 'border-destructive'
+								: ''}"
+							placeholder={m['register.passwordPlaceholder']()}
+						/>
+						<button
+							type="button"
+							onclick={() => (showPassword = !showPassword)}
+							class="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+							aria-label={showPassword
+								? m['register.hidePassword']()
+								: m['register.showPassword']()}
+						>
+							{#if showPassword}
+								<EyeOff class="h-4 w-4" aria-hidden="true" />
+							{:else}
+								<Eye class="h-4 w-4" aria-hidden="true" />
+							{/if}
+						</button>
+					</div>
+
+					{#if errors.password}
+						<p id="password-error" class="text-sm text-destructive" role="alert">
+							{errors.password}
+						</p>
+					{/if}
+
+					<!-- Password Strength Indicator with Requirements -->
+					{#if password}
+						<PasswordStrengthIndicator {password} showRequirements={true} />
+					{/if}
+				</div>
+
+				<!-- Confirm Password Field -->
+				<div class="space-y-2">
+					<label for="confirmPassword" class="block text-sm font-medium">
+						{m['register.confirmPassword']()}
+					</label>
+					<div class="relative">
+						<input
+							id="confirmPassword"
+							name="confirmPassword"
+							type={showConfirmPassword ? 'text' : 'password'}
+							autocomplete="new-password"
+							required
+							bind:value={confirmPassword}
+							onpaste={() => {
+								// Ensure paste always works on mobile
+								// This explicit handler prevents any interference from browser autofill
+								// that might block paste operations on iOS Safari
+							}}
+							aria-invalid={!!errors.confirmPassword}
+							aria-describedby={errors.confirmPassword ? 'confirm-password-error' : undefined}
+							disabled={isSubmitting}
+							class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 pr-10 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.confirmPassword
+								? 'border-destructive'
+								: ''}"
+							placeholder={m['register.confirmPasswordPlaceholder']()}
+						/>
+						<button
+							type="button"
+							onclick={() => (showConfirmPassword = !showConfirmPassword)}
+							class="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+							aria-label={showConfirmPassword
+								? m['register.hidePassword']()
+								: m['register.showPassword']()}
+						>
+							{#if showConfirmPassword}
+								<EyeOff class="h-4 w-4" aria-hidden="true" />
+							{:else}
+								<Eye class="h-4 w-4" aria-hidden="true" />
+							{/if}
+						</button>
+					</div>
+					{#if errors.confirmPassword}
+						<p id="confirm-password-error" class="text-sm text-destructive" role="alert">
+							{errors.confirmPassword}
+						</p>
+					{/if}
+				</div>
+
+				<!-- Terms and Privacy Checkbox -->
+				<div class="flex items-start gap-3">
+					<input
+						id="acceptTerms"
+						name="acceptTerms"
+						type="checkbox"
+						required
+						bind:checked={acceptTerms}
+						aria-invalid={!!errors.acceptTerms}
+						aria-describedby={errors.acceptTerms ? 'terms-error' : undefined}
+						disabled={isSubmitting}
+						class="mt-1 h-4 w-4 rounded border-input text-primary transition-colors focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+					/>
+					<label for="acceptTerms" class="text-sm">
+						{m['register.acceptTerms']()}
+						<a
+							href={resolve('/(public)/legal/terms', {})}
+							target="_blank"
+							rel="noopener noreferrer"
+							class="text-primary underline-offset-4 hover:underline"
+							>{m['footer.termsOfService']()}</a
+						>
+						{m['register.and']()}
+						<a
+							href={resolve('/(public)/legal/privacy', {})}
+							target="_blank"
+							rel="noopener noreferrer"
+							class="text-primary underline-offset-4 hover:underline"
+							>{m['footer.privacyPolicy']()}</a
+						>
+					</label>
+				</div>
+				{#if errors.acceptTerms}
+					<p id="terms-error" class="text-sm text-destructive" role="alert">
+						{errors.acceptTerms}
+					</p>
+				{/if}
+
+				<!-- Referral Code (collapsible) -->
+				<ReferralCodeInput
+					initialCode={initialReferralCode}
+					isProcessing={isSubmitting}
+					validatedCode={referralCode}
+					onValidated={(code) => (referralCode = code)}
+					onRemove={() => (referralCode = '')}
+				/>
+
+				<!-- Hidden referral code input for form submission -->
+				{#if referralCode}
+					<input type="hidden" name="referralCode" value={referralCode} />
+				{/if}
+
+				{#if data.turnstileSiteKey}
+					<Turnstile bind:this={turnstile} siteKey={data.turnstileSiteKey} />
+				{/if}
+
+				<!-- Submit Button -->
+				<button
+					type="submit"
+					disabled={!canSubmit}
+					aria-disabled={!canSubmit}
+					class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+				>
+					{#if isSubmitting}
+						<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+						<span>{m['register.creatingAccount']()}</span>
+					{:else}
+						<span>{m['register.createAccount']()}</span>
+					{/if}
+				</button>
+			</form>
+
+			<SsoProviderButtons
+				providers={data.ssoProviders}
+				returnUrl={page.url.searchParams.get('returnUrl')}
+			/>
+		</CardContent>
+	</Card>
+
+	<!-- Login Link -->
+	<div class="text-center text-sm">
+		<span class="text-muted-foreground">{m['register.alreadyHaveAccount']()}</span>
+		<!-- eslint-disable svelte/no-navigation-without-resolve -- href is resolve() output; withReturnUrl only appends the ?returnUrl= query -->
+		<a href={loginHref} class="ml-1 text-primary underline-offset-4 hover:underline">
+			{m['auth.login']()}
+		</a>
+		<!-- eslint-enable svelte/no-navigation-without-resolve -->
+	</div>
+</AuthBandLayout>

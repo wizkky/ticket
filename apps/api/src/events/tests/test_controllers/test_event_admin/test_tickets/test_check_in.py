@@ -1,0 +1,230 @@
+"""Tests for event check-in window and check-in process."""
+
+import orjson
+import pytest
+from django.test.client import Client
+from django.urls import reverse
+
+from accounts.models import RevelUser
+from events.models import Event, OrganizationStaff, Ticket, TicketTier, VenueSeat
+
+pytestmark = pytest.mark.django_db
+
+
+# --- Tests for Event Check-in Window and Check-in Process ---
+
+
+def test_update_event_check_in_window(organization_owner_client: Client, event: Event) -> None:
+    """Test updating event with check-in window fields."""
+    from datetime import timedelta
+
+    check_in_start = event.start + timedelta(hours=-1)
+    check_in_end = event.end + timedelta(hours=1)
+
+    url = reverse("api:edit_event", kwargs={"event_id": event.pk})
+    payload = {
+        "check_in_starts_at": check_in_start.isoformat(),
+        "check_in_ends_at": check_in_end.isoformat(),
+    }
+
+    response = organization_owner_client.put(url, data=orjson.dumps(payload), content_type="application/json")
+
+    assert response.status_code == 200
+    event.refresh_from_db()
+    assert event.check_in_starts_at == check_in_start
+    assert event.check_in_ends_at == check_in_end
+
+
+def test_check_in_success(organization_owner_client: Client, event: Event, active_online_ticket: Ticket) -> None:
+    """Test successful ticket check-in."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    # Set check-in window to be open
+    now = timezone.now()
+    event.check_in_starts_at = now - timedelta(hours=1)
+    event.check_in_ends_at = now + timedelta(hours=1)
+    event.save()
+
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": active_online_ticket.pk})
+
+    response = organization_owner_client.post(url, content_type="application/json")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == str(active_online_ticket.id)
+    assert data["status"] == Ticket.TicketStatus.CHECKED_IN
+    assert data["checked_in_at"] is not None
+
+    active_online_ticket.refresh_from_db()
+    assert active_online_ticket.status == Ticket.TicketStatus.CHECKED_IN
+    assert active_online_ticket.checked_in_at is not None
+    assert active_online_ticket.checked_in_by is not None
+
+
+def test_check_in_already_checked_in(
+    organization_owner_client: Client, event: Event, active_online_ticket: Ticket
+) -> None:
+    """Test check-in fails when ticket is already checked in."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    # Set check-in window to be open
+    now = timezone.now()
+    event.check_in_starts_at = now - timedelta(hours=1)
+    event.check_in_ends_at = now + timedelta(hours=1)
+    event.save()
+
+    # Mark ticket as already checked in
+    active_online_ticket.status = Ticket.TicketStatus.CHECKED_IN
+    active_online_ticket.checked_in_at = now
+    active_online_ticket.save()
+
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": active_online_ticket.pk})
+
+    response = organization_owner_client.post(url, content_type="application/json")
+
+    assert response.status_code == 400
+    assert "already been checked in" in response.json()["detail"]
+
+
+def test_check_in_window_not_open(
+    organization_owner_client: Client, event: Event, active_online_ticket: Ticket
+) -> None:
+    """Test check-in fails when check-in window is not open."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    # Set check-in window to be closed (in the future)
+    now = timezone.now()
+    event.check_in_starts_at = now + timedelta(hours=1)
+    event.check_in_ends_at = now + timedelta(hours=2)
+    event.save()
+
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": active_online_ticket.pk})
+
+    response = organization_owner_client.post(url, content_type="application/json")
+
+    assert response.status_code == 400
+    assert "Check-in is not open yet" in response.json()["detail"]
+
+
+def test_check_in_staff_with_permission(
+    organization_staff_client: Client, event: Event, staff_member: OrganizationStaff, active_online_ticket: Ticket
+) -> None:
+    """Test staff member with check_in_attendees permission can check in tickets."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    # Grant permission
+    perms = staff_member.permissions
+    perms["default"]["check_in_attendees"] = True
+    staff_member.permissions = perms
+    staff_member.save()
+
+    # Set check-in window to be open
+    now = timezone.now()
+    event.check_in_starts_at = now - timedelta(hours=1)
+    event.check_in_ends_at = now + timedelta(hours=1)
+    event.save()
+
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": active_online_ticket.pk})
+
+    response = organization_staff_client.post(url, content_type="application/json")
+
+    assert response.status_code == 200
+    active_online_ticket.refresh_from_db()
+    assert active_online_ticket.status == Ticket.TicketStatus.CHECKED_IN
+    assert active_online_ticket.checked_in_by == staff_member.user
+
+
+def test_check_in_staff_without_permission(
+    organization_staff_client: Client, event: Event, staff_member: OrganizationStaff, active_online_ticket: Ticket
+) -> None:
+    """Test staff member without check_in_attendees permission gets 403."""
+    # Ensure permission is False
+    perms = staff_member.permissions
+    perms["default"]["check_in_attendees"] = False
+    staff_member.permissions = perms
+    staff_member.save()
+
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": active_online_ticket.pk})
+
+    response = organization_staff_client.post(url, content_type="application/json")
+
+    assert response.status_code == 403
+
+
+def test_check_in_requires_authentication(event: Event, active_online_ticket: Ticket) -> None:
+    """Test check-in requires authentication."""
+    from django.test.client import Client
+
+    client = Client()
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": active_online_ticket.pk})
+
+    response = client.post(url, content_type="application/json")
+
+    assert response.status_code == 401
+
+
+def test_check_in_response_includes_seat(
+    organization_owner_client: Client,
+    seated_event: tuple[Event, list[VenueSeat]],
+    event_ticket_tier: TicketTier,
+    public_user: RevelUser,
+) -> None:
+    """Door staff scanning a QR see the ticket's seat (row/number/label) and sector."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    event, seats = seated_event
+    ticket = Ticket.objects.create(
+        guest_name="Seated Guest",
+        user=public_user,
+        event=event,
+        tier=event_ticket_tier,
+        seat=seats[2],
+        sector=seats[2].sector,
+        status=Ticket.TicketStatus.ACTIVE,
+    )
+    now = timezone.now()
+    event.check_in_starts_at = now - timedelta(hours=1)
+    event.check_in_ends_at = now + timedelta(hours=1)
+    event.save(update_fields=["check_in_starts_at", "check_in_ends_at"])
+
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": ticket.pk})
+    response = organization_owner_client.post(url, content_type="application/json")
+
+    assert response.status_code == 200, response.content
+    data = response.json()
+    assert data["seat"]["label"] == "A3"
+    assert data["seat"]["row_label"] == "A"
+    assert data["seat"]["number"] == 3
+    assert data["sector_name"] == "Stalls"
+
+
+def test_check_in_response_without_seat_is_null(
+    organization_owner_client: Client, event: Event, active_online_ticket: Ticket
+) -> None:
+    """GA tickets (no seat) keep a null seat/sector in the check-in payload."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    now = timezone.now()
+    event.check_in_starts_at = now - timedelta(hours=1)
+    event.check_in_ends_at = now + timedelta(hours=1)
+    event.save(update_fields=["check_in_starts_at", "check_in_ends_at"])
+
+    url = reverse("api:check_in_ticket", kwargs={"event_id": event.pk, "code": active_online_ticket.pk})
+    response = organization_owner_client.post(url, content_type="application/json")
+
+    assert response.status_code == 200, response.content
+    data = response.json()
+    assert data["seat"] is None
+    assert data["sector_name"] is None

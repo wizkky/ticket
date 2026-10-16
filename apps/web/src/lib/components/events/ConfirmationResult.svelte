@@ -1,0 +1,229 @@
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import * as m from '$lib/paraglide/messages.js';
+	import { Button } from '$lib/components/ui/button';
+	import { Alert, AlertDescription } from '$lib/components/ui/alert';
+	import { CheckCircle2, XCircle, Loader2 } from '@lucide/svelte';
+	import { eventpublicdiscoveryConfirmGuestAction } from '$lib/api';
+	import { handleGuestAttendanceError } from '$lib/utils/guestAttendance';
+	import { summarizeConfirmedTickets, type TierBreakdownEntry } from './confirmation-tickets';
+
+	interface Props {
+		token: string;
+	}
+
+	const { token }: Props = $props();
+
+	// State
+	let isLoading = $state(true);
+	let result = $state<{
+		success: boolean;
+		eventId?: string;
+		type?: 'rsvp' | 'ticket';
+		rsvpStatus?: 'yes' | 'no' | 'maybe';
+		ticketId?: string;
+		ticketCount?: number;
+		tierBreakdown?: TierBreakdownEntry[];
+		error?: string;
+	}>({ success: false });
+
+	// Auto-trigger confirmation on mount
+	onMount(async () => {
+		await confirmAction();
+	});
+
+	async function confirmAction() {
+		isLoading = true;
+
+		try {
+			const response = await eventpublicdiscoveryConfirmGuestAction({
+				body: { token }
+			});
+
+			// The client does not throw on non-2xx: rejections (403 tier rule,
+			// 400 eligibility, expired/used token, seat errors) arrive as
+			// `response.error` with `data` undefined. Pass the raw payload to the
+			// error mapper so its detail/reason gets localized instead of being
+			// masked by the generic no-data message.
+			if (response.error) {
+				result = {
+					success: false,
+					error: handleGuestAttendanceError(response.error)
+				};
+				return;
+			}
+
+			const data = response.data;
+
+			if (!data) {
+				throw new Error('No data returned from confirmation');
+			}
+
+			// Determine if this is an RSVP or ticket based on response shape
+			// RSVP has 'status' field with values "yes" | "no" | "maybe"
+			// Ticket confirmation now always returns BatchCheckoutResponse with 'tickets' array
+			const isRsvp =
+				'status' in data &&
+				typeof data.status === 'string' &&
+				['yes', 'no', 'maybe'].includes(data.status);
+
+			if (isRsvp) {
+				// RSVP confirmation
+				const eventId = 'event_id' in data ? data.event_id : undefined;
+
+				result = {
+					success: true,
+					eventId,
+					type: 'rsvp',
+					rsvpStatus: data.status as 'yes' | 'no' | 'maybe'
+				};
+			} else if ('tickets' in data && Array.isArray(data.tickets) && data.tickets.length > 0) {
+				// Ticket confirmation (BatchCheckoutResponse) — the cart can mint
+				// tickets across multiple tiers in one confirmation.
+				const summary = summarizeConfirmedTickets(data.tickets);
+
+				result = {
+					success: true,
+					eventId: summary.eventId,
+					type: 'ticket',
+					ticketId: summary.ticketId,
+					ticketCount: summary.count,
+					tierBreakdown: summary.tierBreakdown
+				};
+			} else {
+				throw new Error('Unexpected response format from confirmation');
+			}
+		} catch (error) {
+			result = {
+				success: false,
+				error: handleGuestAttendanceError(error)
+			};
+		} finally {
+			isLoading = false;
+		}
+	}
+
+	function handleRetry() {
+		confirmAction();
+	}
+
+	function handleNavigateToEvent() {
+		if (!result.eventId) return;
+
+		// Build URL with query params to trigger success message on event page
+		let url = `/events/${result.eventId}`;
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- not reactive state: local URL builder, mutated synchronously then discarded via window.location.href
+		const params = new URLSearchParams();
+
+		if (result.type === 'rsvp' && result.rsvpStatus) {
+			params.set('rsvp', result.rsvpStatus);
+		} else if (result.type === 'ticket' && result.ticketId) {
+			params.set('ticket_id', result.ticketId);
+		}
+
+		const queryString = params.toString();
+		if (queryString) {
+			url += `?${queryString}`;
+		}
+
+		window.location.href = url;
+	}
+</script>
+
+<div class="mx-auto max-w-lg space-y-6 py-12">
+	{#if isLoading}
+		<!-- Loading State -->
+		<div class="flex flex-col items-center justify-center space-y-4 text-center">
+			<div class="relative">
+				<Loader2 class="h-16 w-16 animate-spin text-primary" aria-hidden="true" />
+			</div>
+			<div class="space-y-2">
+				<h1 class="text-2xl font-extrabold">{m['guest_attendance.confirmation_processing']()}</h1>
+				<p class="text-muted-foreground">
+					{m['guest_attendance.confirmation_wait']()}
+				</p>
+			</div>
+		</div>
+	{:else if result.success}
+		<!-- Success State -->
+		<div class="flex flex-col items-center justify-center space-y-6 text-center">
+			<div class="rounded-full bg-primary/10 p-6">
+				<CheckCircle2 class="h-16 w-16 text-primary" aria-hidden="true" />
+			</div>
+
+			<div class="space-y-3">
+				<h1 class="text-3xl font-black leading-[1.12] sm:text-4xl">
+					{result.type === 'rsvp'
+						? m['guest_attendance.rsvp_confirmed_title']()
+						: m['guest_attendance.ticket_confirmed_title']()}
+				</h1>
+				<p class="text-lg text-muted-foreground">
+					{result.type === 'rsvp'
+						? m['guest_attendance.rsvp_confirmed_body']()
+						: m['guest_attendance.ticket_confirmed_body']()}
+				</p>
+				{#if result.type === 'ticket' && result.ticketCount !== undefined}
+					<p class="font-semibold">
+						{m['cartSheet.confirmedTicketCount']({ count: result.ticketCount })}
+					</p>
+					{#if result.tierBreakdown && result.tierBreakdown.length > 1}
+						<ul class="space-y-1 text-sm text-muted-foreground">
+							{#each result.tierBreakdown as entry, index (index)}
+								<li>{m['cart.ticketCount']({ count: entry.count })} · {entry.tierName}</li>
+							{/each}
+						</ul>
+					{/if}
+				{/if}
+			</div>
+
+			{#if result.eventId}
+				<Button size="lg" onclick={handleNavigateToEvent} class="mt-4">
+					{m['guest_attendance.view_event']()}
+				</Button>
+			{:else}
+				<Button size="lg" onclick={() => (window.location.href = '/')} class="mt-4">
+					{m['guest_attendance.common_goToHomepage']()}
+				</Button>
+			{/if}
+
+			<!-- Success message for screen readers -->
+			<div class="sr-only" role="status" aria-live="polite">
+				{result.type === 'rsvp'
+					? m['guest_attendance.rsvp_confirmed_title']()
+					: m['guest_attendance.ticket_confirmed_title']()}
+			</div>
+		</div>
+	{:else}
+		<!-- Error State -->
+		<div class="flex flex-col items-center justify-center space-y-6 text-center">
+			<div class="rounded-full bg-destructive/10 p-6">
+				<XCircle class="h-16 w-16 text-destructive" aria-hidden="true" />
+			</div>
+
+			<div class="space-y-3">
+				<h1 class="text-3xl font-black leading-[1.12] sm:text-4xl">
+					{m['confirmationResult.confirmationFailed']()}
+				</h1>
+				<Alert variant="destructive" class="text-left">
+					<AlertDescription>
+						{result.error || m['guest_attendance.network_error']()}
+					</AlertDescription>
+				</Alert>
+			</div>
+
+			<div class="flex flex-col gap-3 sm:flex-row">
+				<Button variant="outline" onclick={handleRetry}>
+					{m['guest_attendance.retry']()}
+				</Button>
+				<Button onclick={() => (window.location.href = '/')}>
+					{m['guest_attendance.common_goToHomepage']()}
+				</Button>
+			</div>
+
+			<!-- Error message for screen readers -->
+			<div class="sr-only" role="alert" aria-live="assertive">
+				{m['confirmationResult.confirmationFailedSr']({ error: result.error ?? '' })}
+			</div>
+		</div>
+	{/if}
+</div>

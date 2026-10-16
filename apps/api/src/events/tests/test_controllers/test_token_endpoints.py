@@ -1,0 +1,551 @@
+"""Tests for token GET endpoints and validation."""
+
+from datetime import timedelta
+
+import orjson
+import pytest
+from django.test.client import Client
+from django.urls import reverse
+from django.utils import timezone
+
+from accounts.models import RevelUser
+from events.models import Event, EventToken, MembershipTier, Organization, OrganizationToken, TicketTier
+from events.service import event_service, organization_service
+
+pytestmark = pytest.mark.django_db
+
+
+# --- Tests for GET /events/tokens/{token_id} ---
+
+
+def test_get_event_token_returns_token_details(
+    client: Client, event: Event, organization_owner_user: RevelUser
+) -> None:
+    """Test that GET /events/tokens/{token_id} returns token details without authentication."""
+    # Arrange
+    token = event_service.create_event_token(
+        event=event, issuer=organization_owner_user, name="Test Token", grants_invitation=True
+    )
+    url = reverse("api:get_event_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == token.id
+    assert data["name"] == "Test Token"
+    assert data["event"] is not None
+    assert data["grants_invitation"] is True
+    # Public-safe event details so the pre-claim page can render the event (#679).
+    assert data["event_name"] == event.name
+    assert data["event_slug"] == event.slug
+    assert data["organization_slug"] == event.organization.slug
+    assert data["event_start"] is not None
+    assert "event_cover_url" in data  # present (null when the event has no cover art)
+
+
+def test_get_event_token_shows_ticket_tier_when_present(
+    client: Client, event: Event, organization_owner_user: RevelUser, event_ticket_tier: TicketTier
+) -> None:
+    """Test that GET /events/tokens/{token_id} includes ticket_tiers when set."""
+    # Arrange
+    token = event_service.create_event_token(
+        event=event, issuer=organization_owner_user, name="VIP Token", ticket_tier_ids=[event_ticket_tier.id]
+    )
+    url = reverse("api:get_event_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["ticket_tiers"]) == 1
+    assert str(data["ticket_tiers"][0]["id"]) == str(event_ticket_tier.id)
+
+
+def test_get_event_token_returns_404_for_invalid_token(client: Client) -> None:
+    """Test that GET /events/tokens/{token_id} returns 404 for invalid token."""
+    # Arrange
+    url = reverse("api:get_event_token", kwargs={"token_id": "invalid-token"})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 404
+
+
+def test_get_event_token_returns_410_for_expired_token(
+    client: Client, event: Event, organization_owner_user: RevelUser
+) -> None:
+    """GET /events/tokens/{token_id} returns 410 with a machine-readable reason for expired tokens."""
+    # Arrange
+    token = event_service.create_event_token(event=event, issuer=organization_owner_user, duration=-60)
+    url = reverse("api:get_event_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 410
+    data = response.json()
+    assert data["reason"] == "expired"
+    assert "expired" in data["message"].lower()
+    assert data["event_name"] == event.name
+    assert data["event_slug"] == event.slug
+    assert data["organization_slug"] == event.organization.slug
+
+
+def test_get_event_token_returns_410_for_used_up_token(
+    client: Client, event: Event, organization_owner_user: RevelUser
+) -> None:
+    """GET /events/tokens/{token_id} returns 410 with reason 'used_up' for exhausted tokens."""
+    # Arrange -- token that has reached its max_uses
+    token = EventToken.objects.create(
+        event=event,
+        issuer=organization_owner_user,
+        expires_at=timezone.now() + timedelta(hours=1),
+        max_uses=3,
+        uses=3,
+    )
+    url = reverse("api:get_event_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 410
+    data = response.json()
+    assert data["reason"] == "used_up"
+    assert "maximum number of uses" in data["message"].lower()
+    assert data["event_name"] == event.name
+    assert data["event_slug"] == event.slug
+    assert data["organization_slug"] == event.organization.slug
+
+
+# --- Tests for GET /organizations/tokens/{token_id} ---
+
+
+def test_get_organization_token_returns_token_details(
+    client: Client, organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that GET /organizations/tokens/{token_id} returns token details without authentication."""
+    # Arrange
+    from events.models import MembershipTier
+
+    default_tier = MembershipTier.objects.get(organization=organization, name="General membership")
+    token = organization_service.create_organization_token(
+        organization=organization, issuer=organization_owner_user, name="Member Invite", membership_tier=default_tier
+    )
+    url = reverse("api:get_organization_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == token.id
+    assert data["name"] == "Member Invite"
+    assert data["organization"] is not None
+    assert data["grants_membership"] is True
+    # Public-safe org details so the pre-claim page can render which org is inviting (#675).
+    assert data["organization_name"] == organization.name
+    assert data["organization_slug"] == organization.slug
+    assert "organization_logo_url" in data  # present (null when the org has no logo)
+    # Target membership tier name for the pre-claim page (#677).
+    assert data["membership_tier_name"] == default_tier.name
+
+
+def test_get_organization_token_shows_staff_status(
+    client: Client, organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that GET /organizations/tokens/{token_id} shows grants_staff_status."""
+    # Arrange
+    from events.models import MembershipTier
+
+    default_tier = MembershipTier.objects.get(organization=organization, name="General membership")
+    token = organization_service.create_organization_token(
+        organization=organization,
+        issuer=organization_owner_user,
+        name="Staff Invite",
+        grants_staff_status=True,
+        membership_tier=default_tier,
+    )
+    url = reverse("api:get_organization_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 200
+    data = response.json()
+    assert data["grants_staff_status"] is True
+
+
+def test_get_organization_token_returns_404_for_invalid_token(client: Client) -> None:
+    """Test that GET /organizations/tokens/{token_id} returns 404 for invalid token."""
+    # Arrange
+    url = reverse("api:get_organization_token", kwargs={"token_id": "invalid-token"})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 404
+
+
+def test_get_organization_token_returns_410_for_expired_token(
+    client: Client, organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """GET /organizations/tokens/{token_id} returns 410 with reason 'expired' for expired tokens."""
+    # Arrange
+    default_tier = MembershipTier.objects.get(organization=organization, name="General membership")
+    token = OrganizationToken.objects.create(
+        organization=organization,
+        issuer=organization_owner_user,
+        membership_tier=default_tier,
+        expires_at=timezone.now() - timedelta(hours=1),
+    )
+    url = reverse("api:get_organization_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 410
+    data = response.json()
+    assert data["reason"] == "expired"
+    assert "expired" in data["message"].lower()
+    assert data["organization_name"] == organization.name
+    assert data["organization_slug"] == organization.slug
+
+
+def test_get_organization_token_returns_410_for_used_up_token(
+    client: Client, organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """GET /organizations/tokens/{token_id} returns 410 with reason 'used_up' for exhausted tokens."""
+    # Arrange
+    default_tier = MembershipTier.objects.get(organization=organization, name="General membership")
+    token = OrganizationToken.objects.create(
+        organization=organization,
+        issuer=organization_owner_user,
+        membership_tier=default_tier,
+        expires_at=timezone.now() + timedelta(hours=1),
+        max_uses=3,
+        uses=3,
+    )
+    url = reverse("api:get_organization_token", kwargs={"token_id": token.id})
+
+    # Act
+    response = client.get(url)
+
+    # Assert
+    assert response.status_code == 410
+    data = response.json()
+    assert data["reason"] == "used_up"
+    assert "maximum number of uses" in data["message"].lower()
+    assert data["organization_name"] == organization.name
+    assert data["organization_slug"] == organization.slug
+
+
+# --- Tests for ticket_tier_id validation ---
+
+
+def test_create_event_token_succeeds_without_ticket_tier_for_ticketed_events(
+    organization_owner_client: Client, event: Event, vip_tier: TicketTier
+) -> None:
+    """Test that ticket_tier_id is optional even when event.requires_ticket is True."""
+    # Arrange - event fixture has requires_ticket=True by default
+    url = reverse("api:create_event_token", kwargs={"event_id": event.pk})
+    payload = {"name": "Test Token", "max_uses": 10, "duration": 60}
+
+    # Act
+    response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+
+    # Assert
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "Test Token"
+    assert data["ticket_tiers"] == []
+
+
+def test_create_event_token_succeeds_with_ticket_tier_for_ticketed_events(
+    organization_owner_client: Client, event: Event, event_ticket_tier: TicketTier
+) -> None:
+    """Test that token creation succeeds when ticket_tier_ids is provided for ticketed events."""
+    # Arrange - use event_ticket_tier which belongs to event
+    url = reverse("api:create_event_token", kwargs={"event_id": event.pk})
+    payload = {
+        "name": "Test Token",
+        "max_uses": 10,
+        "duration": 60,
+        "ticket_tier_ids": [str(event_ticket_tier.id)],
+    }
+
+    # Act
+    response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+
+    # Assert
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "Test Token"
+    assert len(data["ticket_tiers"]) == 1
+    assert str(data["ticket_tiers"][0]["id"]) == str(event_ticket_tier.id)
+
+
+def test_create_event_token_allows_empty_ticket_tiers_for_non_ticketed_events(
+    organization_owner_client: Client, organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that ticket_tier_ids can be empty when event.requires_ticket is False."""
+    # Arrange - create a non-ticketed event
+    non_ticketed_event = Event.objects.create(
+        organization=organization,
+        name="Non-Ticketed Event",
+        slug="non-ticketed-event",
+        requires_ticket=False,
+        start="2025-12-01T10:00:00Z",
+        end="2025-12-01T12:00:00Z",
+    )
+    url = reverse("api:create_event_token", kwargs={"event_id": non_ticketed_event.pk})
+    payload = {"name": "Test Token", "max_uses": 10, "duration": 60}
+
+    # Act
+    response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+
+    # Assert
+    assert response.status_code == 200
+    data = response.json()
+    assert data["name"] == "Test Token"
+    assert data["ticket_tiers"] == []
+
+
+def test_create_event_token_validates_ticket_tier_belongs_to_event(
+    organization_owner_client: Client, event: Event, organization_owner_user: RevelUser, organization: Organization
+) -> None:
+    """Test that ticket_tier_ids must belong to the event."""
+    # Arrange - create a different event with its own tier
+    other_event = Event.objects.create(
+        organization=organization,
+        name="Other Event",
+        slug="other-event",
+        start="2025-12-01T10:00:00Z",
+        end="2025-12-01T12:00:00Z",
+    )
+    other_tier = TicketTier.objects.create(
+        event=other_event, name="Other Tier", price=50, total_quantity=100, payment_method="online"
+    )
+
+    url = reverse("api:create_event_token", kwargs={"event_id": event.pk})
+    payload = {"name": "Test Token", "ticket_tier_ids": [str(other_tier.id)]}
+
+    # Act
+    response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+
+    # Assert
+    assert response.status_code == 404  # tier not found for this event
+
+
+# --- Tests for token visibility use case ---
+
+
+def test_event_token_grants_visibility_via_header(client: Client, private_event: Event, public_user: RevelUser) -> None:
+    """Test that X-Event-Token header grants visibility to private events."""
+    # Arrange - create a read-only token (no invitation)
+    token = event_service.create_event_token(event=private_event, issuer=private_event.organization.owner)
+    token.grants_invitation = False
+    token.save()
+
+    # Act - access event with token header (without authentication)
+    url = reverse("api:get_event", kwargs={"event_id": private_event.pk})
+    response = client.get(url, HTTP_X_EVENT_TOKEN=token.id)
+
+    # Assert - should be able to see the event
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == str(private_event.pk)
+
+
+def test_organization_token_grants_visibility_via_header(client: Client, organization_owner_user: RevelUser) -> None:
+    """Test that X-Org-Token header grants visibility to private organizations."""
+    # Arrange - create a private organization
+    from events.models import MembershipTier
+
+    private_org = Organization.objects.create(
+        name="Private Org", slug="private-org", owner=organization_owner_user, visibility="private"
+    )
+    # Get the default tier for the new organization
+    default_tier = MembershipTier.objects.get(organization=private_org, name="General membership")
+    # Create a token (grants_membership=True by default which is fine for visibility)
+    token = organization_service.create_organization_token(
+        organization=private_org, issuer=organization_owner_user, membership_tier=default_tier
+    )
+
+    # Act - access organization with token header (without authentication)
+    url = reverse("api:get_organization", kwargs={"slug": private_org.slug})
+    response = client.get(url, HTTP_X_ORG_TOKEN=token.id)
+
+    # Assert - should be able to see the organization
+    assert response.status_code == 200
+    data = response.json()
+    assert data["slug"] == private_org.slug
+
+
+# --- Tests for backwards compatibility with query params ---
+
+
+def test_event_token_backwards_compatible_with_query_param(
+    client: Client, private_event: Event, public_user: RevelUser
+) -> None:
+    """Test that ?et= query param still works for backwards compatibility."""
+    # Arrange - create a read-only token (no invitation)
+    token = event_service.create_event_token(event=private_event, issuer=private_event.organization.owner)
+    token.grants_invitation = False
+    token.save()
+
+    # Act - access event with legacy query param
+    url = reverse("api:get_event", kwargs={"event_id": private_event.pk})
+    response = client.get(f"{url}?et={token.id}")
+
+    # Assert - should still work
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == str(private_event.pk)
+
+
+def test_organization_token_backwards_compatible_with_query_param(
+    client: Client, organization_owner_user: RevelUser
+) -> None:
+    """Test that ?ot= query param still works for backwards compatibility."""
+    # Arrange - create a private organization
+    from events.models import MembershipTier
+
+    private_org = Organization.objects.create(
+        name="Private Org Legacy", slug="private-org-legacy", owner=organization_owner_user, visibility="private"
+    )
+    # Get the default tier for the new organization
+    default_tier = MembershipTier.objects.get(organization=private_org, name="General membership")
+    token = organization_service.create_organization_token(
+        organization=private_org, issuer=organization_owner_user, membership_tier=default_tier
+    )
+
+    # Act - access organization with legacy query param
+    url = reverse("api:get_organization", kwargs={"slug": private_org.slug})
+    response = client.get(f"{url}?ot={token.id}")
+
+    # Assert - should still work
+    assert response.status_code == 200
+    data = response.json()
+    assert data["slug"] == private_org.slug
+
+
+# --- Tests for 410 Gone on expired / used-up tokens ---
+
+
+def test_expired_event_token_returns_410_for_private_event(client: Client, private_event: Event) -> None:
+    """GET /events/{id} with an expired token for that event returns 410 Gone.
+
+    Previously this returned 404 (indistinguishable from 'event does not exist').
+    The 410 lets the frontend show a meaningful message to the user.
+    """
+    # Arrange
+    token = EventToken.objects.create(
+        event=private_event,
+        issuer=private_event.organization.owner,
+        expires_at=timezone.now() - timedelta(hours=1),
+    )
+    url = reverse("api:get_event", kwargs={"event_id": private_event.pk})
+
+    # Act
+    response = client.get(url, HTTP_X_EVENT_TOKEN=token.pk)
+
+    # Assert
+    assert response.status_code == 410
+    assert "expired" in response.json()["detail"].lower()
+
+
+def test_used_up_event_token_returns_410_for_private_event(client: Client, private_event: Event) -> None:
+    """GET /events/{id} with a fully-used token for that event returns 410 Gone.
+
+    The response message should mention that the link has reached its maximum
+    number of uses.
+    """
+    # Arrange
+    token = EventToken.objects.create(
+        event=private_event,
+        issuer=private_event.organization.owner,
+        expires_at=timezone.now() + timedelta(hours=1),
+        max_uses=3,
+        uses=3,
+    )
+    url = reverse("api:get_event", kwargs={"event_id": private_event.pk})
+
+    # Act
+    response = client.get(url, HTTP_X_EVENT_TOKEN=token.pk)
+
+    # Assert
+    assert response.status_code == 410
+    assert "maximum number of uses" in response.json()["detail"].lower()
+
+
+def test_expired_token_for_different_event_returns_404(
+    client: Client, private_event: Event, organization: Organization
+) -> None:
+    """GET /events/{id} with an expired token for a *different* event returns 404.
+
+    This is the info-leakage guard: the controller must not reveal the
+    existence of event B just because the user holds a dead token for event A.
+    """
+    # Arrange -- token belongs to a *different* private event
+    other_event = Event.objects.create(
+        organization=organization,
+        name="Other Private Event",
+        slug="other-private-event",
+        visibility=Event.Visibility.PRIVATE,
+        event_type=Event.EventType.PRIVATE,
+        status="open",
+        start=timezone.now() + timedelta(days=7),
+    )
+    token = EventToken.objects.create(
+        event=other_event,
+        issuer=organization.owner,
+        expires_at=timezone.now() - timedelta(hours=1),
+    )
+    url = reverse("api:get_event", kwargs={"event_id": private_event.pk})
+
+    # Act
+    response = client.get(url, HTTP_X_EVENT_TOKEN=token.pk)
+
+    # Assert -- must be 404, not 410
+    assert response.status_code == 404
+
+
+def test_expired_event_token_returns_410_via_slug_endpoint(client: Client, private_event: Event) -> None:
+    """GET /events/{org_slug}/event/{event_slug} with an expired token returns 410.
+
+    Ensures the slug-based lookup path has the same 410 behaviour as the
+    UUID-based path.
+    """
+    # Arrange
+    token = EventToken.objects.create(
+        event=private_event,
+        issuer=private_event.organization.owner,
+        expires_at=timezone.now() - timedelta(hours=1),
+    )
+    url = reverse(
+        "api:get_event_by_slug",
+        kwargs={
+            "org_slug": private_event.organization.slug,
+            "event_slug": private_event.slug,
+        },
+    )
+
+    # Act
+    response = client.get(url, HTTP_X_EVENT_TOKEN=token.pk)
+
+    # Assert
+    assert response.status_code == 410
+    assert "expired" in response.json()["detail"].lower()

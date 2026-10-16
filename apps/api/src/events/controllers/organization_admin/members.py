@@ -1,0 +1,390 @@
+import typing as t
+from uuid import UUID
+
+from django.db.models import OuterRef, Prefetch, QuerySet, Subquery
+from django.shortcuts import get_object_or_404
+from django.utils.translation import gettext_lazy as _
+from ninja import Path, Query
+from ninja.errors import HttpError
+from ninja_extra import api_controller, route
+from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseSchema, paginate
+from ninja_extra.searching import Searching, searching
+
+from accounts.models import RevelUser
+from common.authentication import I18nJWTAuth, ScopedJWTAuth
+from common.models import Tag
+from common.schema import ErrorDetail, TagSchema
+from common.throttling import UserDefaultThrottle, WriteThrottle
+from events import filters, models, schema
+from events.controllers.permissions import IsOrganizationOwner, IsOrganizationStaff, OrganizationPermission
+from events.service import organization_service
+from oauth.permissions import RequireScope
+
+from .base import OrganizationAdminBaseController
+
+# Verification codes are a membership card QR payload ("member:" + UUID) or a bare
+# member UUID (tolerant — lets staff paste an id from the members list).
+MEMBER_VERIFY_CODE_PATTERN = r"^(member:)?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+
+
+@api_controller(
+    "/organization-admin/{slug}",
+    auth=ScopedJWTAuth(),
+    tags=["Organization Admin"],
+    throttle=WriteThrottle(),
+    permissions=[RequireScope("org:read"), OrganizationPermission("manage_members")],
+)
+class OrganizationAdminMembersController(OrganizationAdminBaseController):
+    """Organization membership management endpoints.
+
+    Handles members, membership tiers, staff, and tags.
+    """
+
+    # ---- Members ----
+
+    @route.get(
+        "/members",
+        url_name="list_organization_members",
+        response=PaginatedResponseSchema[schema.OrganizationMemberSchema],
+        # ``org:members`` ("Manage members and subscriptions"), not the ``org:read`` baseline:
+        # ``IsOrganizationStaff`` binds ``is_staff``, which is not a ``PermissionKey``, so
+        # ``scope_allows`` never runs and ``RequireScope`` is the only scope gate on a response
+        # nesting every member's email, phone number, real name, pronouns and live subscription.
+        # ``GET /staff`` already resolves to ``org:members`` through ``manage_members`` (R-123).
+        # The ``org:read`` baseline stays alongside it, as on every other organizer route.
+        permissions=[RequireScope("org:read"), RequireScope("org:members"), IsOrganizationStaff()],
+        throttle=UserDefaultThrottle(),
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(
+        Searching,
+        search_fields=["user__username", "user__email", "user__first_name", "user__last_name", "user__preferred_name"],
+    )
+    def list_members(
+        self,
+        slug: str,
+        params: t.Annotated[filters.MembershipFilterSchema, Query(...)],
+    ) -> QuerySet[models.OrganizationMember]:
+        """List all members of an organization.
+
+        Each row inlines the member's non-terminal subscription in this organization (if
+        any) so the ban/remove confirmation dialogs can warn that the action cancels it
+        and stops billing. Prefetched (subscription + annotated plan) to keep it O(1).
+        """
+        organization = self.get_one(slug)
+        active_subscriptions = (
+            models.MembershipSubscription.objects.filter(organization=organization)
+            .exclude(status__in=models.MembershipSubscription.TERMINAL_STATUSES)
+            .select_related("user")
+            # ``SubscriptionSchema.member_status`` reads this annotation; without
+            # it the nested schema would issue one member lookup per row.
+            .annotate(
+                member_status=Subquery(
+                    models.OrganizationMember.objects.filter(
+                        organization_id=OuterRef("organization_id"),
+                        user_id=OuterRef("user_id"),
+                    ).values("status")[:1]
+                )
+            )
+            .prefetch_related(
+                # Forward-FK prefetch rather than select_related: the nested PlanSchema
+                # reads the ``active_subscription_count`` annotation, which would
+                # otherwise fall back to a COUNT per row.
+                Prefetch(
+                    "plan",
+                    queryset=models.MembershipSubscriptionPlan.objects.with_active_subscription_count().select_related(
+                        "tier"
+                    ),
+                )
+            )
+        )
+        qs = (
+            models.OrganizationMember.objects.filter(organization=organization)
+            .select_related("user", "tier")
+            .prefetch_related(
+                Prefetch(
+                    "user__membership_subscriptions",
+                    queryset=active_subscriptions,
+                    to_attr="_org_active_subs",
+                )
+            )
+        )
+        return params.filter(qs).distinct()
+
+    @route.get(
+        "/members/verify/{code}",
+        url_name="verify_organization_member",
+        response=schema.MemberVerificationSchema,
+        permissions=[RequireScope("org:read"), OrganizationPermission("check_in_attendees")],
+        throttle=UserDefaultThrottle(),
+    )
+    def verify_member(
+        self,
+        slug: str,
+        code: t.Annotated[str, Path(..., min_length=36, max_length=43, pattern=MEMBER_VERIFY_CODE_PATTERN)],
+    ) -> schema.MemberVerificationSchema:
+        """Verify a membership card scanned at a door (side-effect-free).
+
+        Reports the member's true status (including paused/cancelled/banned) so
+        door staff see the state, not a lookup failure; the name and photo in
+        ``user`` are the anti-impersonation check.
+        """
+        organization = self.get_one(slug)
+        raw = code.removeprefix(models.OrganizationMember.QR_PREFIX)
+        member = get_object_or_404(
+            models.OrganizationMember.objects.select_related("user", "tier"),
+            pk=UUID(raw),
+            organization=organization,
+        )
+        return schema.MemberVerificationSchema.from_member(member)
+
+    @route.put(
+        "/members/{user_id}",
+        url_name="update_organization_member",
+        response=schema.OrganizationMemberSchema,
+    )
+    def update_member(
+        self, slug: str, user_id: UUID, payload: schema.OrganizationMemberUpdateSchema
+    ) -> models.OrganizationMember:
+        """Update a member's status and/or tier.
+
+        Allows organization admins to:
+        - Change membership status (active, paused, cancelled, banned)
+        - Assign or change membership tier
+        - Remove tier assignment by setting tier_id to null
+
+        The tier must belong to the same organization as the membership.
+        """
+        organization = self.get_one(slug)
+        member = get_object_or_404(
+            models.OrganizationMember.objects.select_related("user", "tier"),
+            organization=organization,
+            user_id=user_id,
+        )
+
+        update_data = payload.model_dump(exclude_unset=True)
+        if not update_data:
+            return member
+
+        # Resolve tier_id to tier object if provided
+        tier = None
+        clear_tier = False
+        if "tier_id" in update_data:
+            tier_id = update_data.pop("tier_id")
+            if tier_id is None:
+                clear_tier = True
+            else:
+                tier = get_object_or_404(models.MembershipTier, pk=tier_id, organization=organization)
+
+        return organization_service.update_member(
+            member, status=update_data.get("status"), tier=tier, clear_tier=clear_tier
+        )
+
+    @route.delete(
+        "/members/{user_id}",
+        url_name="remove_organization_member",
+        response={204: None},
+    )
+    def remove_member(self, slug: str, user_id: UUID) -> tuple[int, None]:
+        """Remove a member from an organization."""
+        organization = self.get_one(slug)
+        user_to_remove = get_object_or_404(RevelUser, id=user_id)
+        organization_service.remove_member(organization, user_to_remove)
+        return 204, None
+
+    @route.post(
+        "/members/{user_id}",
+        url_name="create_organization_member",
+        response={201: schema.OrganizationMemberSchema},
+    )
+    def add_member(
+        self, slug: str, user_id: UUID, payload: schema.MemberAddSchema
+    ) -> tuple[int, models.OrganizationMember]:
+        """Add a member to an organization."""
+        organization = self.get_one(slug)
+        user_to_add = get_object_or_404(RevelUser, id=user_id)
+        tier = get_object_or_404(models.MembershipTier, pk=payload.tier_id, organization=organization)
+        return 201, organization_service.add_member(organization, user_to_add, tier)
+
+    # ---- Membership Tiers ----
+
+    @route.get(
+        "/membership-tiers",
+        url_name="list_membership_tiers",
+        response=list[schema.MembershipTierAdminSchema],
+        # Moved with the roster (R-123): every write on this path already requires
+        # ``org:members``, so leaving the read on the baseline alone buys nothing.
+        permissions=[RequireScope("org:read"), RequireScope("org:members"), IsOrganizationStaff()],
+        throttle=UserDefaultThrottle(),
+    )
+    def list_membership_tiers(self, slug: str) -> QuerySet[models.MembershipTier]:
+        """List all membership tiers for an organization."""
+        organization = self.get_one(slug)
+        return models.MembershipTier.objects.filter(organization=organization).distinct()
+
+    @route.post(
+        "/membership-tiers",
+        url_name="create_membership_tier",
+        response={201: schema.MembershipTierAdminSchema},
+    )
+    def create_membership_tier(
+        self, slug: str, payload: schema.MembershipTierCreateSchema
+    ) -> tuple[int, models.MembershipTier]:
+        """Create a new membership tier for the organization."""
+        organization = self.get_one(slug)
+        tier = organization_service.create_membership_tier(organization, payload)
+        return 201, tier
+
+    @route.patch(
+        "/membership-tiers/reorder",
+        url_name="reorder_membership_tiers",
+        response={204: None},
+    )
+    def reorder_membership_tiers(self, slug: str, payload: schema.ReorderSchema) -> tuple[int, None]:
+        """Reorder membership tiers for an organization."""
+        organization = self.get_one(slug)
+        organization_service.reorder_membership_tiers(organization, payload.tier_ids)
+        return 204, None
+
+    @route.put(
+        "/membership-tiers/{tier_id}",
+        url_name="update_membership_tier",
+        response=schema.MembershipTierAdminSchema,
+    )
+    def update_membership_tier(
+        self, slug: str, tier_id: UUID, payload: schema.MembershipTierUpdateSchema
+    ) -> models.MembershipTier:
+        """Update a membership tier."""
+        organization = self.get_one(slug)
+        tier = get_object_or_404(models.MembershipTier, pk=tier_id, organization=organization)
+        return organization_service.update_membership_tier(tier, payload)
+
+    @route.delete(
+        "/membership-tiers/{tier_id}",
+        url_name="delete_membership_tier",
+        response={204: None, 409: ErrorDetail},
+    )
+    def delete_membership_tier(self, slug: str, tier_id: UUID) -> tuple[int, None]:
+        """Delete a membership tier.
+
+        Members assigned to this tier will have their tier set to NULL (due to SET_NULL on the FK),
+        and the tier's subscription plans are deleted along with it. Answers 409 when a membership
+        application or a subscription still references the tier or one of its plans.
+        """
+        organization = self.get_one(slug)
+        tier = get_object_or_404(models.MembershipTier, pk=tier_id, organization=organization)
+        organization_service.delete_membership_tier(tier)
+        return 204, None
+
+    # ---- Staff ----
+
+    @route.get(
+        "/staff",
+        url_name="list_organization_staff",
+        response=PaginatedResponseSchema[schema.OrganizationStaffSchema],
+        throttle=UserDefaultThrottle(),
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["user__username", "user__email", "user__first_name", "user__last_name"])
+    def list_staff(self, slug: str) -> QuerySet[models.OrganizationStaff]:
+        """List all staff of an organization."""
+        organization = self.get_one(slug)
+        return models.OrganizationStaff.objects.filter(organization=organization).select_related("user").distinct()
+
+    @route.delete(
+        "/staff/{user_id}",
+        url_name="remove_organization_staff",
+        response={204: None},
+        # Owner-gated: ``org:read``'s label ("See your organizations, events and settings")
+        # does not promise this, and no scope in the registry honestly covers it, so the route
+        # stays session-only rather than being gated by a scope that understates it (R-93).
+        auth=I18nJWTAuth(),
+        permissions=[IsOrganizationOwner()],
+    )
+    def remove_staff(self, slug: str, user_id: UUID) -> tuple[int, None]:
+        """Remove a staff member from an organization."""
+        organization = self.get_one(slug)
+        user_to_remove = get_object_or_404(RevelUser, id=user_id)
+        organization_service.remove_staff(organization, user_to_remove)
+        return 204, None
+
+    @route.post(
+        "/staff/{user_id}",
+        url_name="create_organization_staff",
+        response={201: schema.OrganizationStaffSchema},
+        # Owner-only, enforced in the handler body rather than by ``IsOrganizationOwner()``, so
+        # the permission list alone does not show it. Granting staff powers with an arbitrary
+        # permission map is strictly more dangerous than the removal pinned above, so it is
+        # session-only too rather than reachable on ``org:read org:members`` (R-100).
+        auth=I18nJWTAuth(),
+    )
+    def add_staff(
+        self, slug: str, user_id: UUID, payload: models.PermissionsSchema | None = None
+    ) -> tuple[int, models.OrganizationStaff]:
+        """Add a staff member to an organization."""
+        organization = self.get_one(slug)
+        if organization.owner != self.user():
+            raise HttpError(403, str(_("Only the organization owner can create staff members.")))
+        users_to_add = get_object_or_404(RevelUser, id=user_id)
+        return 201, organization_service.add_staff(organization, users_to_add, permissions=payload)
+
+    @route.put(
+        "/staff/{user_id}/permissions",
+        url_name="update_staff_permissions",
+        response=schema.OrganizationStaffSchema,
+        # Owner-only, enforced in the handler body (see ``add_staff``). ``edit_organization`` is
+        # in ``UNSCOPED_KEYS``, so app tokens were already refused here — but only *incidentally*,
+        # by a mapping in another file. Pin the auth so the protection is stated, not inherited
+        # from a coincidence (R-100).
+        auth=I18nJWTAuth(),
+        permissions=[OrganizationPermission("edit_organization")],  # Only owners can do this
+    )
+    def update_staff_permissions(
+        self, slug: str, user_id: UUID, payload: models.PermissionsSchema
+    ) -> models.OrganizationStaff:
+        """Update a staff member's permissions."""
+        organization = self.get_one(slug)
+        # Check if current user is the owner
+        if organization.owner != self.user():
+            raise HttpError(403, str(_("Only the organization owner can change staff permissions.")))
+
+        staff_member = get_object_or_404(models.OrganizationStaff, organization=organization, user_id=user_id)
+        return organization_service.update_staff_permissions(staff_member, payload)
+
+    # ---- Tags ----
+
+    @route.post(
+        "/tags",
+        url_name="add_organization_tags",
+        response=list[TagSchema],
+        permissions=[RequireScope("org:read"), OrganizationPermission("edit_organization")],
+    )
+    def add_tags(self, slug: str, payload: schema.TagUpdateSchema) -> list[Tag]:
+        """Add one or more tags to the organization."""
+        organization = self.get_one(slug)
+        organization.tags_manager.add(*payload.tags)
+        return organization.tags_manager.all()
+
+    @route.delete(
+        "/tags",
+        url_name="clear_organization_tags",
+        response={204: None},
+        permissions=[RequireScope("org:read"), OrganizationPermission("edit_organization")],
+    )
+    def clear_tags(self, slug: str) -> tuple[int, None]:
+        """Clear all tags from the organization."""
+        organization = self.get_one(slug)
+        organization.tags_manager.clear()
+        return 204, None
+
+    @route.post(
+        "/tags/remove",
+        url_name="remove_organization_tags",
+        response=list[TagSchema],
+        permissions=[RequireScope("org:read"), OrganizationPermission("edit_organization")],
+    )
+    def remove_tags(self, slug: str, payload: schema.TagUpdateSchema) -> list[Tag]:
+        """Remove one or more tags from the organization."""
+        organization = self.get_one(slug)
+        organization.tags_manager.remove(*payload.tags)
+        return organization.tags_manager.all()

@@ -1,0 +1,181 @@
+import * as m from '$lib/paraglide/messages.js';
+import {
+	extractApiErrorDetail,
+	extractValidationErrors,
+	isResponseMessage
+} from '$lib/utils/api-error-detail';
+import { getEligibilityRefusalMessage } from '$lib/utils/eligibility';
+
+/**
+ * Maps backend error messages to localized user-friendly messages
+ * @param errorMessage - The error message from the backend API
+ * @returns Localized error message
+ */
+export function getLocalizedError(errorMessage: string | undefined): string {
+	if (!errorMessage) {
+		return m['guest_attendance.network_error']();
+	}
+
+	const lowerMessage = errorMessage.toLowerCase();
+
+	// Pattern: Account exists, must log in
+	if (
+		lowerMessage.includes('already exists') ||
+		lowerMessage.includes('log in') ||
+		lowerMessage.includes('login')
+	) {
+		return m['guest_attendance.account_exists']();
+	}
+
+	// Pattern: Event requires authentication
+	if (lowerMessage.includes('requires login') || lowerMessage.includes('create an account')) {
+		return m['guest_attendance.auth_required']();
+	}
+
+	// Pattern: Event is full
+	if (lowerMessage.includes('full') || lowerMessage.includes('sold out')) {
+		return m['guest_attendance.event_full']();
+	}
+
+	// Pattern: Deadline passed
+	if (
+		lowerMessage.includes('deadline') ||
+		(lowerMessage.includes('expired') && lowerMessage.includes('rsvp'))
+	) {
+		return m['guest_attendance.deadline_passed']();
+	}
+
+	// Pattern: Token expired
+	if (lowerMessage.includes('expired') && lowerMessage.includes('token')) {
+		return m['guest_attendance.token_expired']();
+	}
+
+	// Pattern: Token already used. The confirm endpoint blacklists a token on
+	// first use, so a second click on the same email link answers 401
+	// "Token is blacklisted." — the same user-facing situation.
+	if (
+		lowerMessage.includes('blacklisted') ||
+		(lowerMessage.includes('already') &&
+			(lowerMessage.includes('confirmed') || lowerMessage.includes('used')))
+	) {
+		return m['guest_attendance.token_used']();
+	}
+
+	// Pattern: Invalid token
+	if (lowerMessage.includes('invalid') && lowerMessage.includes('token')) {
+		return m['guest_attendance.token_invalid']();
+	}
+
+	// Seat errors surfaced at checkout/confirm time (#657, seating phase 1).
+	// Backend strings (batch_ticket_service.py):
+	//   409 "One or more selected seats are held by another buyer."
+	if (lowerMessage.includes('held by another buyer')) {
+		return m['guestAttendance.seatHeldConflict']();
+	}
+	//   400 "One or more selected seats are no longer available."
+	//   400 "One or more selected seats are invalid or not in the correct sector."
+	if (
+		lowerMessage.includes('seat') &&
+		(lowerMessage.includes('no longer available') ||
+			lowerMessage.includes('not in the correct sector'))
+	) {
+		return m['guestAttendance.seatTaken']();
+	}
+	//   409 "Not enough accessible seats available — please contact the organizer."
+	//   — confirm-time best_available assignment exhausted the accessible pool.
+	if (lowerMessage.includes('not enough accessible seats')) {
+		return m['guestAttendance.accessibleSeatsExhausted']();
+	}
+	//   400 "Seat selection is required for this ticket tier." — hits guests whose
+	//   confirmation token predates the migration of legacy 'random' tiers to
+	//   user_choice (token minted with seat_id=null).
+	if (lowerMessage.includes('seat selection is required')) {
+		return m['guestAttendance.seatSelectionRequired']();
+	}
+
+	// Pattern: Tickets unavailable
+	if (
+		lowerMessage.includes('ticket') &&
+		(lowerMessage.includes('unavailable') || lowerMessage.includes('not available'))
+	) {
+		return m['guest_attendance.ticket_unavailable']();
+	}
+
+	// Fallback: Return backend message (backend uses Django i18n)
+	return errorMessage;
+}
+
+/**
+ * Bare `{ reason: string }` probe for eligibility-ish payloads that lack the
+ * `event_id` the full `isEligibilityRefusal` predicate requires. Real
+ * predicate narrowing, no casts (house rule from api-error-detail.ts).
+ */
+function plainReason(value: unknown): string | null {
+	if (value && typeof value === 'object' && 'reason' in value) {
+		const reason = value.reason;
+		if (typeof reason === 'string' && reason !== '') return reason;
+	}
+	return null;
+}
+
+/**
+ * Reads the message out of a backend error payload by composing the canonical
+ * shape-safe helpers (api-error-detail.ts, eligibility.ts) instead of
+ * hand-rolled casts: `detail` (string or 422 list) → eligibility refusal
+ * (reason_code-aware) → bare `reason` → `{ errors }` map → `message` last
+ * (genuine on almost no endpoints — see backendMessage's rationale).
+ */
+function messageFromErrorBody(body: unknown): string | null {
+	return (
+		extractApiErrorDetail(body) ??
+		getEligibilityRefusalMessage(body) ??
+		plainReason(body) ??
+		extractValidationErrors(body) ??
+		(isResponseMessage(body) ? body.message : null)
+	);
+}
+
+/**
+ * Extracts error message from various error formats
+ * @param error - Error object from API call
+ * @returns Error message string
+ */
+export function extractErrorMessage(error: unknown): string {
+	// Handle different error formats
+	if (typeof error === 'string') {
+		return error;
+	}
+
+	if (error && typeof error === 'object') {
+		// Some wrappers nest the payload under `body`
+		if ('body' in error) {
+			const fromBody = messageFromErrorBody(error.body);
+			if (fromBody) {
+				return fromBody;
+			}
+		}
+
+		// The @hey-api client's `response.error` IS the parsed body itself
+		const direct = messageFromErrorBody(error);
+		if (direct) {
+			return direct;
+		}
+
+		// Handle Error instance
+		if ('message' in error && typeof error.message === 'string') {
+			return error.message;
+		}
+	}
+
+	return m['guest_attendance.network_error']();
+}
+
+/**
+ * Processes an API error and returns a localized user-friendly message
+ * @param error - Error object from API call
+ * @returns Localized error message
+ */
+export function handleGuestAttendanceError(error: unknown): string {
+	const errorMessage = extractErrorMessage(error);
+	return getLocalizedError(errorMessage);
+}

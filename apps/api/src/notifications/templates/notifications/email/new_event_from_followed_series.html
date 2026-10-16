@@ -1,0 +1,20 @@
+{% extends "emails/base.html" %}
+{% load i18n markdown_tags %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<p>{% blocktranslate with series=context.event_series_name event=context.event_name %}New event in <strong>{{ series }}</strong>: <strong>{{ event }}</strong>{% endblocktranslate %}</p>
+
+<div class="card">
+    <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+    <div class="info-row"><span class="label">{% trans "Event:" %}</span> {{ context.event_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Series:" %}</span> {{ context.event_series_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Organization:" %}</span> {{ context.organization_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Date:" %}</span> {{ context.event_start_formatted }}</div>
+    <div class="info-row"><span class="label">{% trans "Location:" %}</span> {{ context.event_location }}</div>
+    {% if context.event_description %}<div class="info-row" style="margin-top: 10px;"><span class="label">{% trans "Description:" %}</span><div>{{ context.event_description|markdown|truncatewords_html:100 }}</div></div>{% endif %}
+</div>
+
+<center>
+    <a href="{{ context.event_url }}" class="button">{% trans "View Event" %}</a>
+</center>
+{% endblock %}

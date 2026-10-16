@@ -1,0 +1,586 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { enhance, applyAction } from '$app/forms';
+	import { invalidate } from '$app/navigation';
+	import {
+		Shield,
+		CheckCircle,
+		XCircle,
+		AlertCircle,
+		Copy,
+		Check,
+		Key,
+		Mail
+	} from '@lucide/svelte';
+	import { toast } from 'svelte-sonner';
+	import TwoFactorInput from '$lib/components/forms/TwoFactorInput.svelte';
+	import EmailChangeCard from './email-change-card.svelte';
+	import LinkedIdentitiesCard from './linked-identities-card.svelte';
+	import type { PageData, ActionData } from './$types';
+	import QRCode from 'qrcode';
+	import { accountResetPasswordRequest } from '$lib/api/generated';
+	import PageHeader from '$lib/components/common/PageHeader.svelte';
+	import SectionHeader from '$lib/components/common/SectionHeader.svelte';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+	import { authStore } from '$lib/stores/auth.svelte';
+
+	interface Props {
+		data: PageData;
+		form: ActionData;
+	}
+
+	const { data, form }: Props = $props();
+
+	// State management
+	let isEnabling = $state(false);
+	let showSetupFlow = $state(false);
+	let showDisableFlow = $state(false);
+	let qrCodeDataUrl = $state<string>('');
+	let otpCode = $state('');
+	let isSubmitting = $state(false);
+	let manualEntryCopied = $state(false);
+
+	// Password change state
+	let showPasswordChangeFlow = $state(false);
+	let isRequestingPasswordReset = $state(false);
+	let passwordResetRequested = $state(false);
+
+	/** Extract string `errors.form` / `errors.code` from an action failure payload. */
+	function actionErrors(payload: Record<string, unknown>): { form?: string; code?: string } {
+		const out: { form?: string; code?: string } = {};
+		const errors = payload.errors;
+		if (typeof errors === 'object' && errors !== null) {
+			if ('form' in errors && typeof errors.form === 'string') out.form = errors.form;
+			if ('code' in errors && typeof errors.code === 'string') out.code = errors.code;
+		}
+		return out;
+	}
+
+	// Derived state
+	const totpActive = $derived(data.totpActive);
+	const provisioningUri = $derived(form?.provisioningUri);
+	const setupSuccess = $derived(form?.verified);
+	const disableSuccess = $derived(form?.disabled);
+
+	// Extract manual entry code from provisioning URI
+	const manualEntryCode = $derived.by(() => {
+		if (!provisioningUri) return '';
+		const match = provisioningUri.match(/secret=([A-Z0-9]+)/);
+		return match ? match[1] : '';
+	});
+
+	// Generate QR code when provisioning URI is available
+	$effect(() => {
+		if (provisioningUri && !qrCodeDataUrl) {
+			QRCode.toDataURL(provisioningUri, { width: 256, margin: 2 })
+				.then((url) => {
+					qrCodeDataUrl = url;
+				})
+				.catch((err) => {
+					console.error('Failed to generate QR code:', err);
+					toast.error(m['accountSecurityPage.toast_qrCodeError']());
+				});
+		}
+	});
+
+	// Handle successful setup/disable
+	$effect(() => {
+		if (setupSuccess) {
+			toast.success(form?.message || m['accountSecurityPage.toast_2faEnabled']());
+			showSetupFlow = false;
+			qrCodeDataUrl = '';
+			otpCode = '';
+			// Invalidate to refresh user data and show updated status
+			invalidate('app:user');
+		}
+	});
+
+	$effect(() => {
+		if (disableSuccess) {
+			toast.success(form?.message || m['accountSecurityPage.toast_2faDisabled']());
+			showDisableFlow = false;
+			otpCode = '';
+			// Invalidate to refresh user data
+			invalidate('app:user');
+		}
+	});
+
+	// Copy manual entry code to clipboard
+	async function copyManualCode() {
+		const code = manualEntryCode;
+		if (!code) return;
+
+		try {
+			await navigator.clipboard.writeText(code);
+			manualEntryCopied = true;
+			toast.success(m['accountSecurityPage.toast_codeCopied']());
+			setTimeout(() => {
+				manualEntryCopied = false;
+			}, 2000);
+		} catch {
+			toast.error(m['accountSecurityPage.toast_copyFailed']());
+		}
+	}
+
+	// Cancel setup flow
+	function cancelSetup() {
+		showSetupFlow = false;
+		qrCodeDataUrl = '';
+		otpCode = '';
+		isEnabling = false;
+	}
+
+	// Cancel disable flow
+	function cancelDisable() {
+		showDisableFlow = false;
+		otpCode = '';
+	}
+
+	// Request password reset
+	async function handlePasswordResetRequest() {
+		if (!data.user?.email || isRequestingPasswordReset) return;
+
+		isRequestingPasswordReset = true;
+		passwordResetRequested = false;
+
+		try {
+			await accountResetPasswordRequest({
+				body: { email: data.user.email }
+			});
+			passwordResetRequested = true;
+			toast.success(m['accountSecurityPage.toast_passwordResetSent']());
+		} catch (error) {
+			console.error('Failed to request password reset:', error);
+			toast.error(m['accountSecurityPage.toast_passwordResetFailed']());
+		} finally {
+			isRequestingPasswordReset = false;
+		}
+	}
+
+	// Cancel password change flow
+	function cancelPasswordChange() {
+		showPasswordChangeFlow = false;
+		passwordResetRequested = false;
+	}
+</script>
+
+<svelte:head>
+	<title>{m['accountSecurityPage.pageTitle']()} - Revel</title>
+</svelte:head>
+
+<div class="container mx-auto max-w-4xl px-4 py-8">
+	<PageHeader
+		kicker={m['myInvoices.account']()}
+		title={m['accountSecurityPage.title']()}
+		subtitle={m['accountSecurityPage.subtitle']()}
+		class="mb-8"
+	/>
+
+	<!-- 2FA Section -->
+	<div class="rounded-lg border bg-card p-6">
+		<div class="flex items-start gap-4">
+			<div
+				class="flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary"
+			>
+				<Shield class="h-6 w-6" aria-hidden="true" />
+			</div>
+
+			<div class="flex-1">
+				<SectionHeader title={m['accountSecurityPage.twoFactorAuth']()} class="flex-1">
+					{#snippet actions()}
+						{#if totpActive}
+							<StatusBadge
+								tone="success"
+								icon={CheckCircle}
+								label={m['accountSecurityPage.statusEnabled']()}
+							/>
+						{:else}
+							<StatusBadge
+								tone="neutral"
+								icon={XCircle}
+								label={m['accountSecurityPage.statusDisabled']()}
+							/>
+						{/if}
+					{/snippet}
+				</SectionHeader>
+				<p class="mt-1 text-sm text-muted-foreground">
+					{m['accountSecurityPage.twoFactorDescription']()}
+				</p>
+
+				<!-- Enable/Disable Button (when not in a flow) -->
+				{#if !showSetupFlow && !showDisableFlow}
+					<div class="mt-6">
+						{#if totpActive}
+							<button
+								type="button"
+								class="rounded-md border border-destructive bg-destructive/10 px-4 py-2 text-sm font-medium text-destructive transition-colors hover:bg-destructive/20 focus:outline-none focus:ring-2 focus:ring-destructive focus:ring-offset-2"
+								onclick={() => {
+									showDisableFlow = true;
+								}}
+							>
+								{m['accountSecurityPage.disable2FA']()}
+							</button>
+						{:else}
+							<form
+								method="POST"
+								action="?/setup"
+								use:enhance={() => {
+									isEnabling = true;
+									return async ({ result }) => {
+										isEnabling = false;
+										if (result.type === 'success') {
+											// Apply action to update form prop
+											await applyAction(result);
+											showSetupFlow = true;
+										} else if (result.type === 'failure' && result.data) {
+											await applyAction(result);
+											const errors = actionErrors(result.data);
+											toast.error(errors.form || m['accountSecurityPage.toast_setupFailed']());
+										}
+									};
+								}}
+							>
+								<button
+									type="submit"
+									disabled={isEnabling}
+									class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
+								>
+									{isEnabling
+										? m['accountSecurityPage.loading']()
+										: m['accountSecurityPage.enable2FA']()}
+								</button>
+							</form>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- Setup Flow -->
+				{#if showSetupFlow}
+					<div class="mt-6 rounded-lg border bg-muted/50 p-6">
+						<h3 class="font-bold">{m['accountSecurityPage.setupTitle']()}</h3>
+
+						{#if provisioningUri}
+							<!-- Step 1: Scan QR Code -->
+							<div class="mt-4">
+								<p class="text-sm text-muted-foreground">
+									<span class="font-medium">{m['accountSecurityPage.step1']()}</span>
+									{m['accountSecurityPage.step1Description']()}
+								</p>
+
+								{#if qrCodeDataUrl}
+									<div class="mt-4 flex justify-center">
+										<img
+											src={qrCodeDataUrl}
+											alt={m['accountSecurityPage.qrCodeAlt']()}
+											class="rounded-lg"
+										/>
+									</div>
+								{:else}
+									<div class="mt-4 flex justify-center">
+										<div class="flex h-64 w-64 items-center justify-center rounded-lg bg-muted">
+											<p class="text-sm text-muted-foreground">
+												{m['accountSecurityPage.generatingQR']()}
+											</p>
+										</div>
+									</div>
+								{/if}
+
+								<!-- Manual Entry Option -->
+								{#if manualEntryCode}
+									<details class="mt-4">
+										<summary class="cursor-pointer text-sm font-medium text-primary">
+											{m['accountSecurityPage.cantScan']()}
+										</summary>
+										<div class="mt-2 rounded-md bg-background p-3">
+											<p class="text-xs text-muted-foreground">
+												{m['accountSecurityPage.enterCodeManually']()}
+											</p>
+											<div class="mt-2 flex items-center gap-2">
+												<code class="flex-1 rounded bg-muted px-3 py-2 font-mono text-sm">
+													{manualEntryCode}
+												</code>
+												<button
+													type="button"
+													onclick={copyManualCode}
+													class="rounded-md p-2 hover:bg-muted focus:outline-none focus:ring-2 focus:ring-ring"
+													aria-label={m['accountSecurityPage.copyCodeLabel']()}
+												>
+													{#if manualEntryCopied}
+														<Check class="h-4 w-4 text-success" aria-hidden="true" />
+													{:else}
+														<Copy class="h-4 w-4" aria-hidden="true" />
+													{/if}
+												</button>
+											</div>
+										</div>
+									</details>
+								{/if}
+							</div>
+
+							<!-- Step 2: Verify Code -->
+							<div class="mt-6">
+								<p class="text-sm text-muted-foreground">
+									<span class="font-medium">{m['accountSecurityPage.step2']()}</span>
+									{m['accountSecurityPage.step2Description']()}
+								</p>
+
+								<form
+									method="POST"
+									action="?/verify"
+									use:enhance={() => {
+										isSubmitting = true;
+										return async ({ result }) => {
+											isSubmitting = false;
+											await applyAction(result);
+											if (result.type === 'failure' && result.data) {
+												const errors = actionErrors(result.data);
+												toast.error(
+													errors.code ||
+														errors.form ||
+														m['accountSecurityPage.toast_verifyFailed']()
+												);
+											}
+										};
+									}}
+								>
+									<div class="mt-4">
+										<TwoFactorInput bind:value={otpCode} />
+										{#if form?.errors && 'code' in form.errors && form.errors.code}
+											<p class="mt-2 text-sm text-destructive" role="alert">
+												{form.errors.code}
+											</p>
+										{/if}
+									</div>
+
+									<div class="mt-6 flex gap-3">
+										<button
+											type="submit"
+											disabled={otpCode.length !== 6 || isSubmitting}
+											class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
+										>
+											{isSubmitting
+												? m['accountSecurityPage.verifying']()
+												: m['accountSecurityPage.verifyButton']()}
+										</button>
+										<button
+											type="button"
+											onclick={cancelSetup}
+											class="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+										>
+											{m['accountSecurityPage.cancel']()}
+										</button>
+									</div>
+								</form>
+							</div>
+						{:else}
+							<!-- Loading provisioning URI -->
+							<div class="mt-4 flex justify-center">
+								<div class="flex h-64 w-64 items-center justify-center rounded-lg bg-muted">
+									<p class="text-sm text-muted-foreground">
+										{m['accountSecurityPage.loadingSetupData']()}
+									</p>
+								</div>
+							</div>
+						{/if}
+					</div>
+				{/if}
+
+				<!-- Disable Flow -->
+				{#if showDisableFlow}
+					<div class="mt-6 rounded-lg border border-destructive/50 bg-destructive/5 p-6">
+						<div class="flex gap-3">
+							<AlertCircle class="h-5 w-5 text-destructive" aria-hidden="true" />
+							<div class="flex-1">
+								<h3 class="font-bold text-destructive">
+									{m['accountSecurityPage.disableTitle']()}
+								</h3>
+								<p class="mt-2 text-sm text-muted-foreground">
+									{m['accountSecurityPage.disableDescription']()}
+								</p>
+
+								<form
+									method="POST"
+									action="?/disable"
+									use:enhance={() => {
+										isSubmitting = true;
+										return async ({ result }) => {
+											isSubmitting = false;
+											await applyAction(result);
+											if (result.type === 'failure' && result.data) {
+												const errors = actionErrors(result.data);
+												toast.error(
+													errors.code ||
+														errors.form ||
+														m['accountSecurityPage.toast_disableFailed']()
+												);
+											}
+										};
+									}}
+								>
+									<div class="mt-4">
+										<TwoFactorInput bind:value={otpCode} />
+										{#if form?.errors && 'code' in form.errors && form.errors.code}
+											<p class="mt-2 text-sm text-destructive" role="alert">
+												{form.errors.code}
+											</p>
+										{/if}
+									</div>
+
+									<div class="mt-6 flex gap-3">
+										<button
+											type="submit"
+											disabled={otpCode.length !== 6 || isSubmitting}
+											class="rounded-md bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 focus:outline-none focus:ring-2 focus:ring-destructive focus:ring-offset-2 disabled:opacity-50"
+										>
+											{isSubmitting
+												? m['accountSecurityPage.disabling']()
+												: m['accountSecurityPage.disableButton']()}
+										</button>
+										<button
+											type="button"
+											onclick={cancelDisable}
+											class="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+										>
+											{m['accountSecurityPage.cancel']()}
+										</button>
+									</div>
+								</form>
+							</div>
+						</div>
+					</div>
+				{/if}
+			</div>
+		</div>
+	</div>
+
+	<EmailChangeCard user={data.user} {form} />
+
+	{#if authStore.accessToken}
+		<LinkedIdentitiesCard authToken={authStore.accessToken} />
+	{/if}
+
+	<!-- Password Change Section -->
+	<div class="mt-6 rounded-lg border bg-card p-6">
+		<div class="flex items-start gap-4">
+			<div
+				class="flex h-12 w-12 items-center justify-center rounded-full bg-primary/10 text-primary"
+			>
+				<Key class="h-6 w-6" aria-hidden="true" />
+			</div>
+
+			<div class="flex-1">
+				<SectionHeader title={m['accountSecurityPage.passwordChange']()} class="flex-1" />
+				<p class="mt-1 text-sm text-muted-foreground">
+					{m['accountSecurityPage.passwordChangeDescription']()}
+				</p>
+
+				<!-- Change Password Button (when not in flow) -->
+				{#if !showPasswordChangeFlow}
+					<div class="mt-6">
+						<button
+							type="button"
+							class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+							onclick={() => {
+								showPasswordChangeFlow = true;
+							}}
+						>
+							{m['accountSecurityPage.changePasswordButton']()}
+						</button>
+					</div>
+				{/if}
+
+				<!-- Password Change Flow -->
+				{#if showPasswordChangeFlow}
+					<div class="mt-6 rounded-lg border bg-muted/50 p-6">
+						<h3 class="font-bold">{m['accountSecurityPage.requestPasswordResetTitle']()}</h3>
+						<p class="mt-2 text-sm text-muted-foreground">
+							{m['accountSecurityPage.requestPasswordResetDescription']()}
+						</p>
+
+						{#if !passwordResetRequested}
+							<!-- Composited tint mirrors ToneTile's audited info pair (>=3:1 vs
+							     background/card); body copy stays on --foreground. -->
+							<div
+								class="mt-4 flex items-center gap-2 rounded-md border border-info/30 bg-info/10 p-3"
+							>
+								<Mail class="h-5 w-5 flex-shrink-0 text-info" aria-hidden="true" />
+								<p class="text-sm text-foreground">
+									{m['accountSecurityPage.emailWillBeSent']({ email: data.user?.email || '' })}
+								</p>
+							</div>
+
+							<div class="mt-6 flex gap-3">
+								<button
+									type="button"
+									onclick={handlePasswordResetRequest}
+									disabled={isRequestingPasswordReset}
+									class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50"
+								>
+									{isRequestingPasswordReset
+										? m['accountSecurityPage.sendingResetLink']()
+										: m['accountSecurityPage.sendResetLink']()}
+								</button>
+								<button
+									type="button"
+									onclick={cancelPasswordChange}
+									class="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+								>
+									{m['accountSecurityPage.cancel']()}
+								</button>
+							</div>
+						{:else}
+							<!-- Composited tint mirrors ToneTile's audited success pair (>=3:1
+							     vs background/card); body copy stays on --foreground. -->
+							<div class="mt-4 rounded-md border border-success/30 bg-success/10 p-4">
+								<div class="flex items-center gap-2">
+									<CheckCircle class="h-5 w-5 text-success" aria-hidden="true" />
+									<div class="flex-1">
+										<p class="text-sm font-medium text-foreground">
+											{m['accountSecurityPage.resetLinkSent']()}
+										</p>
+										<p class="mt-1 text-xs text-muted-foreground">
+											{m['accountSecurityPage.checkEmailInbox']()}
+										</p>
+									</div>
+								</div>
+							</div>
+
+							<div class="mt-6">
+								<button
+									type="button"
+									onclick={cancelPasswordChange}
+									class="rounded-md border px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+								>
+									{m['accountSecurityPage.close']()}
+								</button>
+							</div>
+						{/if}
+					</div>
+				{/if}
+			</div>
+		</div>
+	</div>
+
+	<!-- Additional Security Tips -->
+	<div class="mt-6 rounded-lg border bg-muted/50 p-6">
+		<SectionHeader title={m['accountSecurityPage.securityTips']()} level={3} />
+		<ul class="mt-3 space-y-2 text-sm text-muted-foreground">
+			<li class="flex gap-2">
+				<CheckCircle class="h-5 w-5 flex-shrink-0 text-success" aria-hidden="true" />
+				<span>{m['accountSecurityPage.tip1']()}</span>
+			</li>
+			<li class="flex gap-2">
+				<CheckCircle class="h-5 w-5 flex-shrink-0 text-success" aria-hidden="true" />
+				<span>{m['accountSecurityPage.tip2']()}</span>
+			</li>
+			<li class="flex gap-2">
+				<CheckCircle class="h-5 w-5 flex-shrink-0 text-success" aria-hidden="true" />
+				<span>{m['accountSecurityPage.tip3']()}</span>
+			</li>
+			<li class="flex gap-2">
+				<CheckCircle class="h-5 w-5 flex-shrink-0 text-success" aria-hidden="true" />
+				<span>{m['accountSecurityPage.tip4']()}</span>
+			</li>
+		</ul>
+	</div>
+</div>

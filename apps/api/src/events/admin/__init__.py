@@ -1,0 +1,139 @@
+# src/events/admin/__init__.py
+"""Events admin module - split for maintainability.
+
+Django autodiscover will import this module, which triggers registration
+of all admin classes via the @admin.register decorators in submodules.
+"""
+
+# Import all admin modules to trigger @admin.register decorators
+from events.admin.announcement import AnnouncementAdmin
+from events.admin.attendee_invoice import AttendeeInvoiceAdmin, AttendeeInvoiceCreditNoteAdmin
+from events.admin.blacklist import BlacklistAdmin, WhitelistRequestAdmin
+from events.admin.bookmark import EventBookmarkAdmin
+from events.admin.discount_code import DiscountCodeAdmin
+from events.admin.event import (
+    EventAdmin,
+    EventInvitationAdmin,
+    EventInvitationRequestAdmin,
+    EventResourceAdmin,
+    EventRSVPAdmin,
+    EventSeriesAdmin,
+    EventTokenAdmin,
+    EventWaitListAdmin,
+    PendingEventInvitationAdmin,
+    PotluckItemAdmin,
+)
+from events.admin.follow import (
+    EventSeriesFollowAdmin,
+    OrganizationFollowAdmin,
+)
+from events.admin.invoice import (
+    PlatformFeeCreditNoteAdmin,
+    PlatformFeeInvoiceAdmin,
+)
+from events.admin.nudge import OrganizationNudgeAdmin
+from events.admin.organization import (
+    MembershipTierAdmin,
+    OrganizationAdmin,
+    OrganizationContactMessageAdmin,
+    OrganizationMemberAdmin,
+    OrganizationMembershipRequestAdmin,
+    OrganizationQuestionnaireAdmin,
+    OrganizationStaffAdmin,
+    OrganizationTokenAdmin,
+)
+from events.admin.preferences import (
+    AttendeeVisibilityFlagAdmin,
+    GeneralUserPreferencesAdmin,
+)
+from events.admin.questionnaire import EventQuestionnaireSubmissionAdmin
+from events.admin.reserved_slug_token import ReservedSlugTokenAdmin
+from events.admin.series_pass import (
+    HeldSeriesPassAdmin,
+    SeriesPassAdmin,
+    SeriesPassTierLinkAdmin,
+)
+from events.admin.stripe_webhook_event import StripeWebhookEventAdmin
+from events.admin.subscription import (
+    MembershipPaymentAdmin,
+    MembershipSubscriptionAdmin,
+    MembershipSubscriptionPlanAdmin,
+)
+from events.admin.ticket import (
+    PaymentAdmin,
+    TicketAdmin,
+    TicketTierAdmin,
+)
+from events.admin.venue import (
+    VenueAdmin,
+    VenueSeatAdmin,
+    VenueSectorAdmin,
+)
+from events.admin.waitlist_offer import WaitlistOfferAdmin
+
+__all__ = [
+    # Announcement
+    "AnnouncementAdmin",
+    # Organization
+    "OrganizationAdmin",
+    "OrganizationQuestionnaireAdmin",
+    "OrganizationContactMessageAdmin",
+    "MembershipTierAdmin",
+    "OrganizationStaffAdmin",
+    "OrganizationMemberAdmin",
+    "OrganizationMembershipRequestAdmin",
+    "OrganizationTokenAdmin",
+    # Follows
+    "OrganizationFollowAdmin",
+    "EventSeriesFollowAdmin",
+    # Nudges
+    "OrganizationNudgeAdmin",
+    # Questionnaire join
+    "EventQuestionnaireSubmissionAdmin",
+    # Event
+    "EventAdmin",
+    "EventSeriesAdmin",
+    "EventInvitationAdmin",
+    "EventRSVPAdmin",
+    "PendingEventInvitationAdmin",
+    "EventTokenAdmin",
+    "EventInvitationRequestAdmin",
+    "EventWaitListAdmin",
+    "EventBookmarkAdmin",
+    "WaitlistOfferAdmin",
+    "PotluckItemAdmin",
+    "EventResourceAdmin",
+    # Venue
+    "VenueAdmin",
+    "VenueSectorAdmin",
+    "VenueSeatAdmin",
+    # Ticket
+    "TicketTierAdmin",
+    "TicketAdmin",
+    "PaymentAdmin",
+    # Preferences
+    "GeneralUserPreferencesAdmin",
+    "AttendeeVisibilityFlagAdmin",
+    # Invoice
+    "AttendeeInvoiceAdmin",
+    "AttendeeInvoiceCreditNoteAdmin",
+    "PlatformFeeInvoiceAdmin",
+    "PlatformFeeCreditNoteAdmin",
+    # Blacklist
+    "BlacklistAdmin",
+    "WhitelistRequestAdmin",
+    # Discount
+    "DiscountCodeAdmin",
+    # Reserved slugs
+    "ReservedSlugTokenAdmin",
+    # Series passes
+    "SeriesPassAdmin",
+    "SeriesPassTierLinkAdmin",
+    "HeldSeriesPassAdmin",
+    # Subscriptions
+    "MembershipPaymentAdmin",
+    "MembershipSubscriptionAdmin",
+    "MembershipSubscriptionPlanAdmin",
+    # Stripe webhooks
+    "StripeWebhookEventAdmin",
+]

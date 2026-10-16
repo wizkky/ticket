@@ -1,0 +1,528 @@
+"""Celery tasks for notification dispatch and maintenance."""
+
+import traceback
+import typing as t
+from datetime import timedelta
+
+import structlog
+from celery import group, shared_task
+from django.conf import settings
+from django.utils import timezone, translation
+
+from notifications.enums import DeliveryChannel, DeliveryStatus, NotificationType
+from notifications.models import Notification, NotificationDelivery, NotificationPreference
+from notifications.service.channels.registry import get_channel_instance
+
+logger = structlog.get_logger(__name__)
+
+
+@shared_task(name="notifications.tasks.dispatch_notification")
+def dispatch_notification(notification_id: str) -> dict[str, t.Any]:
+    """Main dispatcher task - creates delivery records and dispatches to channels.
+
+    This task:
+    1. Loads notification
+    2. Renders title/body from template (using recipient's language)
+    3. Determines delivery channels based on user preferences
+    4. Creates NotificationDelivery records
+    5. Dispatches to channel-specific delivery tasks
+
+    Args:
+        notification_id: UUID of notification to dispatch
+
+    Returns:
+        Dict with dispatch stats
+    """
+    notification = Notification.objects.select_related("user", "user__notification_preferences").get(pk=notification_id)
+
+    # Get recipient's language preference
+    user_language = getattr(notification.user, "language", settings.LANGUAGE_CODE)
+
+    # Render title and body from template
+    # CRITICAL: Activate recipient's language, not sender's or system default
+    try:
+        from notifications.service.templates.registry import get_template
+
+        template = get_template(notification.notification_type)
+
+        # Activate user's language for rendering
+        with translation.override(user_language):
+            notification.title = template.get_in_app_title(notification)
+            notification.body = template.get_in_app_body(notification)
+
+        notification.save(update_fields=["title", "body", "updated_at"])
+
+        logger.debug(
+            "notification_rendered",
+            notification_id=notification_id,
+            notification_type=notification.notification_type,
+            user_language=user_language,
+        )
+    except Exception as e:
+        logger.exception(
+            "notification_render_failed",
+            notification_id=notification_id,
+            notification_type=notification.notification_type,
+            error=str(e),
+        )
+        # Continue even if rendering fails - channels can use context directly
+
+    # Determine delivery channels
+    from notifications.service.dispatcher import determine_delivery_channels
+
+    channels = determine_delivery_channels(notification.user, notification.notification_type)
+
+    # Create delivery records
+    deliveries = []
+    for channel in channels:
+        delivery, created = NotificationDelivery.objects.get_or_create(
+            notification=notification,
+            channel=channel,
+            defaults={"status": DeliveryStatus.PENDING},
+        )
+        if created:
+            deliveries.append(delivery)
+
+    # Dispatch to channels in parallel
+    if deliveries:
+        delivery_tasks = group(deliver_to_channel.si(str(delivery.id)) for delivery in deliveries)
+        delivery_tasks.apply_async()
+
+    logger.info(
+        "notification_dispatched",
+        notification_id=notification_id,
+        notification_type=notification.notification_type,
+        user_id=str(notification.user.id),
+        channels=channels,
+        delivery_count=len(deliveries),
+    )
+
+    return {
+        "notification_id": notification_id,
+        "channels": channels,
+        "deliveries_created": len(deliveries),
+    }
+
+
+class BatchDispatchError(Exception):
+    """Raised when one or more notifications fail to dispatch in a batch."""
+
+    def __init__(self, failed_ids: list[str], total: int) -> None:
+        """Initialize BatchDispatchError.
+
+        Args:
+            failed_ids: List of notification IDs that failed to dispatch.
+            total: Total number of notifications in the batch.
+        """
+        self.failed_ids = failed_ids
+        self.total = total
+        super().__init__(f"{len(failed_ids)}/{total} notifications failed to dispatch")
+
+    def __reduce__(self) -> tuple[type["BatchDispatchError"], tuple[list[str], int]]:
+        """Make exception picklable for Celery result backend."""
+        return (self.__class__, (self.failed_ids, self.total))
+
+
+@shared_task(name="notifications.tasks.dispatch_notifications_batch")
+def dispatch_notifications_batch(notification_ids: list[str]) -> dict[str, t.Any]:
+    """Dispatch multiple notifications efficiently.
+
+    This task is more efficient than dispatching individual tasks for each notification
+    because it can batch some operations. Each notification still goes through the
+    same rendering and channel determination logic.
+
+    For very large batches (>100), this task automatically chunks the work
+    to avoid memory issues and long task execution times.
+
+    Args:
+        notification_ids: List of notification UUIDs to dispatch
+
+    Returns:
+        Dict with batch dispatch stats
+
+    Raises:
+        BatchDispatchError: If any notifications fail to dispatch (after processing all).
+    """
+    if not notification_ids:
+        return {"processed": 0, "errors": 0}
+
+    # For large batches, use individual dispatch tasks to spread load
+    if len(notification_ids) > 100:
+        # Create a group of individual dispatch tasks
+        task_group = group(dispatch_notification.s(nid) for nid in notification_ids)
+        task_group.apply_async()
+
+        logger.info(
+            "notifications_batch_chunked",
+            count=len(notification_ids),
+            strategy="individual_tasks",
+        )
+
+        return {
+            "processed": len(notification_ids),
+            "strategy": "chunked_to_individual",
+        }
+
+    # For smaller batches, process directly in this task
+    processed = 0
+    failed_ids: list[str] = []
+
+    for notification_id in notification_ids:
+        try:
+            dispatch_notification(notification_id)
+            processed += 1
+        except Exception as e:
+            failed_ids.append(notification_id)
+            logger.exception(
+                "batch_dispatch_item_failed",
+                notification_id=notification_id,
+                error=str(e),
+            )
+
+    logger.info(
+        "notifications_batch_dispatched",
+        total=len(notification_ids),
+        processed=processed,
+        errors=len(failed_ids),
+    )
+
+    # Fail loudly if any notifications failed - NO SILENT FAILURES
+    if failed_ids:
+        raise BatchDispatchError(failed_ids, len(notification_ids))
+
+    return {
+        "processed": processed,
+        "errors": 0,
+        "total": len(notification_ids),
+    }
+
+
+@shared_task(name="notifications.tasks.deliver_to_channel", bind=True, max_retries=3)
+def deliver_to_channel(self: t.Any, delivery_id: str) -> dict[str, t.Any]:
+    """Deliver notification through specific channel.
+
+    Handles retries for transient failures.
+
+    Args:
+        self: Celery task instance (automatically passed when bind=True)
+        delivery_id: UUID of delivery record
+
+    Returns:
+        Dict with delivery result
+    """
+    delivery = NotificationDelivery.objects.select_related("notification", "notification__user").get(pk=delivery_id)
+
+    # Get channel instance
+    channel = get_channel_instance(delivery.channel)
+
+    # Check if delivery should proceed
+    if not channel.can_deliver(delivery.notification):
+        delivery.status = DeliveryStatus.SKIPPED
+        delivery.save(update_fields=["status", "updated_at"])
+        logger.info(
+            "delivery_skipped",
+            delivery_id=delivery_id,
+            channel=delivery.channel,
+            reason="user_preferences",
+        )
+        return {"status": "skipped", "reason": "user_preferences"}
+
+    # Attempt delivery
+    try:
+        success = channel.deliver(delivery.notification, delivery)
+
+        if not success:
+            logger.warning(
+                "delivery_failed_gracefully",
+                delivery_id=delivery_id,
+                channel=delivery.channel,
+            )
+            return {"status": "failed", "graceful": True}
+
+        return {"status": "sent", "channel": delivery.channel}
+
+    except Exception as e:
+        # Refresh delivery object to get updated retry_count from channel's deliver() method
+        delivery.refresh_from_db()
+
+        logger.exception(
+            "delivery_exception",
+            delivery_id=delivery_id,
+            channel=delivery.channel,
+            error=str(e),
+            retry_count=delivery.retry_count,
+        )
+
+        # Check if we should retry
+        if channel.should_retry(e) and delivery.retry_count < 3:
+            # Exponential backoff: 2^retry_count minutes
+            countdown = 2**delivery.retry_count * 60
+            logger.info(
+                "retrying_delivery",
+                delivery_id=delivery_id,
+                channel=delivery.channel,
+                countdown=countdown,
+                retry_count=delivery.retry_count,
+            )
+            raise self.retry(exc=e, countdown=countdown)
+        else:
+            # Don't retry - permanent failure
+            delivery.status = DeliveryStatus.FAILED
+            delivery.error_message = traceback.format_exc()
+            delivery.save(update_fields=["status", "error_message", "updated_at"])
+            raise
+
+
+# ===== Digest Tasks =====
+
+
+@shared_task(name="notifications.tasks.send_notification_digests")
+def send_notification_digests() -> dict[str, t.Any]:
+    """Send notification digests to users based on their preferences.
+
+    Runs every hour via Celery beat.
+    Checks which users should receive digests now and sends them.
+
+    Returns:
+        Dict with digest stats
+    """
+    from accounts.utils.email_normalization import normalize_email_for_matching
+    from notifications.service.digest import (
+        NotificationDigest,
+        get_digest_lookback_period,
+        get_pending_notifications_for_digest,
+        should_send_digest_now,
+    )
+    from notifications.service.email_policy import may_email, suppressed_addresses
+
+    # Users who want digests (not immediate) and haven't opted out of email globally.
+    # Per-type opt-outs are applied per user below (#1030).
+    users_with_digests = list(
+        NotificationPreference.objects.exclude(digest_frequency=NotificationPreference.DigestFrequency.IMMEDIATE)
+        .filter(silence_all_notifications=False, enabled_channels__contains=[DeliveryChannel.EMAIL])
+        .select_related("user")
+    )
+    suppressed = suppressed_addresses(prefs.user.email for prefs in users_with_digests)
+
+    digests_sent = 0
+    digests_skipped = 0
+
+    for prefs in users_with_digests:
+        # Check if it's time to send digest for this user
+        if not should_send_digest_now(prefs.user):
+            digests_skipped += 1
+            continue
+
+        if normalize_email_for_matching(prefs.user.email) in suppressed:
+            digests_skipped += 1
+            continue
+
+        # Get lookback period
+        lookback = get_digest_lookback_period(prefs.digest_frequency)
+        since = timezone.now() - lookback
+
+        # Pending notifications, restricted to the types the user may be emailed.
+        emailable_types = [nt for nt in NotificationType if may_email(prefs.user, nt)]
+        pending = get_pending_notifications_for_digest(prefs.user, since).filter(notification_type__in=emailable_types)
+
+        if not pending.exists():
+            continue  # No notifications to send
+
+        # Build and send digest
+        digest = NotificationDigest(prefs.user, pending)
+        if not digest.send_digest_email():
+            continue
+
+        # Mark notifications as having email delivery using bulk operations
+        pending_list = list(pending)
+        notification_ids = [n.id for n in pending_list]
+
+        # Find which notifications already have email delivery records
+        existing_deliveries = set(
+            NotificationDelivery.objects.filter(
+                notification_id__in=notification_ids,
+                channel=DeliveryChannel.EMAIL,
+            ).values_list("notification_id", flat=True)
+        )
+
+        # Bulk create delivery records for notifications that don't have them
+        now = timezone.now()
+        deliveries_to_create = [
+            NotificationDelivery(
+                notification=notification,
+                channel=DeliveryChannel.EMAIL,
+                status=DeliveryStatus.SENT,
+                delivered_at=now,
+                metadata={"digest": True},
+            )
+            for notification in pending_list
+            if notification.id not in existing_deliveries
+        ]
+
+        if deliveries_to_create:
+            NotificationDelivery.objects.bulk_create(deliveries_to_create)
+
+        digests_sent += 1
+
+    logger.info("digests_sent", count=digests_sent, skipped=digests_skipped)
+
+    return {"digests_sent": digests_sent, "digests_skipped": digests_skipped}
+
+
+# ===== Maintenance Tasks =====
+
+
+@shared_task(name="notifications.tasks.cleanup_old_notifications")
+def cleanup_old_notifications() -> dict[str, t.Any]:
+    """Clean up notifications older than configured retention period.
+
+    Runs daily via Celery beat.
+    Retention period is configured via NOTIFICATION_RETENTION_DAYS env var (default 90).
+
+    Returns:
+        Dict with cleanup stats
+    """
+    retention_days = getattr(settings, "NOTIFICATION_RETENTION_DAYS", 90)
+    cutoff = timezone.now() - timedelta(days=retention_days)
+
+    # Delete old notifications (cascades to deliveries)
+    deleted_count, _ = Notification.objects.filter(created_at__lt=cutoff).delete()
+
+    logger.info("notifications_cleaned_up", retention_days=retention_days, deleted_count=deleted_count)
+
+    return {"deleted_count": deleted_count, "retention_days": retention_days}
+
+
+@shared_task(name="notifications.tasks.retry_failed_deliveries")
+def retry_failed_deliveries() -> dict[str, t.Any]:
+    """Retry failed deliveries that might be recoverable.
+
+    Runs every 6 hours via Celery beat.
+    Only retries failures from last 24 hours with retry_count < 5.
+
+    Returns:
+        Dict with retry stats
+    """
+    twenty_four_hours_ago = timezone.now() - timedelta(hours=24)
+
+    failed_deliveries = (
+        NotificationDelivery.objects.filter(
+            status=DeliveryStatus.FAILED, retry_count__lt=5, created_at__gte=twenty_four_hours_ago
+        )
+        .exclude(metadata__has_key="suppression_reason")  # permanent: address is suppressed
+        .select_related("notification")
+    )
+
+    # Get list of deliveries to retry
+    deliveries_to_retry = list(failed_deliveries)
+    retry_count = len(deliveries_to_retry)
+
+    if deliveries_to_retry:
+        # Bulk update status to pending
+        delivery_ids = [d.id for d in deliveries_to_retry]
+        NotificationDelivery.objects.filter(id__in=delivery_ids).update(
+            status=DeliveryStatus.PENDING,
+            updated_at=timezone.now(),
+        )
+
+        # Re-dispatch all deliveries
+        for delivery in deliveries_to_retry:
+            deliver_to_channel.delay(str(delivery.id))
+
+    logger.info("failed_deliveries_retried", count=retry_count)
+
+    return {"retried_count": retry_count}
+
+
+@shared_task(name="notifications.tasks.send_event_reminders")
+def send_event_reminders() -> dict[str, t.Any]:
+    """Send event reminders for upcoming events.
+
+    Runs daily via Celery beat.
+    Sends reminders at 14, 7, and 1 days before events.
+    Ensures each reminder is sent only once per user per event.
+
+    Returns:
+        Dict with reminder stats
+    """
+    from notifications.service.reminder_service import EventReminderService
+
+    service = EventReminderService()
+    return service.send_all_reminders()
+
+
+@shared_task(name="notifications.tasks.send_pending_invitation_email", bind=True, max_retries=3, default_retry_delay=60)
+def send_pending_invitation_email(self: t.Any, pending_invitation_id: str) -> None:
+    """Send an invitation email to a non-registered user.
+
+    Since the recipient has no account, this bypasses the notification system
+    and sends a direct email with event details and a signup link.
+    """
+    from django.template.loader import render_to_string
+    from django.utils.translation import gettext as _
+
+    from common.models import SiteSettings
+    from common.tasks import send_email
+    from events.models import PendingEventInvitation
+    from notifications.service.email_policy import suppression_for
+    from notifications.service.notification_helpers import format_event_datetime
+    from notifications.service.org_sender import build_list_unsubscribe_headers, org_from_address, org_reply_to
+    from notifications.service.unsubscribe import generate_email_opt_out_token
+
+    try:
+        pending = PendingEventInvitation.objects.select_related("event", "event__organization", "event__city").get(
+            pk=pending_invitation_id
+        )
+    except PendingEventInvitation.DoesNotExist:
+        logger.warning("pending_invitation_not_found", pending_invitation_id=pending_invitation_id)
+        return
+
+    suppression = suppression_for(pending.email, include_opt_out=True)
+    if suppression is not None:
+        logger.info(
+            "pending_invitation_email_suppressed",
+            pending_invitation_id=pending_invitation_id,
+            reason=suppression.reason,
+        )
+        return
+
+    event = pending.event
+    org = event.organization
+    site_settings = SiteSettings.get_solo()
+    frontend_base_url = site_settings.frontend_base_url
+    opt_out_token = generate_email_opt_out_token(pending.email, organization_id=org.id)
+
+    context = {
+        "event_name": event.name,
+        "invitation_message": pending.custom_message or "",
+        "event_start_formatted": format_event_datetime(event.start, event),
+        "event_end_formatted": format_event_datetime(event.end, event),
+        "event_location": event.full_address(),
+        "organization_name": event.organization.name,
+        "signup_url": f"{frontend_base_url}/auth/register",
+        "frontend_base_url": frontend_base_url,
+        "opt_out_link": f"{frontend_base_url}/unsubscribe?token={opt_out_token}",
+    }
+
+    subject = _("You're invited: %(event_name)s") % {"event_name": event.name}
+    txt_body = render_to_string("notifications/email/pending_invitation.txt", context)
+    html_body = render_to_string("notifications/email/pending_invitation.html", context)
+
+    send_email(
+        to=pending.email,
+        subject=subject,
+        body=txt_body,
+        html_body=html_body,
+        from_email=org_from_address(org),
+        reply_to=org_reply_to(org) or None,
+        headers={
+            **build_list_unsubscribe_headers(opt_out_token),
+            "X-Mailin-custom": f"invitation:{pending.id}|org:{org.id}",
+        },
+    )
+
+    logger.info(
+        "pending_invitation_email_sent",
+        pending_invitation_id=pending_invitation_id,
+        event_id=str(event.id),
+    )

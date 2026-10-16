@@ -1,0 +1,614 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import * as m from '$lib/paraglide/messages.js';
+	import type {
+		EventDetailSchema,
+		OrganizationPermissionsSchema,
+		EventTokenSchema
+	} from '$lib/api/generated/types.gen';
+	import type { UserEventStatus, EventTicketSchemaActual } from '$lib/utils/eligibility';
+	import {
+		isRSVP,
+		isTicket,
+		isEligibility,
+		isUserStatusResponse,
+		hasActiveTickets,
+		getActiveTickets,
+		hasPositiveRsvp,
+		isAttending as checkIsAttending,
+		hasPendingOnlinePayment,
+		getMultipleTicketsStatusText
+	} from '$lib/utils/eligibility';
+	import { cn } from '$lib/utils/cn';
+	import EventStatusBadge from './EventStatusBadge.svelte';
+	import BookmarkButton from './BookmarkButton.svelte';
+	import EventQuickInfo from './EventQuickInfo.svelte';
+	import ActionButton from './ActionButton.svelte';
+	import EventRSVP from './EventRSVP.svelte';
+	import EligibilityStatusDisplay from './EligibilityStatusDisplay.svelte';
+	import { Check, Ticket, CalendarDays, MessageSquare, Ban } from '@lucide/svelte';
+	import ToneTile from '$lib/components/common/ToneTile.svelte';
+	import { downloadRevelEventICalFile } from '$lib/utils/ical';
+	import EventManageSection from './EventManageSection.svelte';
+
+	interface Props {
+		event: EventDetailSchema;
+		userStatus: UserEventStatus | null;
+		isAuthenticated: boolean;
+		userPermissions?: OrganizationPermissionsSchema | null;
+		eventTokenDetails?: EventTokenSchema | null;
+		variant?: 'sidebar' | 'card';
+		canAttendWithoutLogin?: boolean;
+		onGetTicketsClick?: () => void;
+		onShowTicketClick?: () => void;
+		onResumePayment?: () => void;
+		isResumingPayment?: boolean;
+		onGuestRsvpClick?: () => void;
+		onInvitationRequestSuccess?: () => void;
+		onWhitelistRequestSuccess?: () => void;
+		class?: string;
+	}
+
+	let {
+		event,
+		userStatus = $bindable(),
+		isAuthenticated,
+		userPermissions,
+		eventTokenDetails,
+		variant = 'sidebar',
+		canAttendWithoutLogin = false,
+		onGetTicketsClick,
+		onShowTicketClick,
+		onResumePayment,
+		isResumingPayment = false,
+		onGuestRsvpClick,
+		onInvitationRequestSuccess,
+		onWhitelistRequestSuccess,
+		class: className
+	}: Props = $props();
+
+	/**
+	 * Get user's active tickets from the new response format
+	 */
+	const userTickets = $derived.by((): EventTicketSchemaActual[] => {
+		if (!userStatus) return [];
+
+		// New format: EventUserStatusResponse with tickets array
+		if (isUserStatusResponse(userStatus)) {
+			return getActiveTickets(userStatus);
+		}
+
+		// Legacy format: single ticket
+		if (isTicket(userStatus)) {
+			return userStatus.status !== 'cancelled' ? [userStatus] : [];
+		}
+
+		return [];
+	});
+
+	/**
+	 * Check if user can purchase more tickets
+	 */
+	const canPurchaseMore = $derived.by(() => {
+		if (!userStatus) return true;
+		if (isUserStatusResponse(userStatus)) {
+			return userStatus.can_purchase_more ?? true;
+		}
+		return false; // Legacy: single ticket = can't buy more
+	});
+
+	/**
+	 * Check if user is attending (has approved RSVP or active ticket)
+	 */
+	const isAttending = $derived.by(() => {
+		if (!userStatus) return false;
+
+		// New format: EventUserStatusResponse
+		if (isUserStatusResponse(userStatus)) {
+			return checkIsAttending(userStatus);
+		}
+
+		// Legacy format: single RSVP
+		if (isRSVP(userStatus)) {
+			return userStatus.status === 'yes';
+		}
+
+		// Legacy format: single ticket
+		if (isTicket(userStatus)) {
+			return (
+				userStatus.status === 'pending' ||
+				userStatus.status === 'active' ||
+				userStatus.status === 'checked_in'
+			);
+		}
+
+		return false;
+	});
+
+	/**
+	 * Get attendance status display text
+	 */
+	const attendanceStatusText = $derived.by(() => {
+		if (!userStatus) return null;
+
+		// New format: EventUserStatusResponse
+		if (isUserStatusResponse(userStatus)) {
+			const tickets = getActiveTickets(userStatus);
+			if (tickets.length > 0) {
+				return getMultipleTicketsStatusText(tickets);
+			}
+			if (hasPositiveRsvp(userStatus)) {
+				return m['eventActionSidebar.youreAttending']();
+			}
+			return null;
+		}
+
+		// Legacy format
+		if (isRSVP(userStatus) && userStatus.status === 'yes') {
+			return m['eventActionSidebar.youreAttending']();
+		}
+
+		if (isTicket(userStatus)) {
+			if (userStatus.status === 'checked_in') {
+				return m['eventActionSidebar.youreCheckedIn']();
+			}
+			if (userStatus.status === 'pending') {
+				return m['eventActionSidebar.ticketPending']();
+			}
+			return m['eventActionSidebar.youHaveTicket']();
+		}
+
+		return null;
+	});
+
+	/**
+	 * Get ticket tier name if applicable (for single ticket display)
+	 */
+	const ticketTierName = $derived.by(() => {
+		// New format: show tier name of first ticket
+		if (userTickets.length === 1 && userTickets[0].tier) {
+			return userTickets[0].tier.name;
+		}
+
+		// Legacy format
+		if (userStatus && isTicket(userStatus) && userStatus.tier) {
+			return userStatus.tier.name;
+		}
+		return null;
+	});
+
+	/**
+	 * Check if eligibility should be shown
+	 */
+	const shouldShowEligibility = $derived.by(() => {
+		if (!userStatus) return false;
+		if (isUserStatusResponse(userStatus)) return false; // New format doesn't use eligibility this way
+		if (!isEligibility(userStatus)) return false;
+		return !userStatus.allowed;
+	});
+
+	/**
+	 * Check if ticket is pending with online payment (should show Resume Payment directly)
+	 */
+	const shouldShowResumePayment = $derived.by(() => {
+		if (!userStatus) return false;
+
+		// New format: check if any tickets have pending online payment
+		if (isUserStatusResponse(userStatus)) {
+			const tickets = getActiveTickets(userStatus);
+			return hasPendingOnlinePayment(tickets);
+		}
+
+		// Legacy format
+		if (!isTicket(userStatus)) return false;
+		if (userStatus.status !== 'pending') return false;
+		if (!userStatus.tier) return false;
+		return userStatus.tier.payment_method === 'online';
+	});
+
+	/**
+	 * Get feedback questionnaire IDs available for the user (after event ends)
+	 */
+	const feedbackQuestionnaires = $derived.by((): string[] => {
+		if (!userStatus) return [];
+		if (!isUserStatusResponse(userStatus)) return [];
+		return userStatus.feedback_questionnaires ?? [];
+	});
+
+	/**
+	 * Check if feedback questionnaires are available
+	 */
+	const hasFeedbackQuestionnaires = $derived(feedbackQuestionnaires.length > 0);
+
+	/**
+	 * Check if the event has ended (end date is in the past)
+	 */
+	const eventHasEnded = $derived.by(() => {
+		if (!event.end) return false;
+		return new Date(event.end) < new Date();
+	});
+
+	/**
+	 * Container classes based on variant
+	 */
+	const containerClasses = $derived(
+		cn(
+			'rounded-lg border bg-card',
+			variant === 'sidebar' && 'sticky top-4',
+			variant === 'card' && 'w-full',
+			className
+		)
+	);
+
+	// State for showing RSVP management
+	let showManageRSVP = $state(false);
+
+	/**
+	 * Download iCal file for this event
+	 */
+	function handleDownloadCalendar() {
+		downloadRevelEventICalFile(event);
+	}
+
+	/**
+	 * Handle view ticket/manage RSVP action
+	 */
+	function handleSecondaryAction(): void {
+		if (!userStatus) return;
+
+		// New format: check for tickets
+		if (isUserStatusResponse(userStatus)) {
+			if (hasActiveTickets(userStatus)) {
+				if (onShowTicketClick) {
+					onShowTicketClick();
+				}
+				return;
+			}
+			if (hasPositiveRsvp(userStatus)) {
+				showManageRSVP = !showManageRSVP;
+				return;
+			}
+			return;
+		}
+
+		// Legacy format: single ticket
+		if (isTicket(userStatus)) {
+			if (onShowTicketClick) {
+				onShowTicketClick();
+			}
+			return;
+		}
+
+		// Legacy format: RSVP
+		if (isRSVP(userStatus)) {
+			showManageRSVP = !showManageRSVP;
+			return;
+		}
+	}
+</script>
+
+<!--
+  Event Action Sidebar Component
+
+  Unified action center for event attendance management. Contains event status,
+  primary action button, attendance status, quick info, and eligibility details.
+
+  @component
+  @example
+  <EventActionSidebar
+    event={data.event}
+    userStatus={data.userStatus}
+    isAuthenticated={data.isAuthenticated}
+    variant="sidebar"
+    class="hidden lg:block"
+  />
+-->
+<aside class={containerClasses} aria-label={m['eventActionSidebar.eventActionsAriaLabel']()}>
+	<!-- Card Header -->
+	<div class="flex items-start justify-between gap-2 border-b p-4">
+		<EventStatusBadge {event} />
+		<BookmarkButton
+			eventId={event.id}
+			isBookmarked={event.is_bookmarked ?? false}
+			variant="inline"
+			class="shrink-0"
+		/>
+	</div>
+
+	<!-- Card Content -->
+	<div class="space-y-4 p-4">
+		<!-- Event Cancelled Banner -->
+		{#if event.status === 'cancelled'}
+			<div
+				class="flex flex-col gap-2 rounded-md border-2 border-destructive/40 bg-destructive/10 p-4 text-destructive-foreground dark:bg-destructive/15"
+				role="alert"
+			>
+				<div class="flex items-start gap-2">
+					<Ban class="h-5 w-5 shrink-0 text-destructive" aria-hidden="true" />
+					<div role="heading" aria-level="3" class="flex-1 font-extrabold text-destructive">
+						{m['eventActionSidebar.cancelledBannerTitle']()}
+					</div>
+				</div>
+				{#if event.cancellation_reason}
+					<div class="mt-1 text-sm">
+						<div
+							class="mb-1 text-xs font-extrabold uppercase tracking-[0.12em] text-muted-foreground"
+						>
+							{m['eventActionSidebar.cancelledBannerReasonLabel']()}
+						</div>
+						<p class="whitespace-pre-line break-words text-foreground">
+							{event.cancellation_reason}
+						</p>
+					</div>
+				{/if}
+			</div>
+		{/if}
+
+		<!-- Pending Payment Warning (for online tickets pending payment) -->
+		{#if shouldShowResumePayment}
+			<!-- Unfinished payment. Amber `highlight` tokens instead of a hand-picked
+			     orange ramp: the 10% tint composites to ~the card colour, so the copy
+			     stays `text-foreground` and keeps the token contract's AA guarantee,
+			     and the RESUME button uses the solid highlight pair (audited).
+			     TRAP guarded: a custom `bg-*` on a Button keeps the variant's
+			     `text-primary-foreground`, so the explicit text colour is required. -->
+			<div
+				class="flex flex-col gap-3 rounded-md border-2 border-highlight/60 bg-highlight/10 p-4 text-foreground"
+				role="alert"
+			>
+				<div class="flex items-start gap-2">
+					<Ticket
+						class="h-5 w-5 shrink-0 text-highlight-foreground dark:text-highlight"
+						aria-hidden="true"
+					/>
+					<div class="flex-1">
+						<div class="font-extrabold">{m['eventActionSidebar.ticketPendingPayment']()}</div>
+						{#if ticketTierName}
+							<div class="text-sm opacity-90">{ticketTierName}</div>
+						{/if}
+					</div>
+				</div>
+				<p class="text-sm">
+					{m['eventActionSidebar.pendingPaymentDescription']()}
+				</p>
+				<button
+					type="button"
+					onclick={onResumePayment}
+					disabled={isResumingPayment}
+					class="w-full rounded-md border-2 border-highlight bg-highlight px-4 py-2 font-bold text-highlight-foreground transition-colors hover:bg-highlight/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+				>
+					{isResumingPayment
+						? m['eventActionSidebar.processing']()
+						: m['eventActionSidebar.resumePayment']()}
+				</button>
+				{#if onShowTicketClick}
+					<button
+						type="button"
+						onclick={onShowTicketClick}
+						class="w-full rounded-md border border-highlight/60 bg-transparent px-4 py-2 text-sm font-bold text-foreground transition-colors hover:bg-highlight/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					>
+						{#if userTickets.length > 1}
+							{m['eventActionSidebar.viewAllTickets']({ count: userTickets.length })}
+						{:else}
+							{m['eventActionSidebar.viewTicket']()}
+						{/if}
+					</button>
+				{/if}
+			</div>
+		{:else if isAttending && attendanceStatusText}
+			<!-- Attendance Status Display (if user is attending) -->
+			{@const hasPendingTicket =
+				userTickets.length > 0 && userTickets.some((t) => t.status === 'pending')}
+			<!-- Same tint-plus-token-icon recipe as above; the words carry the state,
+			     the tint only reinforces it. -->
+			<div
+				class={cn(
+					'flex items-center gap-2 rounded-md p-3 text-foreground',
+					hasPendingTicket ? 'bg-highlight/10' : 'bg-success/10'
+				)}
+				role="status"
+				aria-live="polite"
+			>
+				<ToneTile
+					tone={hasPendingTicket ? 'warning' : 'success'}
+					icon={userStatus && isTicket(userStatus) ? Ticket : Check}
+					size="sm"
+					class="bg-transparent"
+				/>
+				<div class="flex-1">
+					<div class="font-extrabold">{attendanceStatusText}</div>
+					{#if ticketTierName}
+						<div class="text-sm opacity-90">{ticketTierName}</div>
+					{/if}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Primary Action (if not attending) -->
+		{#if !isAttending}
+			<!-- RSVP Flow for non-ticketed events.
+			     Fail closed: only show RSVP when the event is explicitly known to
+			     be non-ticketed. `requires_ticket` is `boolean | null` on
+			     list/summary-built event objects, where null means unknown; a null
+			     value is treated as ticketed so RSVP is never shown on a ticketed
+			     event reached from a list surface (issue #430). -->
+			{#if event.requires_ticket === false}
+				<EventRSVP
+					eventId={event.id}
+					eventName={event.name}
+					bind:userStatus
+					{isAuthenticated}
+					requiresTicket={event.requires_ticket}
+					{event}
+					{eventTokenDetails}
+					{onGuestRsvpClick}
+					{onInvitationRequestSuccess}
+					{onWhitelistRequestSuccess}
+				/>
+			{:else}
+				<!-- Ticket purchase flow -->
+				{#if shouldShowEligibility && userStatus && isEligibility(userStatus)}
+					<!-- Show eligibility status for ticketed events -->
+					<div>
+						<h3 class="mb-2 text-xs font-extrabold uppercase tracking-[0.12em] text-primary">
+							{m['eventActionSidebar.eligibilityStatus']()}
+						</h3>
+						<EligibilityStatusDisplay
+							eligibility={userStatus}
+							eventId={event.id}
+							eventSlug={event.slug}
+							organizationSlug={event.organization.slug}
+							organizationName={event.organization.name}
+							eventName={event.name}
+							{eventTokenDetails}
+							applyBefore={event.apply_before}
+							timezone={event.timezone}
+							{onInvitationRequestSuccess}
+							{onWhitelistRequestSuccess}
+							{onGetTicketsClick}
+						/>
+					</div>
+				{:else}
+					<!-- Show buy tickets button -->
+					<ActionButton
+						{userStatus}
+						requiresTicket={event.requires_ticket}
+						{isAuthenticated}
+						{canAttendWithoutLogin}
+						onclick={onGetTicketsClick}
+						class="w-full"
+					/>
+				{/if}
+			{/if}
+		{/if}
+
+		<!-- Secondary Actions (if user is attending) -->
+		{#if isAttending && !shouldShowResumePayment}
+			<div class="space-y-2">
+				<!-- Show Ticket button (always available) or Change RSVP (only for ongoing events) -->
+				{#if userTickets.length > 0}
+					<button
+						type="button"
+						onclick={handleSecondaryAction}
+						class="w-full cursor-pointer rounded-md border border-input bg-background px-4 py-2 text-sm font-bold transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					>
+						<span class="flex items-center justify-center gap-2">
+							<Ticket class="h-4 w-4" aria-hidden="true" />
+							{userTickets.length === 1
+								? m['eventActionSidebar.showTicket']()
+								: m['eventActionSidebar.showTickets']({ count: userTickets.length })}
+						</span>
+					</button>
+				{:else if !eventHasEnded}
+					<!-- Only show Change RSVP for ongoing/future events -->
+					<button
+						type="button"
+						onclick={handleSecondaryAction}
+						class="w-full cursor-pointer rounded-md border border-input bg-background px-4 py-2 text-sm font-bold transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					>
+						{showManageRSVP
+							? m['eventActionSidebar.hideRsvp']()
+							: m['eventActionSidebar.changeRsvp']()}
+					</button>
+				{/if}
+
+				<!-- Buy More Tickets Button (if allowed and event not ended) -->
+				{#if canPurchaseMore && event.requires_ticket && !eventHasEnded}
+					<button
+						type="button"
+						onclick={onGetTicketsClick}
+						class="w-full cursor-pointer rounded-md border border-primary bg-primary/10 px-4 py-2 text-sm font-bold text-primary transition-colors hover:bg-primary/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					>
+						<span class="flex items-center justify-center gap-2">
+							<Ticket class="h-4 w-4" aria-hidden="true" />
+							{m['eventActionSidebar.buyMoreTickets']()}
+						</span>
+					</button>
+				{/if}
+
+				<!-- Add to Calendar Button -->
+				<button
+					type="button"
+					onclick={handleDownloadCalendar}
+					class="w-full cursor-pointer rounded-md border border-input bg-background px-4 py-2 text-sm font-bold transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					aria-label={m['eventActionSidebar.downloadCalendarAriaLabel']()}
+				>
+					<span class="flex items-center justify-center gap-2">
+						<CalendarDays class="h-4 w-4" aria-hidden="true" />
+						{m['eventActionSidebar.addToCalendar']()}
+					</span>
+				</button>
+
+				<!-- Feedback Questionnaires (after event ends) -->
+				{#if hasFeedbackQuestionnaires}
+					<div class="mt-4 rounded-md border-2 border-info/40 bg-info/10 p-3">
+						<div class="mb-2 flex items-center gap-2 text-foreground">
+							<MessageSquare class="h-5 w-5 text-info" aria-hidden="true" />
+							<span class="font-extrabold">{m['eventActionSidebar.feedbackAvailable']()}</span>
+						</div>
+						<p class="mb-3 text-sm text-muted-foreground">
+							{m['eventActionSidebar.feedbackDescription']()}
+						</p>
+						{#each feedbackQuestionnaires as questionnaireId (questionnaireId)}
+							<a
+								href={resolve('/(public)/events/[org_slug]/[event_slug]/questionnaire/[id]', {
+									org_slug: event.organization.slug,
+									event_slug: event.slug,
+									id: questionnaireId
+								})}
+								class="flex w-full items-center justify-center gap-2 rounded-md border-2 border-info bg-info px-4 py-2 text-sm font-bold text-info-foreground transition-colors hover:bg-info/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+							>
+								<MessageSquare class="h-4 w-4" aria-hidden="true" />
+								{m['eventActionSidebar.giveFeedback']()}
+							</a>
+						{/each}
+					</div>
+				{/if}
+			</div>
+
+			<!-- Show EventRSVP when managing -->
+			{#if showManageRSVP}
+				{@const hasRsvp =
+					userStatus && isUserStatusResponse(userStatus)
+						? userStatus.rsvp
+						: userStatus && isRSVP(userStatus)
+							? userStatus
+							: null}
+				{#if hasRsvp || (userStatus && !isUserStatusResponse(userStatus))}
+					<EventRSVP
+						eventId={event.id}
+						eventName={event.name}
+						bind:userStatus
+						{isAuthenticated}
+						requiresTicket={event.requires_ticket}
+						{event}
+					/>
+				{/if}
+			{/if}
+		{/if}
+
+		<!-- Manage Event Section (for staff/owners) -->
+		<EventManageSection {event} {userPermissions} />
+
+		<!-- Quick Info Section -->
+		<div class="border-t pt-4">
+			<h3 class="sr-only">{m['eventActionSidebar.eventDetails']()}</h3>
+			<EventQuickInfo {event} variant="compact" />
+		</div>
+
+		<!-- Add to Calendar (always available) -->
+		<div class="border-t pt-4">
+			<button
+				type="button"
+				onclick={handleDownloadCalendar}
+				class="w-full cursor-pointer rounded-md border border-input bg-background px-4 py-2 text-sm font-bold transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+				aria-label={m['eventActionSidebar.downloadCalendarAriaLabel']()}
+			>
+				<span class="flex items-center justify-center gap-2">
+					<CalendarDays class="h-4 w-4" aria-hidden="true" />
+					{m['eventActionSidebar.addToCalendar']()}
+				</span>
+			</button>
+		</div>
+	</div>
+</aside>

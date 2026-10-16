@@ -1,0 +1,18 @@
+{% load i18n %}{% trans "New Membership Request" %}
+
+{% blocktranslate with name=context.requester_name org=context.organization_name %}{{ name }} has requested to join {{ org }}.{% endblocktranslate %}
+
+{% trans "Request Details:" %}
+{% trans "Name:" %} {{ context.requester_name }}
+{% trans "Email:" %} {{ context.requester_email }}
+{% if context.request_message %}
+{% trans "Message:" %}
+{{ context.request_message }}
+{% endif %}
+
+{% trans "View and manage this request:" %}
+{{ context.frontend_url }}
+
+{% trans "This is an automated notification from your organization management system." %}
+
+{% include "notifications/email/_footer.txt" %}

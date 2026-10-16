@@ -1,0 +1,260 @@
+"""Tests for the per-event financials endpoint (#551 addendum; replaces #515 shape)."""
+
+import typing as t
+from decimal import Decimal
+
+import pytest
+from django.test.client import Client
+from django.urls import reverse
+from django.utils import timezone
+
+from accounts.models import RevelUser
+from events.models import Event, Payment, Refund, Ticket, TicketTier
+
+pytestmark = pytest.mark.django_db
+
+
+def _make_online_ticket(
+    *,
+    user: RevelUser,
+    event: Event,
+    tier: TicketTier,
+    amount: Decimal,
+    currency: str = "EUR",
+    status: Payment.PaymentStatus = Payment.PaymentStatus.SUCCEEDED,
+    refund_amount: Decimal | None = None,
+    refund_status: Payment.RefundStatus | None = None,
+) -> Payment:
+    ticket = Ticket.objects.create(
+        guest_name="Online Guest",
+        user=user,
+        event=event,
+        tier=tier,
+        status=Ticket.TicketStatus.ACTIVE,
+    )
+    # The unified engine requires refunded_at to count a refund in the period window.
+    refunded_at = timezone.now() if refund_status == Payment.RefundStatus.SUCCEEDED else None
+    payment = Payment.objects.create(
+        ticket=ticket,
+        user=user,
+        stripe_session_id="sess",
+        amount=amount,
+        platform_fee=Decimal("0.50"),
+        currency=currency,
+        status=status,
+        refund_amount=refund_amount,
+        refund_status=refund_status,
+        refunded_at=refunded_at,
+    )
+    # Refunds are attributed from Refund rows (dated by succeeded_at), not the
+    # legacy Payment mirror — create the row the webhook would have written.
+    if refund_amount is not None and refund_status == Payment.RefundStatus.SUCCEEDED:
+        Refund.objects.create(
+            payment=payment,
+            amount=refund_amount,
+            currency=currency,
+            status=Refund.RefundStatus.SUCCEEDED,
+            succeeded_at=refunded_at,
+            source=Refund.Source.ORGANIZER_API,
+        )
+    return payment
+
+
+def _revenue_url(event: Event) -> str:
+    return reverse("api:event_revenue", kwargs={"event_id": event.pk})
+
+
+def _by_currency(data: dict[str, t.Any]) -> dict[str, dict[str, t.Any]]:
+    return {row["currency"]: row for row in data["by_currency"]}
+
+
+def test_revenue_online_only(
+    organization_owner_client: Client,
+    event: Event,
+    event_ticket_tier: TicketTier,
+    public_user: RevelUser,
+    member_user: RevelUser,
+) -> None:
+    """Multiple successful online payments sum into gross; net equals gross when no refunds."""
+    _make_online_ticket(user=public_user, event=event, tier=event_ticket_tier, amount=Decimal("10.00"))
+    _make_online_ticket(user=member_user, event=event, tier=event_ticket_tier, amount=Decimal("15.00"))
+    response = organization_owner_client.get(_revenue_url(event))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["event_id"] == str(event.pk)
+    eur = _by_currency(body)["EUR"]
+    assert Decimal(eur["gross"]) == Decimal("25.00")
+    assert Decimal(eur["refunds"]) == Decimal("0.00")
+    assert Decimal(eur["net"]) == Decimal("25.00")
+    assert eur["sold_count"] == 2
+    assert eur["refunded_count"] == 0
+
+
+def test_revenue_partial_refund(
+    organization_owner_client: Client,
+    event: Event,
+    event_ticket_tier: TicketTier,
+    public_user: RevelUser,
+    member_user: RevelUser,
+) -> None:
+    """Refunded payments stay in gross; the refund is reported separately and netted out."""
+    _make_online_ticket(user=public_user, event=event, tier=event_ticket_tier, amount=Decimal("20.00"))
+    _make_online_ticket(
+        user=member_user,
+        event=event,
+        tier=event_ticket_tier,
+        amount=Decimal("10.00"),
+        status=Payment.PaymentStatus.REFUNDED,
+        refund_amount=Decimal("4.00"),
+        refund_status=Payment.RefundStatus.SUCCEEDED,
+    )
+    eur = _by_currency(organization_owner_client.get(_revenue_url(event)).json())["EUR"]
+    assert Decimal(eur["gross"]) == Decimal("30.00")
+    assert Decimal(eur["refunds"]) == Decimal("4.00")
+    assert Decimal(eur["net"]) == Decimal("26.00")
+    assert eur["sold_count"] == 2
+    assert eur["refunded_count"] == 1
+
+
+def test_revenue_multi_currency_sorted(
+    organization_owner_client: Client,
+    event: Event,
+    event_ticket_tier: TicketTier,
+    public_user: RevelUser,
+    member_user: RevelUser,
+) -> None:
+    """Multiple currencies appear in ascending alphabetical order with correct per-currency gross."""
+    _make_online_ticket(user=public_user, event=event, tier=event_ticket_tier, amount=Decimal("10.00"), currency="EUR")
+    _make_online_ticket(user=member_user, event=event, tier=event_ticket_tier, amount=Decimal("20.00"), currency="USD")
+    body = organization_owner_client.get(_revenue_url(event)).json()
+    assert [row["currency"] for row in body["by_currency"]] == ["EUR", "USD"]
+    rows = _by_currency(body)
+    assert Decimal(rows["EUR"]["gross"]) == Decimal("10.00")
+    assert Decimal(rows["USD"]["gross"]) == Decimal("20.00")
+
+
+def test_revenue_empty_event(organization_owner_client: Client, event: Event) -> None:
+    """Events with no payments return an empty by_currency list."""
+    body = organization_owner_client.get(_revenue_url(event)).json()
+    assert body["event_id"] == str(event.pk)
+    assert body["by_currency"] == []
+
+
+def test_revenue_offline_full_refund_nets_out(
+    organization_owner_client: Client,
+    event: Event,
+    offline_tier: TicketTier,
+    public_user: RevelUser,
+) -> None:
+    """A fully refunded offline ticket appears in gross and refunds, netting to zero."""
+    from events.service import ticket_service
+
+    ticket = Ticket.objects.create(
+        guest_name="g",
+        user=public_user,
+        event=event,
+        tier=offline_tier,
+        status=Ticket.TicketStatus.ACTIVE,
+    )
+    ticket_service.mark_offline_ticket_refunded(ticket, cancelled_by=public_user)
+    eur = _by_currency(organization_owner_client.get(_revenue_url(event)).json())["EUR"]
+    assert Decimal(eur["gross"]) == Decimal("25.00")
+    assert Decimal(eur["refunds"]) == Decimal("25.00")
+    assert Decimal(eur["net"]) == Decimal("0.00")
+    assert eur["refunded_count"] == 1
+
+
+def test_revenue_offline_status_boundaries(
+    organization_owner_client: Client,
+    event: Event,
+    offline_tier: TicketTier,
+    at_door_tier: TicketTier,
+    public_user: RevelUser,
+    member_user: RevelUser,
+    nonmember_user: RevelUser,
+) -> None:
+    """Offline ACTIVE and at-the-door CHECKED_IN count as paid; at-the-door ACTIVE and pending do not."""
+    Ticket.objects.create(  # offline confirmed -> paid (25)
+        guest_name="g", user=public_user, event=event, tier=offline_tier, status=Ticket.TicketStatus.ACTIVE
+    )
+    Ticket.objects.create(  # at-the-door checked in -> paid (30)
+        guest_name="g", user=member_user, event=event, tier=at_door_tier, status=Ticket.TicketStatus.CHECKED_IN
+    )
+    Ticket.objects.create(  # at-the-door ACTIVE but not checked in -> NOT yet paid
+        guest_name="g", user=nonmember_user, event=event, tier=at_door_tier, status=Ticket.TicketStatus.ACTIVE
+    )
+    Ticket.objects.create(  # pending offline -> not paid
+        guest_name="g", user=nonmember_user, event=event, tier=offline_tier, status=Ticket.TicketStatus.PENDING
+    )
+    eur = _by_currency(organization_owner_client.get(_revenue_url(event)).json())["EUR"]
+    assert Decimal(eur["gross"]) == Decimal("55.00")
+    assert Decimal(eur["net"]) == Decimal("55.00")
+    assert eur["sold_count"] == 2
+
+
+def test_revenue_pending_only_omitted(
+    organization_owner_client: Client,
+    event: Event,
+    event_ticket_tier: TicketTier,
+    offline_tier: TicketTier,
+    public_user: RevelUser,
+    member_user: RevelUser,
+) -> None:
+    """An event whose only activity is pending/unpaid returns an empty by_currency list."""
+    _make_online_ticket(
+        user=public_user,
+        event=event,
+        tier=event_ticket_tier,
+        amount=Decimal("10.00"),
+        status=Payment.PaymentStatus.PENDING,
+    )
+    Ticket.objects.create(
+        guest_name="g", user=member_user, event=event, tier=offline_tier, status=Ticket.TicketStatus.PENDING
+    )
+    assert organization_owner_client.get(_revenue_url(event)).json()["by_currency"] == []
+
+
+def test_revenue_offline_partial_refund_keeps_remainder(
+    organization_owner_client: Client,
+    event: Event,
+    offline_tier: TicketTier,
+    public_user: RevelUser,
+) -> None:
+    """An explicit partial offline refund leaves the kept remainder in net (#528)."""
+    from events.service import ticket_service
+
+    ticket = Ticket.objects.create(
+        guest_name="g", user=public_user, event=event, tier=offline_tier, status=Ticket.TicketStatus.ACTIVE
+    )
+    # Collected 25.00, refund only 10.00 -> kept 15.00.
+    ticket_service.mark_offline_ticket_refunded(ticket, cancelled_by=public_user, refund_amount=Decimal("10.00"))
+    eur = _by_currency(organization_owner_client.get(_revenue_url(event)).json())["EUR"]
+    assert Decimal(eur["gross"]) == Decimal("25.00")
+    assert Decimal(eur["refunds"]) == Decimal("10.00")
+    assert Decimal(eur["net"]) == Decimal("15.00")
+    assert eur["refunded_count"] == 1
+
+
+def test_revenue_pwyc_price_paid_override(
+    organization_owner_client: Client,
+    event: Event,
+    pwyc_offline_tier: TicketTier,
+    public_user: RevelUser,
+) -> None:
+    """For PWYC offline tickets, price_paid is used over the (zero) tier price."""
+    Ticket.objects.create(
+        guest_name="g",
+        user=public_user,
+        event=event,
+        tier=pwyc_offline_tier,
+        status=Ticket.TicketStatus.ACTIVE,
+        price_paid=Decimal("12.00"),
+    )
+    eur = _by_currency(organization_owner_client.get(_revenue_url(event)).json())["EUR"]
+    assert Decimal(eur["gross"]) == Decimal("12.00")
+    assert eur["sold_count"] == 1
+
+
+def test_revenue_requires_manage_tickets(member_client: Client, event: Event) -> None:
+    """The revenue endpoint requires the manage_tickets permission; plain members are rejected."""
+    assert member_client.get(_revenue_url(event)).status_code == 403

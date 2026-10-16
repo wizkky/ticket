@@ -1,0 +1,66 @@
+import * as m from '$lib/paraglide/messages.js';
+import type { NotificationType } from '$lib/api/generated/types.gen.js';
+
+interface NotificationTypeCopy {
+	label: () => string;
+	description?: () => string;
+}
+
+/**
+ * Human labels for notification types. Types missing here fall back to their
+ * raw name with underscores turned into spaces (the per-type list capitalizes
+ * it with CSS), so this map can grow one type at a time.
+ */
+const NOTIFICATION_TYPE_COPY: Partial<Record<NotificationType, NotificationTypeCopy>> = {
+	// Organizer alerts for ticket and series-pass activity (BE #1127 / #1130).
+	staff_ticket_created: {
+		label: () => m['notificationPreferences.typeStaffTicketCreated'](),
+		description: () => m['notificationPreferences.typeStaffTicketCreatedDescription']()
+	},
+	staff_ticket_cancelled: {
+		label: () => m['notificationPreferences.typeStaffTicketCancelled'](),
+		description: () => m['notificationPreferences.typeStaffTicketCancelledDescription']()
+	},
+	staff_ticket_refunded: {
+		label: () => m['notificationPreferences.typeStaffTicketRefunded'](),
+		description: () => m['notificationPreferences.typeStaffTicketRefundedDescription']()
+	},
+	staff_series_pass_purchased: {
+		label: () => m['notificationPreferences.typeStaffSeriesPassPurchased'](),
+		description: () => m['notificationPreferences.typeStaffSeriesPassPurchasedDescription']()
+	},
+	staff_series_pass_cancelled: {
+		label: () => m['notificationPreferences.typeStaffSeriesPassCancelled'](),
+		description: () => m['notificationPreferences.typeStaffSeriesPassCancelledDescription']()
+	},
+	org_setup_nudge: {
+		label: () => m['notificationPreferences.typeOrgSetupNudge'](),
+		description: () => m['notificationPreferences.typeOrgSetupNudgeDescription']()
+	},
+	// Daily digest to owners and manage_tickets staff (#1008, BE #1073).
+	fiscal_document_skipped: {
+		label: () => m['notificationPreferences.typeFiscalDocumentSkipped'](),
+		description: () => m['notificationPreferences.typeFiscalDocumentSkippedDescription']()
+	}
+};
+
+function getCopy(type: string): NotificationTypeCopy | undefined {
+	// hasOwn, not `in`: the API may send a type this build doesn't know yet, and
+	// `in` would also match prototype keys like `toString`.
+	return Object.hasOwn(NOTIFICATION_TYPE_COPY, type)
+		? NOTIFICATION_TYPE_COPY[type as NotificationType]
+		: undefined;
+}
+
+/** Whether `type` has a translated label (vs. the raw-name fallback). */
+export function hasNotificationTypeLabel(type: string): boolean {
+	return getCopy(type) !== undefined;
+}
+
+export function getNotificationTypeLabel(type: string): string {
+	return getCopy(type)?.label() ?? type.replace(/_/g, ' ');
+}
+
+export function getNotificationTypeDescription(type: string): string | undefined {
+	return getCopy(type)?.description?.();
+}

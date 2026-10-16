@@ -1,0 +1,85 @@
+/**
+ * Formatting utilities for prices and currencies.
+ *
+ * All currency formatting is pinned to the active UI language (via
+ * `getDateLocale()`), never the runtime's default locale — the server's ICU
+ * locale and the browser's can differ, which made SSR render "95,00 €" and
+ * the client re-render "€95.00" on the same page.
+ */
+
+import { getDateLocale } from './date';
+
+/**
+ * Format a price with currency using Intl.NumberFormat.
+ * Returns `freeLabel` when the price is zero, null, or undefined.
+ */
+export function formatPrice(
+	price: number | string | undefined | null,
+	currency?: string | null,
+	freeLabel = 'Free'
+): string {
+	if (price === undefined || price === null) return freeLabel;
+	const numPrice = typeof price === 'string' ? parseFloat(price) : price;
+	if (numPrice === 0) return freeLabel;
+	const currencyCode = currency?.toUpperCase() || 'USD';
+	return new Intl.NumberFormat(getDateLocale(), {
+		style: 'currency',
+		currency: currencyCode
+	}).format(numPrice);
+}
+
+/**
+ * Format a monetary amount with currency, always showing the numeric value
+ * (including zero, e.g. "$0.00"). Unlike {@link formatPrice} it never
+ * substitutes a "Free" label — use it for accounting figures (revenue, net,
+ * refunds) where a zero amount is meaningful.
+ */
+export function formatMoney(
+	amount: number | string | null | undefined,
+	currency?: string | null
+): string {
+	const parsed = typeof amount === 'string' ? parseFloat(amount) : (amount ?? 0);
+	const safe = Number.isFinite(parsed) ? parsed : 0;
+	const currencyCode = currency?.toUpperCase() || 'USD';
+	try {
+		return new Intl.NumberFormat(getDateLocale(), {
+			style: 'currency',
+			currency: currencyCode
+		}).format(safe);
+	} catch {
+		// Intl.NumberFormat throws RangeError on a malformed currency code
+		// (not exactly 3 letters). Fall back to USD rather than break rendering.
+		return new Intl.NumberFormat(getDateLocale(), {
+			style: 'currency',
+			currency: 'USD'
+		}).format(safe);
+	}
+}
+
+/** Spaced en dash between the two ends of a money range. */
+export const MONEY_RANGE_SEPARATOR = ' \u2013 ';
+
+/**
+ * Format a min–max money range with {@link formatMoney} on both ends, e.g.
+ * "€20.00 – €45.00" (en) or "20,00 € – 45,00 €" (de).
+ */
+export function formatMoneyRange(
+	min: number | string | null | undefined,
+	max: number | string | null | undefined,
+	currency?: string | null
+): string {
+	return `${formatMoney(min, currency)}${MONEY_RANGE_SEPARATOR}${formatMoney(max, currency)}`;
+}
+
+/**
+ * Format a 0..1 ratio as a locale-aware percentage (e.g. `0.0667` → "6.7%" in
+ * en, "6,7 %" in de). Pinned to the UI language like the currency helpers so
+ * SSR and CSR agree.
+ */
+export function formatPercent(ratio: number | null | undefined, maximumFractionDigits = 1): string {
+	const safe = Number.isFinite(ratio) ? (ratio as number) : 0;
+	return new Intl.NumberFormat(getDateLocale(), {
+		style: 'percent',
+		maximumFractionDigits
+	}).format(safe);
+}

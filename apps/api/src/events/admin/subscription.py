@@ -1,0 +1,126 @@
+"""Admin classes for membership subscription models."""
+
+from django.contrib import admin
+from simple_history.admin import SimpleHistoryAdmin
+from unfold.admin import ModelAdmin
+
+from events import models
+from events.admin.base import OrganizationLinkMixin, UserLinkMixin
+
+
+@admin.register(models.MembershipSubscriptionPlan)
+class MembershipSubscriptionPlanAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
+    """Admin for MembershipSubscriptionPlan."""
+
+    list_display = [
+        "__str__",
+        "tier",
+        "price",
+        "currency",
+        "period_unit",
+        "period_count",
+        "payment_method",
+        "is_active",
+    ]
+    list_filter = ["is_active", "payment_method", "period_unit", "currency", "tier__organization__name"]
+    list_select_related = ["tier", "tier__organization"]
+    search_fields = ["name", "tier__name", "tier__organization__name", "stripe_price_id", "stripe_product_id"]
+    autocomplete_fields = ["tier"]
+    # Stripe IDs are populated by the service layer on save; keep them readonly
+    # so admins don't accidentally desync the local row from Stripe.
+    readonly_fields = ["stripe_product_id", "stripe_price_id", "created_at", "updated_at"]
+
+
+@admin.register(models.MembershipSubscription)
+class MembershipSubscriptionAdmin(SimpleHistoryAdmin, ModelAdmin, UserLinkMixin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for MembershipSubscription.
+
+    Lifecycle fields (``status``, ``cancelled_at``, ``current_period_*``) are
+    readonly here so admin edits cannot bypass the service-layer state
+    machine (see :mod:`events.service.subscription.lifecycle`).
+    """
+
+    list_display = [
+        "__str__",
+        "user_link",
+        "organization_link",
+        "plan",
+        "status",
+        "current_period_end",
+        "cancel_at_period_end",
+        "pending_plan",
+    ]
+    list_filter = ["status", "cancel_at_period_end", "organization__name"]
+    list_select_related = ["user", "organization", "plan", "plan__tier", "pending_plan"]
+    search_fields = [
+        "user__username",
+        "user__email",
+        "organization__name",
+        "plan__name",
+        "stripe_subscription_id",
+        "stripe_schedule_id",
+    ]
+    autocomplete_fields = ["user", "organization", "plan", "pending_plan"]
+    readonly_fields = [
+        "status",
+        "current_period_start",
+        "current_period_end",
+        "cancelled_at",
+        "stripe_subscription_id",
+        "stripe_schedule_id",
+        "pending_plan",
+        "created_at",
+        "updated_at",
+    ]
+    date_hierarchy = "current_period_end"
+
+
+@admin.register(models.MembershipPayment)
+class MembershipPaymentAdmin(SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
+    """Admin for MembershipPayment.
+
+    ``status`` and the period fields are readonly to keep refunds and
+    period mutation flowing through the service layer. The ``platform_fee*``
+    group is readonly too: it is written as one consistent set by the fee
+    decomposition, and a partial admin edit would silently skew invoicing and
+    referral payouts.
+    """
+
+    list_display = ["__str__", "subscription", "amount", "currency", "status", "period_end", "created_at"]
+    list_filter = ["status", "currency", "subscription__organization__name"]
+    list_select_related = ["subscription", "subscription__user", "subscription__organization"]
+    search_fields = [
+        "subscription__user__username",
+        "subscription__user__email",
+        "subscription__organization__name",
+        "stripe_invoice_id",
+        "stripe_payment_intent_id",
+    ]
+    autocomplete_fields = ["subscription", "recorded_by"]
+    readonly_fields = [
+        "status",
+        "period_start",
+        "period_end",
+        "stripe_invoice_id",
+        "stripe_payment_intent_id",
+        "platform_fee",
+        "platform_fee_net",
+        "platform_fee_vat",
+        "platform_fee_vat_rate",
+        "platform_fee_reverse_charge",
+        "created_at",
+        "updated_at",
+    ]
+    date_hierarchy = "created_at"
+
+
+@admin.register(models.CustomerProfile)
+class CustomerProfileAdmin(SimpleHistoryAdmin, ModelAdmin, UserLinkMixin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for the per-(user, organization) Stripe Customer reference."""
+
+    list_display = ["__str__", "user_link", "organization_link", "stripe_customer_id", "created_at"]
+    list_filter = ["organization__name"]
+    list_select_related = ["user", "organization"]
+    search_fields = ["user__username", "user__email", "organization__name", "stripe_customer_id"]
+    autocomplete_fields = ["user", "organization"]
+    readonly_fields = ["stripe_customer_id", "created_at", "updated_at"]

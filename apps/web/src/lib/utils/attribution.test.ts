@@ -1,0 +1,192 @@
+import { describe, it, expect } from 'vitest';
+import {
+	sanitizeUtmValue,
+	readAttributionFromUrl,
+	withUtmParams,
+	formatTicketAttributionLine,
+	landingCreateOrgPath,
+	tagLandingCtaHref
+} from './attribution';
+import { registrationReturnUrl, safeReturnUrl } from './safe-redirect';
+import { landingPages } from '$lib/data/landing-pages';
+
+describe('sanitizeUtmValue', () => {
+	it.each([
+		['newsletter', 'newsletter'],
+		['  spring-2026  ', 'spring-2026'],
+		['a.b:c_d-e', 'a.b:c_d-e'],
+		['', null],
+		[null, null],
+		[undefined, null],
+		['has spaces', null],
+		['<script>', null],
+		['emoji🎉', null]
+	])('%j → %j', (raw, expected) => {
+		expect(sanitizeUtmValue(raw)).toBe(expected);
+	});
+
+	it('caps at 100 chars BEFORE the charset test (long-but-valid keeps its head, like BE)', () => {
+		expect(sanitizeUtmValue('a'.repeat(150))).toBe('a'.repeat(100));
+	});
+});
+
+describe('readAttributionFromUrl', () => {
+	it('returns null when no utm params are present', () => {
+		expect(readAttributionFromUrl(new URL('https://x.test/events/a/b?page=2'))).toBeNull();
+	});
+
+	it('reads only the four utm keys and drops junk values', () => {
+		const url = new URL(
+			'https://x.test/e?utm_source=instagram&utm_campaign=bad value&utm_term=nope&other=1&utm_medium=social'
+		);
+		expect(readAttributionFromUrl(url)).toEqual({ utm_source: 'instagram', utm_medium: 'social' });
+	});
+
+	it('returns null when every value is junk', () => {
+		expect(readAttributionFromUrl(new URL('https://x.test/?utm_source=a b'))).toBeNull();
+	});
+});
+
+describe('withUtmParams', () => {
+	const current = new URL('https://letsrevel.io/org/acme?utm_source=newsletter&utm_campaign=sept');
+
+	it('appends surviving tags to a path href', () => {
+		expect(withUtmParams('/events/acme/party', current)).toBe(
+			'/events/acme/party?utm_source=newsletter&utm_campaign=sept'
+		);
+	});
+
+	it('resolves ?-only hrefs against the current path', () => {
+		expect(withUtmParams('?page=2', current)).toBe(
+			'/org/acme?page=2&utm_source=newsletter&utm_campaign=sept'
+		);
+	});
+
+	it('is a no-op when the current URL has no tags', () => {
+		expect(withUtmParams('/events', new URL('https://letsrevel.io/'))).toBe('/events');
+	});
+
+	it('never overwrites a utm key already on the href', () => {
+		expect(withUtmParams('/e?utm_source=embed', current)).toBe(
+			'/e?utm_source=embed&utm_campaign=sept'
+		);
+	});
+
+	it('drops junk values instead of carrying them', () => {
+		const junky = new URL('https://letsrevel.io/?utm_source=ok&utm_medium=b a d');
+		expect(withUtmParams('/e', junky)).toBe('/e?utm_source=ok');
+	});
+});
+
+describe('formatTicketAttributionLine', () => {
+	it('returns null when there is no attribution', () => {
+		expect(formatTicketAttributionLine(null)).toBeNull();
+		expect(formatTicketAttributionLine(undefined)).toBeNull();
+	});
+
+	it('returns null when the attribution object carries no tags', () => {
+		expect(formatTicketAttributionLine({})).toBeNull();
+	});
+
+	it('joins source and campaign when both are present', () => {
+		expect(formatTicketAttributionLine({ utm_source: 'instagram', utm_campaign: 'launch' })).toBe(
+			'instagram · launch'
+		);
+	});
+
+	it('renders only source when campaign is absent', () => {
+		expect(formatTicketAttributionLine({ utm_source: 'instagram' })).toBe('instagram');
+	});
+
+	it('renders only campaign when source is absent', () => {
+		expect(formatTicketAttributionLine({ utm_campaign: 'launch' })).toBe('launch');
+	});
+
+	it('falls back to medium · content when neither source nor campaign is present', () => {
+		expect(formatTicketAttributionLine({ utm_medium: 'social', utm_content: 'story' })).toBe(
+			'social · story'
+		);
+	});
+
+	it('falls back to medium alone when content is also absent', () => {
+		expect(formatTicketAttributionLine({ utm_medium: 'social' })).toBe('social');
+	});
+
+	it('prefers source/campaign over medium/content when both groups are present', () => {
+		expect(
+			formatTicketAttributionLine({
+				utm_source: 'instagram',
+				utm_medium: 'social',
+				utm_content: 'story'
+			})
+		).toBe('instagram');
+	});
+});
+
+describe('landing CTA tags (#1002)', () => {
+	const tagged =
+		'/create-org?utm_source=revel&utm_medium=landing&utm_campaign=eventbrite-alternative&utm_content=hero';
+
+	it('builds the tagged create-org path', () => {
+		expect(landingCreateOrgPath('eventbrite-alternative', 'hero')).toBe(tagged);
+	});
+
+	it('round-trips through readAttributionFromUrl unchanged', () => {
+		expect(
+			readAttributionFromUrl(new URL(landingCreateOrgPath('home', 'close'), 'http://x'))
+		).toEqual({
+			utm_source: 'revel',
+			utm_medium: 'landing',
+			utm_campaign: 'home',
+			utm_content: 'close'
+		});
+	});
+
+	it('sends /register on to the tagged create-org page via an encoded returnUrl', () => {
+		const href = tagLandingCtaHref('/register', 'eventbrite-alternative', 'hero');
+		const url = new URL(href, 'http://x');
+		expect(url.pathname).toBe('/register');
+		// One param only: the tags must not leak out as siblings of returnUrl.
+		expect([...url.searchParams.keys()]).toEqual(['returnUrl']);
+		const returnUrl = url.searchParams.get('returnUrl');
+		expect(returnUrl).toBe(tagged);
+		// Accepted by both the redirect guard and the registration allow-list,
+		// so it survives register → verify email → /create-org.
+		expect(safeReturnUrl(returnUrl)).toBe(tagged);
+		expect(registrationReturnUrl(returnUrl)).toBe(tagged);
+	});
+
+	it('carries an inbound campaign verbatim instead of the landing defaults (#880 rule)', () => {
+		const current = new URL(
+			'http://x/eventbrite-alternative?utm_source=instagram&utm_campaign=spring&utm_medium=bad%20value'
+		);
+		expect(landingCreateOrgPath('eventbrite-alternative', 'hero', current)).toBe(
+			'/create-org?utm_source=instagram&utm_campaign=spring'
+		);
+	});
+
+	it('ignores inbound tags without a valid utm_source', () => {
+		const current = new URL('http://x/?utm_campaign=spring');
+		expect(landingCreateOrgPath('eventbrite-alternative', 'hero', current)).toBe(tagged);
+	});
+
+	it('tags /create-org directly', () => {
+		expect(tagLandingCtaHref('/create-org', 'eventbrite-alternative', 'hero')).toBe(tagged);
+	});
+
+	it('leaves every other href alone', () => {
+		for (const href of ['https://demo.letsrevel.io', 'mailto:contact@letsrevel.io', '/events']) {
+			expect(tagLandingCtaHref(href, 'home', 'hero')).toBe(href);
+		}
+	});
+});
+
+describe('landing slugs as utm_campaign (#1002)', () => {
+	it('every landing slug survives the sanitiser, so no campaign is silently dropped', () => {
+		for (const pages of Object.values(landingPages)) {
+			for (const page of Object.values(pages)) {
+				expect(sanitizeUtmValue(page.slug)).toBe(page.slug);
+			}
+		}
+	});
+});

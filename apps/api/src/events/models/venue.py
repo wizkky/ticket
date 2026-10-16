@@ -1,0 +1,275 @@
+import typing as t
+
+from django.db import models
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+
+from common.models import TimeStampedModel
+
+from .mixins import LocationMixin, SlugFromNameMixin
+from .organization import Organization
+
+
+class VenueQuerySet(models.QuerySet["Venue"]):
+    """Custom queryset for Venue model with prefetch patterns."""
+
+    def with_sectors(self) -> t.Self:
+        """Prefetch related sectors."""
+        return self.prefetch_related("sectors")
+
+    def with_seats(self) -> t.Self:
+        """Prefetch sectors and their seats."""
+        return self.prefetch_related("sectors__seats")
+
+    def full(self) -> t.Self:
+        """Prefetch all related objects (sectors and seats)."""
+        return self.prefetch_related("sectors", "sectors__seats")
+
+
+class VenueManager(models.Manager["Venue"]):
+    """Custom manager for Venue with convenience methods for related object selection."""
+
+    def get_queryset(self) -> VenueQuerySet:
+        """Get base queryset."""
+        return VenueQuerySet(self.model, using=self._db)
+
+    def with_sectors(self) -> VenueQuerySet:
+        """Returns a queryset with sectors prefetched."""
+        return self.get_queryset().with_sectors()
+
+    def with_seats(self) -> VenueQuerySet:
+        """Returns a queryset with sectors and seats prefetched."""
+        return self.get_queryset().with_seats()
+
+    def full(self) -> VenueQuerySet:
+        """Returns a queryset with all related objects prefetched."""
+        return self.get_queryset().full()
+
+
+class Venue(SlugFromNameMixin, TimeStampedModel, LocationMixin):
+    """A physical venue belonging to an organization.
+
+    Layout (sectors/seats) is optional and FE-defined.
+
+    Note:
+        The `capacity` field is combined with Event.max_attendees to determine
+        the effective event capacity (min of both). This is a soft limit that
+        can be overridden by invitations with overrides_max_attendees=True.
+
+        Hard capacity limits are enforced via:
+        - VenueSector.capacity for GA tiers (cannot be overridden)
+        - Materialized seats in sectors for seated events
+    """
+
+    # Slug must be unique per organization, same convention as Event
+    slug_scope_field = "organization"
+
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="venues",
+        db_index=True,
+    )
+
+    name = models.CharField(max_length=255, db_index=True)
+    slug = models.SlugField(max_length=255)
+
+    description = models.TextField(blank=True, null=True)
+
+    # Allows GA-only venues
+    capacity = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Combined with Event.max_attendees to determine effective capacity (min of both). 0/null = unlimited."
+        ),
+    )
+
+    # Arbitrary metadata for FE layout config (mirrors VenueSector.metadata)
+    metadata = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            "Arbitrary JSON for venue-level layout config (e.g. stage position/shape) written by the frontend designer."
+        ),
+    )
+
+    # The seating chart's cache key. Explicit rather than derived from
+    # max(venue/sector/seat.updated_at): a derived version cannot see a DELETE (no row left to
+    # stamp), cannot see a price-category rename (categories are on the chart but were never in
+    # the max), and silently misses every writer that uses save(update_fields=...), bulk_update()
+    # or queryset.update() — all three bypass auto_now. Only
+    # `events.service.seating.chart.bump_chart_version` writes this; every venue mutation that
+    # changes what the chart renders must call it.
+    chart_version = models.DateTimeField(
+        default=timezone.now,
+        editable=False,
+        help_text="Version stamp of the seating chart; bumped by every chart-visible venue write.",
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "slug"],
+                name="unique_organization_venue_slug",
+            )
+        ]
+        ordering = ["name"]
+        indexes = [
+            models.Index(fields=["organization", "name"]),
+        ]
+
+    objects = VenueManager()
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.organization.name})"
+
+
+class PriceCategory(TimeStampedModel):
+    """A venue-scoped price category painted onto seats.
+
+    Category lives on the map; price lives on the event via TicketTier.
+    Multiple tiers MAY reference the same category (shared seat pool).
+    """
+
+    venue = models.ForeignKey(Venue, on_delete=models.CASCADE, related_name="price_categories", db_index=True)
+    name = models.CharField(max_length=100)
+    color = models.CharField(max_length=7, help_text="Hex color for map rendering, e.g. #aa0000.")
+    display_order = models.PositiveIntegerField(default=0, db_index=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["venue", "name"], name="unique_venue_price_category_name")]
+        ordering = ["venue", "display_order", "name"]
+
+    def __str__(self) -> str:
+        return f"{self.venue.name}: {self.name}"
+
+
+class VenueSector(TimeStampedModel):
+    """A logical area inside a venue (e.g. Balcony, Floor Left).
+
+    Note:
+        The `capacity` field is a HARD limit for GA tiers (seat_assignment_mode=NONE)
+        and is enforced during ticket sales. This limit cannot be overridden by
+        special invitations. For seated tiers, capacity is implicitly enforced by
+        the number of materialized VenueSeat objects in this sector.
+    """
+
+    class Kind(models.TextChoices):
+        SEATED = "seated", _("Seated")
+        STANDING = "standing", _("Standing")
+
+    venue = models.ForeignKey(
+        Venue,
+        on_delete=models.CASCADE,
+        related_name="sectors",
+        db_index=True,
+    )
+
+    kind = models.CharField(choices=Kind.choices, default=Kind.SEATED, max_length=10, db_index=True)
+
+    name = models.CharField(max_length=100, db_index=True)
+    code = models.CharField(max_length=30, blank=True, null=True)
+
+    shape = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=(
+            'Arbitrary polygon for FE rendering. Canonical format: [{"x": .., "y": ..}, ...]. '
+            "Legacy [x, y] pairs are coerced on read."
+        ),
+    )
+
+    capacity = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Hard capacity limit for GA tiers. Enforced during ticket sales. "
+            "For seated tiers, capacity is enforced by seat count."
+        ),
+    )
+
+    # Controls ordering in FE lists
+    display_order = models.PositiveIntegerField(default=0, db_index=True)
+
+    # Arbitrary metadata for FE rendering (e.g., aisle positions, labels, etc.)
+    metadata = models.JSONField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text="Arbitrary JSON metadata for frontend rendering (e.g., aisle positions).",
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["venue", "name"],
+                name="unique_venue_sector_name",
+            )
+        ]
+        ordering = ["venue", "display_order", "name"]
+        indexes = [
+            models.Index(fields=["venue", "display_order"]),
+            models.Index(fields=["venue", "name"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.venue.name}: {self.name}"
+
+
+class VenueSeat(TimeStampedModel):
+    """A materialized seat inside a sector.
+
+    Used in reserved seating, or as 'spots' in standing sections.
+    """
+
+    sector = models.ForeignKey(
+        VenueSector,
+        on_delete=models.CASCADE,
+        related_name="seats",
+        db_index=True,
+    )
+
+    label = models.CharField(max_length=50, db_index=True)
+
+    # Optional structured labeling
+    row_label = models.CharField(max_length=20, blank=True, null=True, db_index=True)
+    number = models.PositiveIntegerField(null=True, blank=True, db_index=True)
+
+    row_order = models.PositiveIntegerField(
+        default=0, db_index=True, help_text="Deterministic front-to-back row rank within the sector."
+    )
+    adjacency_index = models.PositiveIntegerField(
+        default=0, help_text="Physical left-to-right position in the row. Never derived from printed number."
+    )
+    default_price_category = models.ForeignKey(
+        "events.PriceCategory", on_delete=models.SET_NULL, null=True, blank=True, related_name="seats"
+    )
+
+    position = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Seat position for FE rendering (pixel-based or relative coordinate).",
+    )
+
+    is_accessible = models.BooleanField(default=False)
+    is_obstructed_view = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["sector", "label"],
+                name="unique_sector_seat_label",
+            )
+        ]
+        ordering = ["sector", "row_order", "adjacency_index", "label"]
+        indexes = [
+            models.Index(fields=["sector", "row_label", "number"]),
+            models.Index(fields=["sector", "label"]),
+            models.Index(fields=["sector", "is_active"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.sector.name} / {self.label}"

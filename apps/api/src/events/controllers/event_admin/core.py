@@ -1,0 +1,293 @@
+import typing as t
+from uuid import UUID
+
+from django.http import HttpRequest
+from django.utils.translation import gettext_lazy as _
+from ninja import File
+from ninja.errors import HttpError
+from ninja.files import UploadedFile
+from ninja_extra import api_controller, route
+
+from common.authentication import ScopedJWTAuth
+from common.models import Tag
+from common.schema import ErrorDetail, TagSchema, ValidationErrorResponse
+from common.service.upload_service import safe_save_uploaded_file
+from common.throttling import UserDefaultThrottle, WriteThrottle
+from common.thumbnails.service import delete_image_with_derivatives
+from events import models, schema
+from events.controllers.permissions import CanDuplicateEvent, EventPermission, scope_allows
+from events.service import event_service, refund_service
+from oauth.permissions import RequireScope
+
+from .base import EventAdminBaseController
+
+
+@api_controller(
+    "/event-admin/{event_id}",
+    auth=ScopedJWTAuth(),
+    permissions=[RequireScope("org:read"), EventPermission("invite_to_event")],
+    tags=["Event Admin"],
+    throttle=WriteThrottle(),
+)
+class EventAdminCoreController(EventAdminBaseController):
+    """Core event admin operations.
+
+    Handles event CRUD, media uploads, status changes, and tags.
+    """
+
+    @route.put(
+        "",
+        url_name="edit_event",
+        response={200: schema.EventDetailSchema, 400: ValidationErrorResponse | ErrorDetail},
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def update_event(self, event_id: UUID, payload: schema.EventEditSchema) -> models.Event:
+        """Update event by ID.
+
+        Editing a series occurrence (non-template) marks it as ``is_modified=True``
+        so it is protected from future template propagation — *but only when
+        the PUT actually changes a persisted field*. A no-op PUT (re-submitting
+        the current state) must not silently opt the occurrence out of
+        propagation. Template editing and propagation are handled via the
+        series admin controller. Templates themselves are never reachable here:
+        ``get_one()`` uses ``Event.objects.for_user()`` which filters
+        ``is_template=False``.
+        """
+        event = self.get_one(event_id)
+        return event_service.update_event(event, payload, requested_by=self.user())
+
+    @route.delete(
+        "",
+        url_name="delete_event",
+        response={204: None},
+        permissions=[RequireScope("org:read"), EventPermission("delete_event")],
+    )
+    def delete_event(self, event_id: UUID) -> tuple[int, None]:
+        """Delete event by ID."""
+        event = self.get_one(event_id)
+        event.delete()
+        return 204, None
+
+    @route.patch(
+        "/slug",
+        url_name="edit_event_slug",
+        response={200: schema.EventDetailSchema},
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def edit_slug(self, event_id: UUID, payload: schema.EventEditSlugSchema) -> models.Event:
+        """Update the event's slug (URL-friendly identifier).
+
+        The slug must be unique within the organization and must be a valid slug format
+        (lowercase letters, numbers, and hyphens only).
+        """
+        event = self.get_one(event_id)
+        try:
+            return event_service.update_slug(event, payload.slug)
+        except event_service.SlugAlreadyExistsError as exc:
+            raise HttpError(400, str(event_service.SLUG_ALREADY_EXISTS_MESSAGE)) from exc
+
+    @route.put(
+        "/schedule",
+        url_name="update_event_schedule",
+        response={200: schema.EventDetailSchema},
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def update_event_schedule(self, event_id: UUID, payload: schema.EventScheduleUpdateSchema) -> models.Event:
+        """Replace this event's schedule (timeline) with the provided sessions.
+
+        Full-array replace: the supplied ``sessions`` list becomes the new schedule,
+        in the given order. Times are relative offsets (minutes) from the event start.
+        """
+        event = self.get_one(event_id)
+        return event_service.update_event_schedule(event, payload.sessions)
+
+    @route.post(
+        "/duplicate",
+        url_name="duplicate_event",
+        response={200: schema.EventDetailSchema},
+        permissions=[RequireScope("org:read"), CanDuplicateEvent()],
+    )
+    def duplicate_event(self, event_id: UUID, payload: schema.EventDuplicateSchema) -> models.Event:
+        """Create a copy of this event with a new name and start date.
+
+        All date fields are shifted relative to the new start date. The new event
+        is created in DRAFT status. Ticket tiers, suggested potluck items, tags,
+        questionnaire links, and resource links are copied. User-specific data
+        (tickets, RSVPs, invitations, etc.) is NOT copied.
+
+        Requires create_event permission on the event's organization.
+        """
+        event = self.get_one(event_id)
+        return event_service.duplicate_event(
+            template_event=event,
+            new_name=payload.name,
+            new_start=payload.start,
+        )
+
+    @route.post(
+        "/actions/update-status/{status}",
+        url_name="update_event_status",
+        permissions=[RequireScope("org:read"), EventPermission("manage_event")],
+        response={200: schema.EventDetailSchema, 400: ErrorDetail, 409: ErrorDetail},
+    )
+    def update_event_status(
+        self,
+        event_id: UUID,
+        status: models.Event.EventStatus,
+        payload: schema.EventStatusUpdatePayload | None = None,
+    ) -> models.Event:
+        """Update event status to the specified value.
+
+        When ``status`` is ``cancelled``, an optional ``cancellation_reason`` in
+        the request body is persisted on the event and surfaced in the
+        EVENT_CANCELLED notification. The reason is ignored for every other
+        target status. ``refund_tickets=True`` additionally cancels every
+        ticket and refunds online payments in the background — only valid
+        alongside ``cancelled`` (400 otherwise). The sweep always dispatches
+        (even if a previous sweep already started), and each per-ticket
+        subtask is idempotent — so re-POSTing this endpoint with the flag
+        still set is the supported way to resume a crashed or partial sweep.
+
+        Note: Event opening notifications are handled automatically by the post_save signal
+        in events/signals.py which triggers when status field is updated.
+        """
+        event = self.get_one(event_id)
+        cancellation_reason = payload.cancellation_reason if payload else None
+        refund_tickets = payload.refund_tickets if payload else False
+        if refund_tickets and status != models.Event.EventStatus.CANCELLED:
+            raise HttpError(400, str(_("refund_tickets is only valid when cancelling the event.")))
+        if refund_tickets:
+            # Cancelling is ``manage_event``, but ``refund_tickets`` runs the same Stripe sweep
+            # the per-ticket refund route gates behind ``manage_tickets`` — and ``org:tickets``
+            # is the only scope whose consent label names refunds. An app token therefore needs
+            # it as well; ``scope_allows`` is a no-op for session principals, so staff in a
+            # browser are untouched. Checked in the handler because the requirement is
+            # conditional on the body, which a declarative ``permissions=`` entry cannot see.
+            request = t.cast(HttpRequest, self.context.request)  # type: ignore[union-attr]
+            scope_allows(request, "manage_tickets")
+        return event_service.update_status(
+            event,
+            status,
+            cancellation_reason=cancellation_reason,
+            refund_tickets=refund_tickets,
+            initiated_by=self.user(),
+        )
+
+    @route.get(
+        "/cancellation-refund-preview",
+        url_name="event_cancellation_refund_preview",
+        response=schema.EventRefundPreviewSchema,
+        # ``org:tickets`` alongside the baseline: the response carries the connected account's
+        # live Stripe balance and the event's refundable revenue, which ``org:events``'s label
+        # never promises and ``org:tickets``'s ("see ... revenue") does. Same pattern as the
+        # member roster (R-123): ``RequireScope`` constrains app tokens only.
+        permissions=[RequireScope("org:read"), RequireScope("org:tickets"), EventPermission("manage_event")],
+        throttle=UserDefaultThrottle(),  # read-only — don't burn the class-level WriteThrottle budget
+    )
+    def cancellation_refund_preview(self, event_id: UUID) -> schema.EventRefundPreviewSchema:
+        """Advisory pre-flight for cancel-with-refunds: totals vs Stripe balance. Never blocks.
+
+        Also the ONLY place ``tickets_refund_started_at`` is exposed — staff-gated by
+        this controller's permission; it must never appear in event schemas.
+        """
+        event = self.get_one(event_id)
+        preview = refund_service.build_event_refund_preview(event)
+        return schema.EventRefundPreviewSchema(
+            active_tickets=preview.active_tickets,
+            online_refundable_tickets=preview.online_refundable_tickets,
+            offline_tickets=preview.offline_tickets,
+            currencies=[
+                schema.RefundPreviewCurrencyLine(
+                    currency=line.currency,
+                    total_refundable=line.total_refundable,
+                    available_balance=line.available_balance,
+                    balance_sufficient=line.balance_sufficient,
+                )
+                for line in preview.currencies
+            ],
+            tickets_refund_started_at=preview.tickets_refund_started_at,
+        )
+
+    @route.post(
+        "/upload-logo",
+        url_name="event_upload_logo",
+        response=schema.EventDetailSchema,
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def upload_logo(self, event_id: UUID, logo: File[UploadedFile]) -> models.Event:
+        """Upload logo to event."""
+        event = self.get_one(event_id)
+        event = safe_save_uploaded_file(instance=event, field="logo", file=logo, uploader=self.user())
+        return event
+
+    @route.post(
+        "/upload-cover-art",
+        url_name="event_upload_cover_art",
+        response=schema.EventDetailSchema,
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def upload_cover_art(self, event_id: UUID, cover_art: File[UploadedFile]) -> models.Event:
+        """Upload cover art to event."""
+        event = self.get_one(event_id)
+        event = safe_save_uploaded_file(instance=event, field="cover_art", file=cover_art, uploader=self.user())
+        return event
+
+    @route.delete(
+        "/delete-logo",
+        url_name="event_delete_logo",
+        response={204: None},
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def delete_logo(self, event_id: UUID) -> tuple[int, None]:
+        """Delete logo and its derivatives from event."""
+        event = self.get_one(event_id)
+        delete_image_with_derivatives(event, "logo")
+        return 204, None
+
+    @route.delete(
+        "/delete-cover-art",
+        url_name="event_delete_cover_art",
+        response={204: None},
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def delete_cover_art(self, event_id: UUID) -> tuple[int, None]:
+        """Delete cover art and its derivatives from event."""
+        event = self.get_one(event_id)
+        delete_image_with_derivatives(event, "cover_art")
+        return 204, None
+
+    @route.post(
+        "/tags",
+        url_name="add_event_tags",
+        response=list[TagSchema],
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def add_tags(self, event_id: UUID, payload: schema.TagUpdateSchema) -> list[Tag]:
+        """Add one or more tags to the organization."""
+        event = self.get_one(event_id)
+        event.tags_manager.add(*payload.tags)
+        return event.tags_manager.all()
+
+    @route.delete(
+        "/tags",
+        url_name="clear_event_tags",
+        response={204: None},
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def clear_tags(self, event_id: UUID) -> tuple[int, None]:
+        """Remove one or more tags from the organization."""
+        event = self.get_one(event_id)
+        event.tags_manager.clear()
+        return 204, None
+
+    @route.post(
+        "/tags/remove",
+        url_name="remove_event_tags",
+        response=list[TagSchema],
+        permissions=[RequireScope("org:read"), EventPermission("edit_event")],
+    )
+    def remove_tags(self, event_id: UUID, payload: schema.TagUpdateSchema) -> list[Tag]:
+        """Remove one or more tags from the organization."""
+        event = self.get_one(event_id)
+        event.tags_manager.remove(*payload.tags)
+        return event.tags_manager.all()

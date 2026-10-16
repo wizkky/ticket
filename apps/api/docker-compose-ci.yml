@@ -1,0 +1,25 @@
+# Minimal Docker Compose for CI/CD pipeline
+# Only includes services required for running tests (no Mailpit)
+#
+# For local development, use: docker compose up -d (uses compose.yaml)
+
+services:
+  redis:
+    extends:
+      service: redis
+      file: docker-compose-base.yml
+
+  postgres:
+    extends:
+      service: postgres
+      file: docker-compose-base.yml
+
+  clamav:
+    extends:
+      service: clamav
+      file: docker-compose-base.yml
+
+volumes:
+  postgres_data:
+  clamav_defs:
+  redis_data:

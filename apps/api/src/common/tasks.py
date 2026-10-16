@@ -1,0 +1,505 @@
+"""Common tasks."""
+
+# Re-export thumbnail tasks for Celery autodiscovery
+# (Celery only discovers tasks.py at app root, not in subdirectories)
+import hashlib
+import importlib
+import typing as t
+from datetime import timedelta
+from pathlib import Path
+
+import pyclamd
+import structlog
+from celery import shared_task
+from django.apps import apps
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.core.files.base import ContentFile
+from django.core.mail import EmailMultiAlternatives
+from django.db import transaction
+from django.db.models import Q
+from django.template.loader import render_to_string
+from django.urls import reverse
+from django.utils import timezone
+
+from accounts.models import RevelUser
+from common.models import EmailLog, FileExport, FileUploadAudit, QuarantinedFile, SiteSettings
+from common.thumbnails.tasks import (  # noqa: F401
+    delete_orphaned_thumbnails_task,
+    generate_thumbnails_task,
+)
+from common.utils import with_message_id
+
+logger = structlog.get_logger(__name__)
+
+
+_ALLOWED_EMAIL_CALLBACKS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("accounts.tasks", "mark_reminder_sent"),
+    }
+)
+
+
+def _execute_email_callback(callback_data: dict[str, t.Any], success: bool, error_message: str | None) -> None:
+    """Execute callback function after email delivery attempt.
+
+    Args:
+        callback_data: Callback configuration with module, function, and kwargs
+        success: Whether email was sent successfully
+        error_message: Error message if sending failed
+    """
+    try:
+        module_path = callback_data.get("module")
+        function_name = callback_data.get("function")
+        kwargs = callback_data.get("kwargs", {})
+
+        if not module_path or not function_name:
+            logger.error("Invalid callback_data: missing module or function", callback_data=callback_data)
+            return
+
+        if (module_path, function_name) not in _ALLOWED_EMAIL_CALLBACKS:
+            logger.error(
+                "email_callback_blocked",
+                module=module_path,
+                function=function_name,
+                reason="not in allowlist",
+            )
+            return
+
+        # Import module and get function
+        module = importlib.import_module(module_path)
+        callback_function = getattr(module, function_name)
+
+        # Add status and error_message to kwargs
+        kwargs["success"] = success
+        if not success:
+            kwargs["error_message"] = error_message
+
+        # Execute callback
+        callback_function(**kwargs)
+
+        logger.info(
+            "email_callback_executed",
+            module=module_path,
+            function=function_name,
+            success=success,
+        )
+    except Exception as callback_error:
+        logger.error(
+            "email_callback_failed",
+            callback_data=callback_data,
+            error=str(callback_error),
+            exc_info=True,
+        )
+
+
+def preferences_list_unsubscribe_header() -> dict[str, str]:
+    """``List-Unsubscribe`` header pointing at the notification preferences page (#1137).
+
+    Brevo injects its own one-click header into any email lacking one, and a client
+    "Unsubscribe" click then globally blocks the address. There is deliberately no
+    ``List-Unsubscribe-Post``: clients open the page in a browser rather than POSTing
+    silently, so nothing is switched off by the click.
+
+    Returns:
+        A ``List-Unsubscribe`` header only.
+    """
+    url = f"{SiteSettings.get_solo().frontend_base_url.rstrip('/')}/account/notifications"
+    return {"List-Unsubscribe": f"<{url}>"}
+
+
+@shared_task(name="common.tasks.send_email")
+def send_email(
+    *,
+    to: str | list[str],
+    subject: str,
+    body: str,
+    html_body: str | None = None,
+    bcc: list[str] | None = None,
+    from_email: str | None = None,
+    reply_to: list[str] | None = None,
+    callback_data: dict[str, t.Any] | None = None,
+    attachment_storage_path: str | None = None,
+    attachment_filename: str | None = None,
+    attachment_mime_type: str = "application/pdf",
+    headers: dict[str, str] | None = None,
+) -> None:
+    """Send an email with optional callback and optional file attachment.
+
+    Args:
+        to: Email address(es).
+        subject: Email subject.
+        body: Plain text body.
+        html_body: HTML body (optional).
+        bcc: Explicit BCC addresses (optional). When not set, multiple "to"
+            recipients are auto-BCC'd for privacy.
+        from_email: Sender address. Defaults to ``settings.DEFAULT_FROM_EMAIL``.
+        reply_to: Reply-To addresses (optional).
+        callback_data: Optional callback configuration with:
+            - module: Python module path (e.g., "accounts.tasks")
+            - function: Function name to call (e.g., "mark_reminder_sent")
+            - kwargs: Dict of keyword arguments to pass to the function
+        attachment_storage_path: Path of the file in Django's default storage.
+            The file is read inside the task worker to avoid passing large
+            byte payloads through the Celery broker.
+        attachment_filename: Display filename for the attachment (defaults to
+            the storage path basename).
+        attachment_mime_type: MIME type for the attachment.
+        headers: Extra message headers (e.g. List-Unsubscribe, X-Mailin-custom). When no
+            ``List-Unsubscribe`` is given, a preferences-page one is added so Brevo doesn't
+            inject its own globally-blocking header (#1137).
+    """
+    from django.core.files.storage import default_storage
+
+    success = False
+    error_message = None
+
+    try:
+        site_settings = SiteSettings.get_solo()
+        recipients = [to] if isinstance(to, str) else to
+        recipients = [to_safe_email_address(email, site_settings=site_settings) for email in recipients]
+        safe_bcc = [to_safe_email_address(email, site_settings=site_settings) for email in (bcc or [])]
+        sender = from_email or settings.DEFAULT_FROM_EMAIL
+        if not any(key.lower() == "list-unsubscribe" for key in headers or {}):
+            headers = {**(headers or {}), **preferences_list_unsubscribe_header()}
+        headers = with_message_id(headers, sender)
+
+        # Build the To/BCC headers:
+        # - Single recipient: use as To, add explicit BCC if provided.
+        # - Multiple recipients: auto-BCC all for privacy (RFC 5322),
+        #   merge with any explicit BCC addresses.
+        if len(recipients) == 1:
+            email_msg = EmailMultiAlternatives(
+                subject=subject,
+                body=body,
+                from_email=sender,
+                to=recipients,
+                bcc=safe_bcc,
+                reply_to=reply_to or [],
+                headers=headers,
+            )
+        else:
+            email_msg = EmailMultiAlternatives(
+                subject=subject,
+                body=body,
+                from_email=sender,
+                to=[sender],
+                bcc=recipients + safe_bcc,
+                reply_to=reply_to or [],
+                headers=headers,
+            )
+
+        if html_body:  # pragma: no branch
+            email_msg.attach_alternative(html_body, "text/html")
+
+        # Attach file from storage if requested
+        if attachment_storage_path:
+            with default_storage.open(attachment_storage_path, "rb") as f:
+                attachment_bytes = f.read()
+            filename = attachment_filename or Path(attachment_storage_path).name
+            email_msg.attach(filename, attachment_bytes, attachment_mime_type)
+
+        email_msg.send(fail_silently=False)
+
+        # Create email logs
+        email_logs: list[EmailLog] = []
+        for recipient in recipients:
+            el = EmailLog(to=recipient, subject=subject)
+            el.set_body(body=body)
+            if html_body:  # pragma: no branch
+                el.set_html(html_body=html_body)
+            email_logs.append(el)
+        EmailLog.objects.bulk_create(email_logs)
+
+        success = True
+        logger.info("email_sent", to=recipients, subject=subject)
+
+    except Exception as e:
+        error_message = str(e)
+        logger.error("email_send_failed", to=to, subject=subject, error=error_message, exc_info=True)
+        raise  # Re-raise so Celery can retry if needed
+
+    finally:
+        # Execute callback if provided (even if failed)
+        if callback_data:
+            _execute_email_callback(callback_data, success, error_message)
+
+
+@shared_task(name="common.tasks.cleanup_email_logs")
+def cleanup_email_logs() -> None:
+    """Clean up email logs."""
+    older_than_a_week = EmailLog.objects.filter(sent_at__lte=timezone.now() - timedelta(days=7))
+    older_than_a_week.delete()
+
+    # delete compressed_body and compressed_html for older than a day
+    older_than_a_day = EmailLog.objects.filter(sent_at__lte=timezone.now() - timedelta(days=1))
+    older_than_a_day.update(compressed_body=None, compressed_html=None)
+
+
+def to_safe_email_address(email: str, site_settings: SiteSettings | None = None) -> str:
+    """Convert an email address to a safe format for sending.
+
+    Args:
+        email (str): The email address.
+        site_settings (SiteSettings): The site settings.
+
+    Returns:
+        str: The safe email address.
+    """
+    site_settings = site_settings or SiteSettings.get_solo()
+    if site_settings.live_emails:
+        return email
+    safe_email = email.replace("@", "_at_").replace(".", "_dot_")
+    user, domain = site_settings.internal_catchall_email.split("@", 1)
+    safe_email = f"{user}+{safe_email}@{domain}"
+    return safe_email
+
+
+@shared_task(name="common.tasks.scan_for_malware")
+def scan_for_malware(*, app: str, model: str, pk: str, field: str) -> None | dict[str, t.Any]:
+    """Scan for malware."""
+    if not settings.FEATURE_MALWARE_SCAN:
+        # Scope to this upload's still-pending audit: never rewrite another instance's row
+        # or a previously-flagged (e.g. MALICIOUS) audit to CLEAN.
+        FileUploadAudit.objects.filter(
+            app=app,
+            model=model,
+            field=field,
+            instance_pk=pk,
+            status=FileUploadAudit.FileUploadAuditStatus.PENDING,
+        ).update(status=FileUploadAudit.FileUploadAuditStatus.CLEAN, updated_at=timezone.now())
+        return None
+    cd = pyclamd.ClamdNetworkSocket(host=settings.CLAMAV_HOST, port=settings.CLAMAV_PORT)
+    if not cd.ping():
+        raise RuntimeError("ClamAV daemon is not reachable")
+    model_class = apps.get_model(app, model)
+    instance = model_class.objects.get(pk=pk)
+    file_field = getattr(instance, field)
+    file_bytes = file_field.read()
+    findings = cd.scan_stream(file_bytes)
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    # Scope to this upload's audit rows: never quarantine another instance's file that happens
+    # to share the same bytes, and never re-match an already-quarantined audit on re-upload.
+    audit_qs = FileUploadAudit.objects.filter(app=app, model=model, field=field, file_hash=file_hash, instance_pk=pk)
+    if not findings:
+        audit_qs.filter(status=FileUploadAudit.FileUploadAuditStatus.PENDING).update(
+            status=FileUploadAudit.FileUploadAuditStatus.CLEAN, updated_at=timezone.now()
+        )
+        return None
+    quarantined = []
+    filename = getattr(file_field, "name", file_hash)
+    name = Path(filename).name
+    # Only audits with no QuarantinedFile yet: a re-upload of identical bytes to the same
+    # instance re-matches earlier audits whose quarantine row already exists, and bulk_create
+    # writes each ContentFile to storage *before* the INSERT — including them would leave an
+    # orphan blob per conflict. The status update is scoped to these same rows so an audit
+    # inserted meanwhile is never marked MALICIOUS without a quarantine row to notify from.
+    pending = list(audit_qs.filter(quarantinedfile__isnull=True))
+    for audit in pending:
+        quarantined.append(QuarantinedFile(audit=audit, file=ContentFile(file_bytes, name), findings=findings))
+    with transaction.atomic():
+        audit_qs.filter(pk__in=[audit.pk for audit in pending]).update(
+            status=FileUploadAudit.FileUploadAuditStatus.MALICIOUS, updated_at=timezone.now()
+        )
+        # ignore_conflicts: two concurrent scans of the same instance can still race on the
+        # OneToOne; without this the IntegrityError would roll back the detachment below and
+        # leave the malicious file live.
+        QuarantinedFile.objects.bulk_create(quarantined, ignore_conflicts=True)
+        if instance._meta.get_field(field).null:
+            # Nullable field: blank the reference so the live file is dropped.
+            setattr(instance, field, None)
+            instance.save()
+        else:
+            # Non-nullable field: full_clean() would reject a blank value and roll back the
+            # quarantine, so remove the file and the row outright instead.
+            getattr(instance, field).delete(save=False)
+            instance.delete()
+    # Notify users about malware detection
+    notify_malware_detected.delay(app=app, model=model, pk=pk, field=field, file_hash=file_hash, findings=findings)
+    return t.cast(dict[str, t.Any], findings)
+
+
+def _get_organization_owner(app: str, model: str, pk: str) -> RevelUser | None:
+    """Get organization owner for a given model instance.
+
+    Returns None if:
+    - Model/app doesn't exist (LookupError)
+    - Instance doesn't exist (ObjectDoesNotExist)
+    - Instance has no organization association
+    """
+    from django.core.exceptions import ObjectDoesNotExist
+
+    try:
+        model_class = apps.get_model(app, model)
+        instance = model_class.objects.get(pk=pk)
+    except LookupError, ObjectDoesNotExist:
+        logger.debug("organization_owner_resolution_failed", app=app, model=model, pk=pk)
+        return None
+
+    # Check if the instance has an organization field
+    if hasattr(instance, "organization") and instance.organization:
+        return instance.organization.owner  # type: ignore[no-any-return]
+    # Check if the instance itself is an organization
+    elif model == "Organization":
+        return instance.owner  # type: ignore[no-any-return]
+
+    return None
+
+
+@shared_task(name="common.tasks.notify_malware_detected")
+def notify_malware_detected(
+    *, app: str, model: str, pk: str, field: str, file_hash: str, findings: dict[str, t.Any]
+) -> None:
+    """Notify users when malware is detected.
+
+    Notifies:
+    - Django superusers and staff
+    - Organization owner (if applicable)
+    - File uploader
+    """
+    # Get the file upload audit record. Scope by app/model/field/instance (not just hash) so
+    # neither a cross-model hash collision nor another instance's identical upload can pull in
+    # an audit whose uploader/quarantine record don't belong to this ``pk``.
+    audits = FileUploadAudit.objects.filter(
+        app=app, model=model, field=field, file_hash=file_hash, instance_pk=pk, notified=False
+    )
+
+    for audit in audits:
+        quarantined_file = QuarantinedFile.objects.filter(audit=audit).first()
+        if quarantined_file is None:
+            continue
+        quarantined_file_url = reverse("admin:common_quarantinedfile_change", args=[quarantined_file.id])
+
+        uploader = RevelUser.objects.filter(username=audit.uploader).first()
+
+        # Get organization owner
+        organization_owner = _get_organization_owner(app, model, pk)
+
+        # Notify uploader
+        if uploader:
+            _notify_user_about_malware(uploader, "Malware detected in your upload")
+
+        # Notify organization owner (if different from uploader)
+        if organization_owner and organization_owner != uploader:
+            _notify_user_about_malware(organization_owner, "Malware detected in organization-related upload")
+
+        # Notify superusers and staff
+        _notify_superusers_about_malware(
+            app=app,
+            model=model,
+            pk=pk,
+            field=field,
+            findings=findings,
+            uploader=uploader,
+            quarantined_file_url=quarantined_file_url,
+        )
+        audit.notified = True
+        audit.save(update_fields=["notified"])
+
+
+def _notify_user_about_malware(user: RevelUser, subject: str) -> None:
+    """Send malware notification email to a user."""
+    context = {"user": user, "frontend_base_url": SiteSettings.get_solo().frontend_base_url}
+    txt_body = render_to_string("common/emails/malware_detected_user.txt", context)
+    html_body = render_to_string("common/emails/malware_detected_user.html", context)
+
+    send_email.delay(
+        to=user.email,
+        subject=subject,
+        body=txt_body,
+        html_body=html_body,
+    )
+
+
+def _notify_superusers_about_malware(
+    *,
+    app: str,
+    model: str,
+    pk: str,
+    field: str,
+    findings: dict[str, t.Any],
+    uploader: "RevelUser | None",
+    quarantined_file_url: str,
+) -> None:
+    """Send malware notification email to superusers and staff."""
+    User = get_user_model()
+    superuser_emails = list(
+        User.objects.filter(Q(is_superuser=True) | Q(is_staff=True)).values_list("email", flat=True).distinct()
+    )
+
+    if not superuser_emails:
+        return
+
+    subject = "Malware detected in file upload"
+    context = {
+        "uploader": uploader,
+        "app": app,
+        "model": model,
+        "instance_pk": pk,
+        "field": field,
+        "findings": findings,
+        "quarantined_file_url": quarantined_file_url,
+        "frontend_base_url": SiteSettings.get_solo().frontend_base_url,
+    }
+
+    txt_body = render_to_string("common/emails/malware_detected_superuser.txt", context)
+    html_body = render_to_string("common/emails/malware_detected_superuser.html", context)
+
+    send_email.delay(
+        to=superuser_emails,
+        subject=subject,
+        body=txt_body,
+        html_body=html_body,
+    )
+
+
+@shared_task(name="common.tasks.cleanup_expired_file_exports")
+def cleanup_expired_file_exports() -> dict[str, int]:
+    """Delete expired file exports (both files and database records).
+
+    Export download links are valid for 7 days. After expiry, the records
+    serve no purpose, so we delete both the stored file and the DB row.
+
+    Also deletes FAILED exports older than the same window.
+
+    Returns:
+        Dict with count of records deleted.
+    """
+    from common.service.export_service import EXPORT_URL_EXPIRES_IN
+
+    expiry_cutoff = timezone.now() - timedelta(seconds=EXPORT_URL_EXPIRES_IN)
+
+    expired_exports = FileExport.objects.filter(
+        Q(status=FileExport.ExportStatus.READY, completed_at__lte=expiry_cutoff)
+        | Q(status=FileExport.ExportStatus.FAILED, updated_at__lte=expiry_cutoff)
+    )
+
+    count = 0
+    for export in expired_exports:
+        if export.file:
+            export.file.delete(save=False)
+        export.delete()
+        count += 1
+        logger.info("file_export_deleted", export_id=str(export.id))
+
+    logger.info("file_export_cleanup_completed", records_deleted=count)
+    return {"records_deleted": count}
+
+
+@shared_task(
+    name="common.fetch_exchange_rates",
+    autoretry_for=(Exception,),
+    retry_backoff=60,
+    retry_backoff_max=3600,
+    max_retries=5,
+)
+def fetch_exchange_rates() -> dict[str, t.Any]:
+    """Fetch daily exchange rates from frankfurter.dev and store them.
+
+    Runs daily at 04:00 UTC via Celery beat. Rates are used for platform fee
+    currency conversion and referral payout calculations.
+    """
+    from common.service.exchange_rate_service import fetch_and_store_rates
+
+    exchange_rate = fetch_and_store_rates()
+    return {"base": exchange_rate.base, "date": str(exchange_rate.date), "currencies": len(exchange_rate.rates)}

@@ -1,0 +1,506 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import type { PageData } from './$types';
+	import { createMutation, useQueryClient } from '@tanstack/svelte-query';
+	import {
+		eventadmincoreUpdateEventStatus,
+		eventadmincoreDeleteEvent
+	} from '$lib/api/generated/sdk.gen';
+	import type { EventInListSchema } from '$lib/api/generated/types.gen';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { formatEventDate, formatEventDateRange } from '$lib/utils/date';
+	import EventCoverImage from '$lib/components/events/EventCoverImage.svelte';
+	import EventBadges from '$lib/components/events/EventBadges.svelte';
+	import DuplicateEventModal from '$lib/components/events/admin/DuplicateEventModal.svelte';
+	import CancelEventDialog from '$lib/components/events/admin/CancelEventDialog.svelte';
+	import AdminEventCard from '$lib/components/events/admin/AdminEventCard.svelte';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import {
+		Plus,
+		Calendar,
+		Eye,
+		Users,
+		Ticket,
+		Trash2,
+		Mail,
+		MoreVertical,
+		Copy,
+		Edit
+	} from '@lucide/svelte';
+	import { extractApiErrorDetail } from '$lib/utils/api-error-detail';
+	import PageHeader from '$lib/components/common/PageHeader.svelte';
+	import SectionHeader from '$lib/components/common/SectionHeader.svelte';
+	import EmptyState from '$lib/components/common/EmptyState.svelte';
+
+	const { data }: { data: PageData } = $props();
+
+	const organization = $derived($page.data.organization);
+	const accessToken = $derived(authStore.accessToken);
+	const queryClient = useQueryClient();
+
+	// Update event status mutation
+	const updateStatusMutation = createMutation(() => ({
+		mutationFn: async ({
+			eventId,
+			status
+		}: {
+			eventId: string;
+			status: 'draft' | 'open' | 'closed' | 'cancelled';
+		}) => {
+			const response = await eventadmincoreUpdateEventStatus({
+				path: { event_id: eventId, status },
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				const errorDetail = extractApiErrorDetail(response.error) ?? 'Failed to update status';
+				throw new Error(errorDetail);
+			}
+
+			if (!response.data) {
+				throw new Error('Failed to update status');
+			}
+
+			return response.data;
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['events'] });
+			// Reload page data
+			window.location.reload();
+		},
+		onError: (error: Error) => {
+			alert(`Failed to update status: ${error.message}`);
+		}
+	}));
+
+	// Delete event mutation
+	const deleteEventMutation = createMutation(() => ({
+		mutationFn: async (eventId: string) => {
+			const response = await eventadmincoreDeleteEvent({
+				path: { event_id: eventId },
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				const errorDetail = extractApiErrorDetail(response.error) ?? 'Failed to delete event';
+				throw new Error(errorDetail);
+			}
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['events'] });
+			// Reload page data
+			window.location.reload();
+		},
+		onError: (error: Error) => {
+			alert(`Failed to delete event: ${error.message}`);
+		}
+	}));
+
+	function createEvent(): void {
+		goto(resolve('/(auth)/org/[slug]/admin/events/new', { slug: organization.slug }));
+	}
+
+	function publishEvent(eventId: string): void {
+		if (confirm(m['orgAdmin.events.confirmations.publish']())) {
+			updateStatusMutation.mutate({ eventId, status: 'open' });
+		}
+	}
+
+	function closeEvent(eventId: string): void {
+		if (confirm(m['orgAdmin.events.confirmations.close']())) {
+			updateStatusMutation.mutate({ eventId, status: 'closed' });
+		}
+	}
+
+	function cancelEvent(eventId: string): void {
+		cancelEventId = eventId;
+		showCancelEventDialog = true;
+	}
+
+	function deleteEvent(eventId: string): void {
+		// Stronger confirmation when deleting a cancelled event — attendees
+		// have already been notified and we're now wiping the record.
+		const target = data.events.find((e: EventInListSchema) => e.id === eventId);
+		const isCancelled = (target?.status as string) === 'cancelled';
+		const message = isCancelled
+			? m['orgAdmin.events.confirmations.deleteCancelled']()
+			: m['orgAdmin.events.confirmations.delete']();
+		if (confirm(message)) {
+			deleteEventMutation.mutate(eventId);
+		}
+	}
+
+	function reopenEvent(eventId: string): void {
+		if (confirm(m['orgAdmin.events.confirmations.reopen']())) {
+			updateStatusMutation.mutate({ eventId, status: 'open' });
+		}
+	}
+
+	// Helper to check if event is past (ended)
+	function isPastEvent(event: EventInListSchema): boolean {
+		if (!event.end) return false;
+		return new Date(event.end) < new Date();
+	}
+
+	// Derived state: group events by status and time
+	// Note: Status type in OpenAPI is incorrect, using string comparison
+	// Past events are separated regardless of status
+	const draftEvents = $derived(
+		data.events.filter(
+			(e: EventInListSchema) => (e.status as string) === 'draft' && !isPastEvent(e)
+		)
+	);
+	const openEvents = $derived(
+		data.events.filter((e: EventInListSchema) => (e.status as string) === 'open' && !isPastEvent(e))
+	);
+	const closedEvents = $derived(
+		data.events.filter(
+			(e: EventInListSchema) => (e.status as string) === 'closed' && !isPastEvent(e)
+		)
+	);
+	const cancelledEvents = $derived(
+		data.events.filter(
+			(e: EventInListSchema) => (e.status as string) === 'cancelled' && !isPastEvent(e)
+		)
+	);
+	const pastEvents = $derived(data.events.filter((e: EventInListSchema) => isPastEvent(e)));
+
+	// Duplicate modal state
+	let showDuplicateModal = $state(false);
+	let duplicateEventData = $state<{
+		id: string;
+		name: string;
+		start: string;
+	} | null>(null);
+
+	// Cancel event dialog state
+	let showCancelEventDialog = $state(false);
+	let cancelEventId = $state<string | null>(null);
+
+	// Drop the stale event id once the dialog closes so the conditional
+	// mount block tracks the lifecycle symmetrically with closeDuplicateModal.
+	$effect(() => {
+		if (!showCancelEventDialog) {
+			cancelEventId = null;
+		}
+	});
+
+	function openDuplicateModal(event: EventInListSchema): void {
+		duplicateEventData = {
+			id: event.id,
+			name: event.name,
+			start: event.start
+		};
+		showDuplicateModal = true;
+	}
+
+	function closeDuplicateModal(): void {
+		showDuplicateModal = false;
+		duplicateEventData = null;
+	}
+</script>
+
+<svelte:head>
+	<title>{m['orgAdmin.events.pageTitle']()} - {organization.name} Admin | Revel</title>
+	<meta
+		name="description"
+		content={m['orgAdmin.events.metaDescription']({ orgName: organization.name })}
+	/>
+	<meta name="robots" content="noindex, nofollow" />
+</svelte:head>
+
+<div class="space-y-6">
+	<!-- Header -->
+	{#snippet headerActions()}
+		{#if data.canCreateEvent}
+			<button
+				type="button"
+				onclick={createEvent}
+				class="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+			>
+				<Plus class="h-5 w-5" aria-hidden="true" />
+				{m['orgAdmin.events.createEventButton']()}
+			</button>
+		{/if}
+	{/snippet}
+	<PageHeader
+		kicker={m['orgAdmin.nav.events']()}
+		title={m['orgAdmin.events.pageTitle']()}
+		subtitle={m['orgAdmin.events.pageDescription']()}
+		actions={headerActions}
+	/>
+
+	<!-- Empty state -->
+	{#if data.events.length === 0}
+		<EmptyState
+			icon={Calendar}
+			title={m['orgAdmin.events.empty.title']()}
+			body={m['orgAdmin.events.empty.description']()}
+			level={2}
+		>
+			{#snippet action()}
+				{#if data.canCreateEvent}
+					<button
+						type="button"
+						onclick={createEvent}
+						class="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+					>
+						<Plus class="h-5 w-5" aria-hidden="true" />
+						{m['orgAdmin.events.createEventButton']()}
+					</button>
+				{/if}
+			{/snippet}
+		</EmptyState>
+	{:else}
+		<!-- Draft Events -->
+		{#if draftEvents.length > 0}
+			<div class="space-y-4">
+				<SectionHeader
+					title={m['orgAdmin.events.sections.drafts']({
+						count: draftEvents.length
+					})}
+				/>
+				<div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+					{#each draftEvents as event (event.id)}
+						<AdminEventCard
+							{event}
+							organizationSlug={organization.slug}
+							variant="draft"
+							onPublish={publishEvent}
+							onCancel={cancelEvent}
+							onDelete={deleteEvent}
+							onDuplicate={openDuplicateModal}
+						/>
+					{/each}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Open Events -->
+		{#if openEvents.length > 0}
+			<div class="space-y-4">
+				<SectionHeader
+					title={m['orgAdmin.events.sections.open']({
+						count: openEvents.length
+					})}
+				/>
+				<div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+					{#each openEvents as event (event.id)}
+						<AdminEventCard
+							{event}
+							organizationSlug={organization.slug}
+							variant="open"
+							onClose={closeEvent}
+							onCancel={cancelEvent}
+							onDelete={deleteEvent}
+							onDuplicate={openDuplicateModal}
+						/>
+					{/each}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Closed Events -->
+		{#if closedEvents.length > 0}
+			<div class="space-y-4">
+				<SectionHeader
+					title={m['orgAdmin.events.sections.closed']({
+						count: closedEvents.length
+					})}
+				/>
+				<div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+					{#each closedEvents as event (event.id)}
+						<AdminEventCard
+							{event}
+							organizationSlug={organization.slug}
+							variant="closed"
+							onCancel={cancelEvent}
+							onReopen={reopenEvent}
+							onDelete={deleteEvent}
+							onDuplicate={openDuplicateModal}
+						/>
+					{/each}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Cancelled Events -->
+		{#if cancelledEvents.length > 0}
+			<div class="space-y-4">
+				<SectionHeader
+					title={m['orgAdmin.events.sections.cancelled']({
+						count: cancelledEvents.length
+					})}
+				/>
+				<div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+					{#each cancelledEvents as event (event.id)}
+						<AdminEventCard
+							{event}
+							organizationSlug={organization.slug}
+							variant="cancelled"
+							onReopen={reopenEvent}
+							onDelete={deleteEvent}
+							onDuplicate={openDuplicateModal}
+						/>
+					{/each}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Past Events -->
+		{#if pastEvents.length > 0}
+			<!-- grayscale (not opacity): opacity-dimming blends buttons toward the page
+			     background and breaks WCAG contrast; grayscale preserves luminance (#595) -->
+			<div class="space-y-4 grayscale">
+				<SectionHeader
+					title={m['orgAdmin.events.sections.past']({
+						count: pastEvents.length
+					})}
+				/>
+				<div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+					{#each pastEvents as event (event.id)}
+						<div
+							class="flex flex-col overflow-hidden rounded-lg border bg-card text-card-foreground shadow-sm transition-shadow hover:shadow-md"
+						>
+							<!-- Cover Image -->
+							<EventCoverImage {event} />
+							<div class="flex flex-1 flex-col gap-4 p-4">
+								<div class="space-y-2">
+									<div class="flex items-start justify-between gap-2">
+										<h3 class="line-clamp-2 flex-1 text-lg font-bold leading-tight">
+											{event.name}
+										</h3>
+										<div class="flex items-center gap-2">
+											<EventBadges {event} />
+											<!-- More Actions Dropdown -->
+											<DropdownMenu.Root>
+												<DropdownMenu.Trigger>
+													{#snippet child({ props })}
+														<button
+															{...props}
+															type="button"
+															class="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+															aria-label={m['orgAdmin.events.actions.moreActions']()}
+														>
+															<MoreVertical class="h-4 w-4" aria-hidden="true" />
+														</button>
+													{/snippet}
+												</DropdownMenu.Trigger>
+												<DropdownMenu.Content align="end" class="w-48">
+													<DropdownMenu.Item onclick={() => openDuplicateModal(event)}>
+														<Copy class="mr-2 h-4 w-4" />
+														{m['orgAdmin.events.actions.duplicate']()}
+													</DropdownMenu.Item>
+													<DropdownMenu.Separator />
+													<DropdownMenu.Item
+														onclick={() => deleteEvent(event.id)}
+														class="text-destructive focus:text-destructive"
+													>
+														<Trash2 class="mr-2 h-4 w-4" />
+														{m['orgAdmin.events.actions.delete']()}
+													</DropdownMenu.Item>
+												</DropdownMenu.Content>
+											</DropdownMenu.Root>
+										</div>
+									</div>
+									<div class="flex flex-wrap items-center gap-3 text-sm text-muted-foreground">
+										<div class="flex items-center gap-1.5">
+											<Calendar class="h-4 w-4" aria-hidden="true" />
+											<time datetime={event.start}>
+												{#if event.is_open_ended}
+													{formatEventDate(event.start)} · {m['eventDetails.openEnded']()}
+												{:else}
+													{formatEventDateRange(event.start, event.end)}
+												{/if}
+											</time>
+										</div>
+									</div>
+								</div>
+
+								<div class="mt-auto flex flex-wrap gap-2">
+									<a
+										href={resolve('/(public)/events/[org_slug]/[event_slug]', {
+											org_slug: data.organization.slug,
+											event_slug: event.slug
+										})}
+										class="inline-flex items-center gap-1 rounded-md bg-primary px-3 py-1 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+									>
+										<Eye class="h-4 w-4" aria-hidden="true" />
+										{m['orgAdmin.events.actions.view']()}
+									</a>
+									<a
+										href={resolve('/(auth)/org/[slug]/admin/events/[event_id]/edit', {
+											slug: data.organization.slug,
+											event_id: event.id
+										})}
+										class="inline-flex items-center gap-1 rounded-md bg-secondary px-3 py-1 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+									>
+										<Edit class="h-4 w-4" aria-hidden="true" />
+										{m['orgAdmin.events.actions.edit']()}
+									</a>
+									{#if event.requires_ticket}
+										<a
+											href={resolve('/(auth)/org/[slug]/admin/events/[event_id]/tickets', {
+												slug: data.organization.slug,
+												event_id: event.id
+											})}
+											class="inline-flex items-center gap-1 rounded-md bg-secondary px-3 py-1 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+										>
+											<Ticket class="h-4 w-4" aria-hidden="true" />
+											{m['orgAdmin.events.actions.tickets']()}
+										</a>
+									{:else}
+										<a
+											href={resolve('/(auth)/org/[slug]/admin/events/[event_id]/attendees', {
+												slug: data.organization.slug,
+												event_id: event.id
+											})}
+											class="inline-flex items-center gap-1 rounded-md bg-secondary px-3 py-1 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+										>
+											<Users class="h-4 w-4" aria-hidden="true" />
+											{m['orgAdmin.events.actions.attendees']()}
+										</a>
+									{/if}
+									<a
+										href={resolve('/(auth)/org/[slug]/admin/events/[event_id]/invitations', {
+											slug: data.organization.slug,
+											event_id: event.id
+										})}
+										class="inline-flex items-center gap-1 rounded-md bg-secondary px-3 py-1 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+									>
+										<Mail class="h-4 w-4" aria-hidden="true" />
+										{m['orgAdmin.events.actions.invitations']()}
+									</a>
+								</div>
+							</div>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{/if}
+	{/if}
+</div>
+
+<!-- Duplicate Event Modal -->
+{#if duplicateEventData}
+	<DuplicateEventModal
+		bind:open={showDuplicateModal}
+		eventId={duplicateEventData.id}
+		eventName={duplicateEventData.name}
+		eventStart={duplicateEventData.start}
+		organizationSlug={organization.slug}
+		onClose={closeDuplicateModal}
+	/>
+{/if}
+
+<!-- Cancel Event Dialog -->
+{#if cancelEventId}
+	<CancelEventDialog bind:open={showCancelEventDialog} eventId={cancelEventId} />
+{/if}

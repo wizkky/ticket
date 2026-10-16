@@ -1,0 +1,473 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import type { PageData } from './$types';
+	import EventEditor from '$lib/components/events/admin/EventEditor.svelte';
+	import DuplicateEventModal from '$lib/components/events/admin/DuplicateEventModal.svelte';
+	import CancelEventDialog from '$lib/components/events/admin/CancelEventDialog.svelte';
+	import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query';
+	import {
+		eventadmincoreCancellationRefundPreview,
+		eventadmincoreUpdateEventStatus,
+		eventadmincoreDeleteEvent
+	} from '$lib/api/generated/sdk.gen';
+	import type { EventRefundPreviewSchema } from '$lib/api/generated/types.gen';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import * as Tooltip from '$lib/components/ui/tooltip';
+	import {
+		CheckCircle,
+		XCircle,
+		FileEdit,
+		Trash2,
+		Ban,
+		MoreVertical,
+		Copy,
+		RotateCcw
+	} from '@lucide/svelte';
+	import { extractApiErrorDetail } from '$lib/utils/api-error-detail';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+	import type { Tone } from '$lib/components/common/tones';
+
+	const { data }: { data: PageData } = $props();
+
+	const organization = $derived($page.data.organization);
+	const event = $derived(data.event);
+	// An unknown ?tab= would leave the controlled Tabs.Root with no active
+	// panel; anything but a real tab name falls back to the default.
+	const initialTab = $derived.by((): 'details' | 'ticketing' | 'listings' | undefined => {
+		const tab = $page.url.searchParams.get('tab');
+		return tab === 'details' || tab === 'ticketing' || tab === 'listings' ? tab : undefined;
+	});
+	const accessToken = $derived(authStore.accessToken);
+	const queryClient = useQueryClient();
+
+	// Current status
+	const currentStatus = $derived(event.status as string);
+	const statusTone = $derived.by((): Tone => {
+		switch (currentStatus) {
+			case 'open':
+				return 'success';
+			case 'closed':
+				return 'danger';
+			case 'draft':
+			default:
+				return 'neutral';
+		}
+	});
+
+	// Update event status mutation
+	const updateStatusMutation = createMutation(() => ({
+		mutationFn: async (status: 'draft' | 'open' | 'closed' | 'cancelled') => {
+			if (!accessToken) throw new Error(m['eventEditPage.error_notAuthenticated']());
+
+			const response = await eventadmincoreUpdateEventStatus({
+				path: { event_id: event.id, status },
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				const errorDetail =
+					extractApiErrorDetail(response.error) ?? m['eventEditPage.error_updateStatusFailed']();
+				throw new Error(errorDetail);
+			}
+
+			if (!response.data) {
+				throw new Error(m['eventEditPage.error_updateStatusFailed']());
+			}
+
+			return response.data;
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['events'] });
+			// Reload the page to get updated event data
+			window.location.reload();
+		},
+		onError: (error: Error) => {
+			alert(m['eventEditPage.updateStatusAlert']({ message: error.message }));
+		}
+	}));
+
+	// Delete event mutation (permanent deletion)
+	const deleteEventMutation = createMutation(() => ({
+		mutationFn: async () => {
+			if (!accessToken) throw new Error(m['eventEditPage.error_notAuthenticated']());
+
+			const response = await eventadmincoreDeleteEvent({
+				path: { event_id: event.id },
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				const errorDetail =
+					extractApiErrorDetail(response.error) ?? m['eventEditPage.error_deleteFailed']();
+				throw new Error(errorDetail);
+			}
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['events'] });
+			// Redirect to events list after deletion
+			goto(resolve('/(auth)/org/[slug]/admin/events', { slug: organization.slug }));
+		},
+		onError: (error: Error) => {
+			alert(m['eventEditPage.deleteAlert']({ message: error.message }));
+		}
+	}));
+
+	/**
+	 * Publish event (draft → open)
+	 */
+	function publishEvent(): void {
+		if (confirm(m['eventEditPage.publishConfirm']())) {
+			updateStatusMutation.mutate('open');
+		}
+	}
+
+	/**
+	 * Close event (open → closed)
+	 */
+	function closeEvent(): void {
+		if (confirm(m['eventEditPage.closeConfirm']())) {
+			updateStatusMutation.mutate('closed');
+		}
+	}
+
+	/**
+	 * Mark as draft (open/closed → draft)
+	 */
+	function markAsDraft(): void {
+		if (confirm(m['eventEditPage.draftConfirm']())) {
+			updateStatusMutation.mutate('draft');
+		}
+	}
+
+	/**
+	 * Reopen event (closed → open). Same mutation target as publish but
+	 * with reopen-specific confirmation copy so admins see the right
+	 * intent when transitioning from closed.
+	 */
+	function reopenEvent(): void {
+		if (confirm(m['orgAdmin.events.confirmations.reopen']())) {
+			updateStatusMutation.mutate('open');
+		}
+	}
+
+	/**
+	 * Cancel event (any → cancelled). Opens the dedicated dialog so the
+	 * organizer can attach an optional reason; the dialog drives the
+	 * mutation itself.
+	 */
+	function cancelEvent(): void {
+		showCancelEventDialog = true;
+	}
+
+	/**
+	 * Delete event (permanent deletion). Already-cancelled events get a
+	 * stronger confirmation that names what just happened (attendees
+	 * notified, record removal on top of that).
+	 */
+	function deleteEvent(): void {
+		const message =
+			currentStatus === 'cancelled'
+				? m['orgAdmin.events.confirmations.deleteCancelled']()
+				: m['orgAdmin.events.confirmations.delete']();
+		if (confirm(message)) {
+			deleteEventMutation.mutate();
+		}
+	}
+
+	// Duplicate modal state
+	let showDuplicateModal = $state(false);
+
+	// Cancel event dialog state
+	let showCancelEventDialog = $state(false);
+
+	// Cancelled events with refundable online payments left get a
+	// "Retry refunds" affordance — re-POSTing cancel-with-refunds is the
+	// supported way to resume a partial sweep (idempotent on the backend).
+	const refundPreviewQuery = createQuery<EventRefundPreviewSchema>(() => ({
+		queryKey: ['event-cancellation-refund-preview', event.id],
+		queryFn: async () => {
+			const response = await eventadmincoreCancellationRefundPreview({
+				path: { event_id: event.id },
+				headers: { Authorization: `Bearer ${accessToken}` }
+			});
+			if (response.error || !response.data) throw new Error('preview-failed');
+			return response.data;
+		},
+		enabled: currentStatus === 'cancelled' && !!accessToken,
+		retry: false
+	}));
+	const hasRefundableTickets = $derived(
+		(refundPreviewQuery.data?.online_refundable_tickets ?? 0) > 0
+	);
+
+	/**
+	 * Open duplicate modal
+	 */
+	function openDuplicateModal(): void {
+		showDuplicateModal = true;
+	}
+
+	/**
+	 * Close duplicate modal
+	 */
+	function closeDuplicateModal(): void {
+		showDuplicateModal = false;
+	}
+</script>
+
+<svelte:head>
+	<title
+		>{m['eventEditPage.headTitle']({ eventName: event.name })} - {organization.name} Admin | Revel</title
+	>
+	<meta
+		name="description"
+		content={m['eventEditPage.headDescription']({ eventName: event.name })}
+	/>
+	<meta name="robots" content="noindex, nofollow" />
+</svelte:head>
+
+<div class="space-y-6">
+	<!-- Header Section with Status Badge and Actions -->
+	<div>
+		<div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+			<div>
+				<div class="flex items-center gap-3">
+					<h1 class="text-2xl font-extrabold tracking-tight sm:text-3xl">
+						{m['eventEditPage.heading']()}
+					</h1>
+					<StatusBadge
+						tone={statusTone}
+						label={currentStatus === 'draft'
+							? m['eventEditPage.statusDraft']()
+							: currentStatus === 'open'
+								? m['eventEditPage.statusPublished']()
+								: currentStatus === 'closed'
+									? m['eventEditPage.statusClosed']()
+									: currentStatus}
+					/>
+				</div>
+				<p class="mt-1 text-sm text-muted-foreground">
+					{m['eventEditPage.updateDetailsFor']()}
+					<span class="font-semibold">{event.name}</span>
+				</p>
+			</div>
+
+			<!-- Action Buttons -->
+			<Tooltip.Provider delayDuration={300}>
+				<div class="flex flex-wrap items-center gap-2">
+					{#if currentStatus === 'draft'}
+						<!-- Publish action -->
+						<Tooltip.Root>
+							<Tooltip.Trigger>
+								{#snippet child({ props })}
+									<button
+										{...props}
+										type="button"
+										onclick={publishEvent}
+										disabled={updateStatusMutation.isPending}
+										class="inline-flex items-center gap-2 rounded-md bg-success px-3 py-2 text-sm font-medium text-success-foreground transition-colors hover:bg-success/90 disabled:cursor-not-allowed disabled:opacity-50"
+									>
+										<CheckCircle class="h-4 w-4" aria-hidden="true" />
+										{m['eventEditPage.publishButton']()}
+									</button>
+								{/snippet}
+							</Tooltip.Trigger>
+							<Tooltip.Content>{m['eventEditPage.tooltips.publish']()}</Tooltip.Content>
+						</Tooltip.Root>
+					{:else if currentStatus === 'open'}
+						<!-- Close action -->
+						<Tooltip.Root>
+							<Tooltip.Trigger>
+								{#snippet child({ props })}
+									<button
+										{...props}
+										type="button"
+										onclick={closeEvent}
+										disabled={updateStatusMutation.isPending}
+										class="inline-flex items-center gap-2 rounded-md bg-highlight px-3 py-2 text-sm font-medium text-highlight-foreground transition-colors hover:bg-highlight/90 disabled:cursor-not-allowed disabled:opacity-50"
+									>
+										<XCircle class="h-4 w-4" aria-hidden="true" />
+										{m['eventEditPage.closeButton']()}
+									</button>
+								{/snippet}
+							</Tooltip.Trigger>
+							<Tooltip.Content>{m['eventEditPage.tooltips.close']()}</Tooltip.Content>
+						</Tooltip.Root>
+						<!-- Mark as Draft -->
+						<Tooltip.Root>
+							<Tooltip.Trigger>
+								{#snippet child({ props })}
+									<button
+										{...props}
+										type="button"
+										onclick={markAsDraft}
+										disabled={updateStatusMutation.isPending}
+										class="inline-flex items-center gap-2 rounded-md bg-secondary px-3 py-2 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:cursor-not-allowed disabled:opacity-50"
+									>
+										<FileEdit class="h-4 w-4" aria-hidden="true" />
+										{m['eventEditPage.draftButton']()}
+									</button>
+								{/snippet}
+							</Tooltip.Trigger>
+							<Tooltip.Content>{m['eventEditPage.tooltips.draft']()}</Tooltip.Content>
+						</Tooltip.Root>
+					{:else if currentStatus === 'closed'}
+						<!-- Reopen action -->
+						<Tooltip.Root>
+							<Tooltip.Trigger>
+								{#snippet child({ props })}
+									<button
+										{...props}
+										type="button"
+										onclick={reopenEvent}
+										disabled={updateStatusMutation.isPending}
+										class="inline-flex items-center gap-2 rounded-md bg-success px-3 py-2 text-sm font-medium text-success-foreground transition-colors hover:bg-success/90 disabled:cursor-not-allowed disabled:opacity-50"
+									>
+										<CheckCircle class="h-4 w-4" aria-hidden="true" />
+										{m['eventEditPage.reopenButton']()}
+									</button>
+								{/snippet}
+							</Tooltip.Trigger>
+							<Tooltip.Content>{m['eventEditPage.tooltips.reopen']()}</Tooltip.Content>
+						</Tooltip.Root>
+						<!-- Mark as Draft -->
+						<Tooltip.Root>
+							<Tooltip.Trigger>
+								{#snippet child({ props })}
+									<button
+										{...props}
+										type="button"
+										onclick={markAsDraft}
+										disabled={updateStatusMutation.isPending}
+										class="inline-flex items-center gap-2 rounded-md bg-secondary px-3 py-2 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80 disabled:cursor-not-allowed disabled:opacity-50"
+									>
+										<FileEdit class="h-4 w-4" aria-hidden="true" />
+										{m['eventEditPage.draftButton']()}
+									</button>
+								{/snippet}
+							</Tooltip.Trigger>
+							<Tooltip.Content>{m['eventEditPage.tooltips.draft']()}</Tooltip.Content>
+						</Tooltip.Root>
+					{/if}
+
+					<!-- Retry refunds (cancelled events with refundable online payments left) -->
+					{#if currentStatus === 'cancelled' && hasRefundableTickets}
+						<Tooltip.Root>
+							<Tooltip.Trigger>
+								{#snippet child({ props })}
+									<button
+										{...props}
+										type="button"
+										onclick={cancelEvent}
+										class="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+									>
+										<RotateCcw class="h-4 w-4" aria-hidden="true" />
+										{m['cancelEvent.retryButton']()}
+									</button>
+								{/snippet}
+							</Tooltip.Trigger>
+							<Tooltip.Content>{m['cancelEvent.retryDescription']()}</Tooltip.Content>
+						</Tooltip.Root>
+					{/if}
+
+					<!-- Cancel event button (open/closed only — reversible, notifies attendees) -->
+					{#if currentStatus === 'open' || currentStatus === 'closed'}
+						<Tooltip.Root>
+							<Tooltip.Trigger>
+								{#snippet child({ props })}
+									<button
+										{...props}
+										type="button"
+										onclick={cancelEvent}
+										disabled={updateStatusMutation.isPending}
+										class="inline-flex items-center gap-2 rounded-md bg-destructive px-3 py-2 text-sm font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 disabled:cursor-not-allowed disabled:opacity-50"
+									>
+										<Ban class="h-4 w-4" aria-hidden="true" />
+										{m['cancelEvent.confirmButton']()}
+									</button>
+								{/snippet}
+							</Tooltip.Trigger>
+							<Tooltip.Content>{m['eventEditPage.tooltips.cancel']()}</Tooltip.Content>
+						</Tooltip.Root>
+					{/if}
+
+					<!-- More Actions Dropdown (Duplicate + Delete) — no Tooltip
+					     wrapper here because nesting Tooltip.Trigger child
+					     snippets with DropdownMenu.Trigger child snippets stacks
+					     two competing keyboard/focus handlers on the same
+					     button. The `aria-label` carries the accessible name
+					     and `title` provides a native browser tooltip on hover. -->
+					<DropdownMenu.Root>
+						<DropdownMenu.Trigger>
+							{#snippet child({ props })}
+								<button
+									{...props}
+									type="button"
+									class="inline-flex items-center justify-center rounded-md border border-input bg-background p-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+									aria-label={m['orgAdmin.events.actions.moreActions']()}
+									title={m['eventEditPage.tooltips.more']()}
+								>
+									<MoreVertical class="h-4 w-4" aria-hidden="true" />
+								</button>
+							{/snippet}
+						</DropdownMenu.Trigger>
+						<DropdownMenu.Content align="end" class="w-48">
+							<DropdownMenu.Item onclick={openDuplicateModal}>
+								<Copy class="mr-2 h-4 w-4" />
+								{m['orgAdmin.events.actions.duplicate']()}
+							</DropdownMenu.Item>
+							<DropdownMenu.Item onclick={deleteEvent} class="text-destructive">
+								<Trash2 class="mr-2 h-4 w-4" />
+								{m['orgAdmin.events.actions.delete']()}
+							</DropdownMenu.Item>
+						</DropdownMenu.Content>
+					</DropdownMenu.Root>
+				</div>
+			</Tooltip.Provider>
+		</div>
+	</div>
+
+	<!-- Event Editor Component. Keyed by event id: EventEditor snapshots
+	     existingEvent (incl. the id it saves to) into $state once, so a
+	     client-side navigation between two events' edit pages (e.g. the
+	     duplicate flow's goto) must remount it or it keeps editing the
+	     previous event. -->
+	<div class="rounded-lg border bg-card text-card-foreground shadow-sm">
+		{#key event.id}
+			<EventEditor
+				{organization}
+				existingEvent={event}
+				userCity={data.userCity}
+				orgCity={data.orgCity}
+				eventSeries={data.eventSeries}
+				{initialTab}
+				isOwner={data.isOwner}
+			/>
+		{/key}
+	</div>
+</div>
+
+<!-- Duplicate Event Modal -->
+<DuplicateEventModal
+	bind:open={showDuplicateModal}
+	eventId={event.id}
+	eventName={event.name}
+	eventStart={event.start}
+	organizationSlug={organization.slug}
+	onClose={closeDuplicateModal}
+/>
+
+<!-- Cancel Event Dialog (doubles as the retry-refunds dialog once cancelled) -->
+<CancelEventDialog
+	bind:open={showCancelEventDialog}
+	eventId={event.id}
+	retryRefunds={currentStatus === 'cancelled'}
+/>

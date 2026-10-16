@@ -1,0 +1,151 @@
+import { redirect, fail, isRedirect, type Actions } from '@sveltejs/kit';
+import { organizationCreateSchema } from '$lib/schemas/organization';
+import { organizationCreateOrganization } from '$lib/api/generated/sdk.gen';
+import type { PageServerLoad } from './$types';
+import { extractErrorMessage } from '$lib/utils/errors';
+import { readAttributionFromUrl } from '$lib/utils/attribution';
+import { loginRedirectPath } from '$lib/server/auth-guard';
+
+export const load: PageServerLoad = async ({ locals, parent, url }) => {
+	// Require authentication. Keep the query string so campaign tags (#1002)
+	// survive the login round trip.
+	if (!locals.user) {
+		throw redirect(303, loginRedirectPath(url));
+	}
+
+	// Hide create-org when the capability is disabled on this instance.
+	// Server stays the source of truth (POST still 403s); this avoids a dead end.
+	const { features } = await parent();
+	if (!features.organization_creation) {
+		throw redirect(303, '/dashboard');
+	}
+
+	return {
+		user: locals.user
+	};
+};
+
+export const actions: Actions = {
+	default: async ({ request, locals, cookies, url }) => {
+		// Require authentication. Keep the query string: a tagged landing link
+		// (`?utm_…`, #1002) must still be tagged after the login round trip.
+		if (!locals.user) {
+			throw redirect(303, loginRedirectPath(url));
+		}
+
+		const formData = await request.formData();
+		const data = {
+			name: formData.get('name') as string,
+			contact_email: formData.get('contact_email') as string,
+			city_id: formData.get('city_id') as string,
+			address: formData.get('address') as string,
+			description: formData.get('description') as string
+		};
+
+		// Validate
+		const result = organizationCreateSchema.safeParse(data);
+
+		if (!result.success) {
+			const errors: Record<string, string> = {};
+			result.error.issues.forEach((error) => {
+				if (error.path[0]) {
+					errors[error.path[0].toString()] = error.message;
+				}
+			});
+
+			return fail(400, { errors, ...data });
+		}
+
+		// Get access token from cookie
+		const accessToken = cookies.get('access_token');
+		if (!accessToken) {
+			return fail(401, {
+				errors: { form: 'Authentication required' },
+				...data
+			});
+		}
+
+		// Campaign tags ride in the page URL only (#1002): the form has no
+		// `action`, so it posts back to the URL it was rendered at, `?utm_…` and all.
+		const attribution = readAttributionFromUrl(url);
+
+		try {
+			// Create organization via API
+			const {
+				data: orgData,
+				error,
+				response
+			} = await organizationCreateOrganization({
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				},
+				body: {
+					name: result.data.name,
+					contact_email: result.data.contact_email,
+					city_id: result.data.city_id ? parseInt(result.data.city_id) : undefined,
+					address: result.data.address || undefined,
+					description: result.data.description || undefined,
+					...(attribution ? { attribution } : {})
+				}
+			});
+
+			// Check for success (201 Created or 200 OK)
+			if (response?.ok && orgData) {
+				// Success - redirect to organization admin settings
+				throw redirect(303, `/org/${orgData.slug}/admin/settings`);
+			}
+
+			// Handle errors. The status lives on the Response, never on the parsed
+			// error BODY — the old `(error as { status?: number }).status` was always
+			// `undefined`, so both branches below were dead and every refusal was
+			// reported as a 500.
+			const status = response?.status;
+
+			if (status === 400) {
+				const errorMessage = extractErrorMessage(error, 'You already own an organization');
+				return fail(400, {
+					errors: { form: errorMessage },
+					...data
+				});
+			}
+
+			if (status === 403) {
+				const errorMessage = extractErrorMessage(
+					error,
+					'Please verify your email before creating an organization'
+				);
+				return fail(403, {
+					errors: { form: errorMessage },
+					...data
+				});
+			}
+
+			// Anything else 4xx is still the CLIENT's problem — this endpoint declares
+			// no error responses at all, so a runtime 422 (request validation, which
+			// is systemically under-declared per backend #826) is entirely plausible
+			// and must not be reported to the user as a server failure.
+			const errorMessage = extractErrorMessage(
+				error,
+				'Failed to create organization. Please try again.'
+			);
+			return fail(status && status >= 400 && status < 500 ? status : 500, {
+				errors: { form: errorMessage },
+				...data
+			});
+		} catch (err) {
+			// If it's a redirect, re-throw it immediately
+			if (isRedirect(err)) {
+				throw err;
+			}
+
+			const errorMessage = extractErrorMessage(
+				err,
+				'An unexpected error occurred. Please try again.'
+			);
+			return fail(500, {
+				errors: { form: errorMessage },
+				...data
+			});
+		}
+	}
+};

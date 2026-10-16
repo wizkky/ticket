@@ -1,0 +1,260 @@
+import { render, screen, waitFor } from '@testing-library/svelte';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import userEvent from '@testing-library/user-event';
+import NotificationDropdown from './NotificationDropdown.svelte';
+import { QueryClient } from '@tanstack/svelte-query';
+import QueryClientTestWrapper from '$lib/test-utils/QueryClientTestWrapper.svelte';
+
+// Mock the API
+vi.mock('$lib/api/generated', () => ({
+	notificationUnreadCount: vi.fn(() =>
+		Promise.resolve({
+			data: { count: 3 }
+		})
+	),
+	notificationListNotifications: vi.fn(() =>
+		Promise.resolve({
+			data: {
+				results: [
+					{
+						id: '1',
+						notification_type: 'event_invitation',
+						title: 'Event Invitation',
+						message: 'You have been invited to Test Event',
+						read_at: null,
+						created_at: new Date().toISOString()
+					},
+					{
+						id: '2',
+						notification_type: 'event_update',
+						title: 'Event Update',
+						message: 'Event details have been updated',
+						read_at: new Date().toISOString(),
+						created_at: new Date().toISOString()
+					}
+				],
+				count: 2
+			}
+		})
+	),
+	notificationMarkAllRead: vi.fn(() => Promise.resolve({ data: {} }))
+}));
+
+// Mock toasts (asserted by the mark-all-read error test)
+vi.mock('svelte-sonner', () => ({
+	toast: { success: vi.fn(), error: vi.fn() }
+}));
+
+// Mock navigation
+const mockGoto = vi.fn();
+vi.mock('$app/navigation', () => ({
+	goto: (url: string) => mockGoto(url)
+}));
+
+describe('NotificationDropdown', () => {
+	let queryClient: QueryClient;
+
+	beforeEach(() => {
+		queryClient = new QueryClient({
+			defaultOptions: {
+				queries: {
+					retry: false
+				}
+			}
+		});
+		vi.clearAllMocks();
+		// bits-ui toggles pointer-events on <body> while a menu is open; jsdom
+		// keeps <body> across tests, so reset to avoid poisoning later clicks.
+		document.body.style.pointerEvents = '';
+	});
+
+	function renderWithQuery(props: Record<string, unknown> = {}) {
+		return render(QueryClientTestWrapper, {
+			props: {
+				client: queryClient,
+				component: NotificationDropdown,
+				componentProps: {
+					authToken: 'test-token',
+					...props
+				}
+			}
+		});
+	}
+
+	it('renders bell icon button', () => {
+		renderWithQuery();
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		expect(button).toBeInTheDocument();
+	});
+
+	it('shows notification badge with unread count', async () => {
+		renderWithQuery();
+
+		await waitFor(() => {
+			const badge = screen.getByRole('status');
+			expect(badge).toBeInTheDocument();
+			expect(badge).toHaveTextContent('3');
+		});
+	});
+
+	it('opens dropdown when button is clicked', async () => {
+		const user = userEvent.setup();
+		renderWithQuery();
+
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		await user.click(button);
+
+		// bits-ui 2 keeps the floating-ui positioning wrapper at
+		// `visibility: hidden` until positioning completes, which never happens
+		// in jsdom (no layout engine). The menu is open (data-state="open") and
+		// visible in real browsers; `hidden: true` includes it in the query here.
+		await waitFor(() => {
+			expect(screen.getByRole('menu', { hidden: true })).toBeInTheDocument();
+		});
+	});
+
+	it('shows notification list in compact mode', async () => {
+		const user = userEvent.setup();
+		renderWithQuery();
+
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		await user.click(button);
+
+		await waitFor(() => {
+			expect(screen.getByText('Event Invitation')).toBeInTheDocument();
+			expect(screen.getByText('Event Update')).toBeInTheDocument();
+		});
+	});
+
+	it('shows "View all notifications" link', async () => {
+		const user = userEvent.setup();
+		renderWithQuery();
+
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		await user.click(button);
+
+		await waitFor(() => {
+			expect(screen.getByText(/view all notifications/i)).toBeInTheDocument();
+		});
+	});
+
+	it('navigates to notifications page when "View all" is clicked', async () => {
+		const user = userEvent.setup();
+		renderWithQuery();
+
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		await user.click(button);
+
+		await waitFor(() => {
+			const viewAllButton = screen.getByText(/view all notifications/i);
+			expect(viewAllButton).toBeInTheDocument();
+		});
+
+		const viewAllButton = screen.getByText(/view all notifications/i);
+		await user.click(viewAllButton);
+
+		expect(mockGoto).toHaveBeenCalledWith('/account/notifications');
+	});
+
+	it('is keyboard accessible', async () => {
+		const user = userEvent.setup();
+		renderWithQuery();
+
+		// Tab to button
+		await user.tab();
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		expect(button).toHaveFocus();
+
+		// Enter to open
+		await user.keyboard('{Enter}');
+
+		// See note in "opens dropdown when button is clicked": jsdom cannot
+		// complete floating-ui positioning, so the menu stays a11y-hidden.
+		await waitFor(() => {
+			expect(screen.getByRole('menu', { hidden: true })).toBeInTheDocument();
+		});
+
+		// Escape to close
+		await user.keyboard('{Escape}');
+
+		await waitFor(() => {
+			expect(screen.queryByText('Event Invitation')).not.toBeInTheDocument();
+		});
+	});
+
+	it('passes custom polling interval to NotificationBadge', () => {
+		renderWithQuery({ pollingInterval: 30000 });
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		expect(button).toBeInTheDocument();
+		// Badge will use the custom polling interval internally
+	});
+
+	it('passes custom maxItems to NotificationList', async () => {
+		const user = userEvent.setup();
+		renderWithQuery({ maxItems: 10 });
+
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		await user.click(button);
+
+		await waitFor(() => {
+			expect(screen.getByText('Event Invitation')).toBeInTheDocument();
+		});
+		// NotificationList will respect the maxItems prop internally
+	});
+
+	it('has proper ARIA attributes', () => {
+		renderWithQuery();
+		const button = screen.getByRole('button', { name: /open notifications/i });
+
+		// Button should have proper aria-label
+		expect(button).toHaveAttribute('aria-label');
+	});
+
+	it('handles missing authToken gracefully', () => {
+		// Should still render but badge won't show
+		expect(() => renderWithQuery({ authToken: '' })).not.toThrow();
+	});
+
+	it('toasts an error and no success when mark all as read resolves with an HTTP error body', async () => {
+		// The generated client does not reject on HTTP errors — it resolves with
+		// `{ error }` — so the mutationFn must throw it for onError to fire.
+		const user = userEvent.setup();
+		const { notificationMarkAllRead } = await import('$lib/api/generated');
+		const { toast } = await import('svelte-sonner');
+
+		vi.mocked(notificationMarkAllRead).mockResolvedValueOnce({
+			data: undefined,
+			error: { detail: 'Nope' },
+			response: { ok: false, status: 400 }
+		} as never);
+
+		renderWithQuery();
+		await user.click(screen.getByRole('button', { name: /open notifications/i }));
+
+		// The floating-ui wrapper stays `visibility: hidden` in jsdom (no layout
+		// engine), which also empties accessible names — reveal it the way
+		// AttributionBreakdownSection.test.ts does before querying by role.
+		const content = await waitFor(() => {
+			const el = document.querySelector('[data-dropdown-menu-content]');
+			if (!el) throw new Error('the dropdown content never opened');
+			return el;
+		});
+		const floatingWrapper = content.parentElement;
+		if (floatingWrapper instanceof HTMLElement) {
+			floatingWrapper.style.visibility = 'visible';
+		}
+		await user.click(screen.getByRole('button', { name: /mark all as read/i }));
+
+		await waitFor(() => {
+			expect(toast.error).toHaveBeenCalled();
+		});
+		expect(toast.success).not.toHaveBeenCalled();
+	});
+
+	it('applies custom className', () => {
+		renderWithQuery({ class: 'custom-class' });
+		const button = screen.getByRole('button', { name: /open notifications/i });
+		// Custom class is applied to the dropdown root, not the button directly
+		expect(button).toBeInTheDocument();
+	});
+});

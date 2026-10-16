@@ -1,0 +1,77 @@
+# E2E overlay: adds a PgBouncer connection pooler in front of Postgres, mirroring the
+# production topology (infra/docker-compose.yml). Heavy local load — e.g. parallel frontend
+# Playwright workers driving a gunicorn backend — otherwise exhausts Postgres connections
+# (`FATAL: sorry, too many clients already`).
+#
+# Use as an overlay so pgbouncer shares the network with the main stack's `postgres`:
+#   docker compose -f compose.yaml -f docker-compose-e2e.yml up -d pgbouncer
+# `make run-e2e` does this for you and starts the server pointed at 6432.
+#
+# Postgres stays directly reachable on 5432; nothing routes through pgbouncer unless a
+# client explicitly connects to 6432 with DB_USE_PGBOUNCER=True.
+#
+# `keycloak` is the OpenID Connect provider the e2e suite logs in through (generic OIDC
+# login, ADR-0016). Dev mode + `--import-realm` loads e2e/keycloak/revel-realm.json when the
+# container is CREATED; a reused container keeps its embedded H2 state and skips the import,
+# so `make e2e-seed` force-recreates it. The e2e Make targets point the backend at it via
+# OIDC_KEYCLOAK_* env. It exists ONLY in this overlay — `make run` / `make test` never start it.
+
+services:
+  pgbouncer:
+    image: edoburu/pgbouncer
+    restart: unless-stopped
+    environment:
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_HOST: postgres
+      DB_NAME: ${DB_NAME}
+      LISTEN_PORT: 6432
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 1000
+      DEFAULT_POOL_SIZE: 25
+      RESERVE_POOL_SIZE: 5
+      ADMIN_USERS: ${DB_USER}
+    ports:
+      - "127.0.0.1:6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h localhost -p 6432"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    mem_limit: 256m
+    cpus: 0.5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.3
+    restart: unless-stopped
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HEALTH_ENABLED: "true"
+      # Pin the issuer so the backend (host process) and the browser see the same value
+      # in the discovery document: http://localhost:8080/realms/revel
+      KC_HOSTNAME: http://localhost:8080
+      KC_HTTP_ENABLED: "true"
+    volumes:
+      - ./e2e/keycloak:/opt/keycloak/data/import:ro
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      # The image has no curl; probe the management port with bash's /dev/tcp.
+      test:
+        - CMD-SHELL
+        - >
+          exec 3<>/dev/tcp/127.0.0.1/9000 &&
+          printf 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 &&
+          grep -q '"UP"' <&3
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    mem_limit: 768m
+    cpus: 1

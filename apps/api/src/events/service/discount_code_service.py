@@ -1,0 +1,629 @@
+"""Service layer for discount code validation and application."""
+
+import typing as t
+from decimal import Decimal
+from uuid import UUID
+
+import structlog
+from django.core.exceptions import ValidationError
+from django.db import IntegrityError, transaction
+from django.db.models import F
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from ninja.errors import HttpError
+
+from accounts.models import RevelUser
+from events.exceptions import DuplicateDiscountCodeError
+from events.models import Event, EventSeries, Organization, Ticket, TicketTier
+from events.models.discount_code import DiscountCode
+
+if t.TYPE_CHECKING:
+    from django.contrib.auth.models import AnonymousUser
+
+    from events import schema
+    from events.schema.discount_code import DiscountCodeCreateSchema, DiscountCodeUpdateSchema
+    from events.service.batch_ticket_service.context import CartGroup
+
+logger = structlog.get_logger(__name__)
+
+# Mapping from schema field name → (model M2M attr name, related model class)
+_M2M_FIELDS: dict[str, tuple[str, type[Event] | type[EventSeries] | type[TicketTier]]] = {
+    "series_ids": ("series", EventSeries),
+    "event_ids": ("events", Event),
+    "tier_ids": ("tiers", TicketTier),
+}
+
+
+def _set_m2m_relations(dc: DiscountCode, m2m_data: dict[str, list[UUID]]) -> None:
+    """Set M2M relationships on a discount code, scoped to its organization.
+
+    Validates that all referenced objects belong to the same organization
+    as the discount code. Tiers are validated via their event's organization.
+
+    Raises:
+        HttpError: If any provided IDs don't exist or belong to another organization.
+    """
+    org = dc.organization
+    err_msg = str(_("One or more referenced objects are invalid or do not belong to this organization."))
+
+    for schema_field, ids in m2m_data.items():
+        attr_name, _model_cls = _M2M_FIELDS[schema_field]
+        unique_ids = set(ids)
+
+        # Scope by organization; tiers are linked through their event
+        if schema_field == "tier_ids":
+            scoped = TicketTier.objects.filter(id__in=ids, event__organization=org)
+        elif schema_field == "event_ids":
+            scoped = Event.objects.filter(id__in=ids, organization=org)  # type: ignore[assignment]
+        else:
+            scoped = EventSeries.objects.filter(id__in=ids, organization=org)  # type: ignore[assignment]
+
+        if scoped.count() != len(unique_ids):
+            raise HttpError(400, err_msg)
+
+        getattr(dc, attr_name).set(scoped)
+
+
+def _tier_currency(organization: Organization, tier_ids: list[UUID], requested: str | None) -> str:
+    """Resolve a tier-scoped fixed-amount code's currency from its tiers (#997).
+
+    A fixed discount can only ever apply to tiers priced in its own currency, so a
+    tier-scoped code takes its tiers' currency rather than asking the organizer for it.
+
+    Raises:
+        HttpError: If the tiers are unknown, span several currencies, or disagree with
+            an explicitly requested currency.
+    """
+    currencies = set(
+        TicketTier.objects.filter(id__in=tier_ids, event__organization=organization).values_list("currency", flat=True)
+    )
+    if not currencies:
+        raise HttpError(
+            400, str(_("One or more referenced objects are invalid or do not belong to this organization."))
+        )
+    if len(currencies) > 1:
+        raise HttpError(400, str(_("All tiers of a fixed amount discount code must use the same currency.")))
+    (tier_currency,) = currencies
+    if requested and requested != tier_currency:
+        raise HttpError(400, str(_("The discount code currency must match the currency of its tiers.")))
+    return tier_currency
+
+
+@transaction.atomic
+def create_discount_code(
+    organization: Organization,
+    payload: "DiscountCodeCreateSchema",
+) -> DiscountCode:
+    """Create a discount code with optional M2M scope relations.
+
+    Args:
+        organization: The owning organization.
+        payload: Validated create schema.
+
+    Returns:
+        The created DiscountCode instance.
+
+    Raises:
+        DuplicateDiscountCodeError: If a discount code with the same ``code`` already
+            exists for the organization.
+    """
+    data = payload.model_dump()
+    data["code"] = data["code"].upper()
+    # Always pop M2M keys (they aren't model fields); keep only truthy values for .set()
+    m2m_data = {key: val for key in _M2M_FIELDS if (val := data.pop(key, None))}
+    if data["discount_type"] == DiscountCode.DiscountType.FIXED_AMOUNT and "tier_ids" in m2m_data:
+        data["currency"] = _tier_currency(organization, m2m_data["tier_ids"], data["currency"])
+    # Reject duplicates race-safely (see #520). TimeStampedModel.save() runs full_clean(),
+    # so a sequential duplicate is caught by validate_constraints() and raised as a
+    # ValidationError (its SELECT sees the existing row), while a genuine concurrent race
+    # slips past full_clean and raises IntegrityError at INSERT. The nested savepoint
+    # isolates the failed INSERT (which would otherwise poison this outer @transaction.atomic);
+    # we then confirm the (organization, code) collision before mapping to a clear 409, and
+    # re-raise any unrelated validation error untouched. (get_or_create_with_race_protection
+    # can't be used here: it re-queries after the IntegrityError without its own savepoint.)
+    try:
+        with transaction.atomic():
+            dc = DiscountCode.objects.create(organization=organization, **data)
+    except IntegrityError, ValidationError:
+        if DiscountCode.objects.filter(organization=organization, code=data["code"]).exists():
+            raise DuplicateDiscountCodeError
+        raise
+    _set_m2m_relations(dc, m2m_data)
+    return dc
+
+
+@transaction.atomic
+def update_discount_code(
+    dc: DiscountCode,
+    payload: "DiscountCodeUpdateSchema",
+) -> DiscountCode:
+    """Update a discount code's scalar fields and M2M scope relations.
+
+    Args:
+        dc: The existing DiscountCode instance.
+        payload: Validated update schema (exclude_unset semantics).
+
+    Returns:
+        The refreshed DiscountCode instance with prefetched M2M.
+    """
+    from events.service import update_db_instance
+
+    data = payload.model_dump(exclude_unset=True)
+    # Pop M2M keys; treat explicit null as "clear relation"
+    m2m_data = {key: (data.pop(key) or []) for key in _M2M_FIELDS if key in data}
+
+    # Re-derive a tier-scoped fixed code's currency whenever its type, currency or tiers change
+    discount_type = data.get("discount_type", dc.discount_type)
+    touched = {"discount_type", "currency", "tier_ids"} & (data.keys() | m2m_data.keys())
+    if discount_type == DiscountCode.DiscountType.FIXED_AMOUNT and touched:
+        tier_ids = m2m_data["tier_ids"] if "tier_ids" in m2m_data else list(dc.tiers.values_list("id", flat=True))
+        if tier_ids:
+            data["currency"] = _tier_currency(dc.organization, tier_ids, data.get("currency"))
+
+    # Update scalar fields with race-condition-safe locking
+    if data:
+        dc = update_db_instance(dc, **data)
+
+    _set_m2m_relations(dc, m2m_data)
+
+    return DiscountCode.objects.prefetch_related("series", "events", "tiers").get(pk=dc.pk)
+
+
+@transaction.atomic
+def delete_discount_code(dc: DiscountCode) -> t.Literal["deleted", "deactivated"]:
+    """Delete a discount code, hard-deleting it only when it was never used.
+
+    A code is considered unused when its ``times_used`` counter is zero *and* no
+    ticket references it at all (any status). ``times_used`` never decrements, so
+    the two checks are belt-and-suspenders: either one being non-empty means the
+    code has redemption history worth keeping. Unused codes are hard-deleted,
+    which also frees the ``(organization, code)`` slot for reuse. Used codes are
+    deactivated (``is_active = False``) to preserve the redemption history on
+    their tickets.
+
+    The row is re-fetched under ``select_for_update`` (mirroring ``apply_discount``)
+    so a concurrent purchase can't slip a ticket past the check and then have its
+    ``Ticket.discount_code`` FK silently nulled by the hard delete (``SET_NULL``).
+
+    Args:
+        dc: The discount code to delete.
+
+    Returns:
+        ``"deleted"`` if the row was hard-deleted, ``"deactivated"`` otherwise.
+    """
+    dc = DiscountCode.objects.select_for_update().get(pk=dc.pk)
+    if dc.times_used == 0 and not dc.tickets.exists():
+        dc.delete()
+        return "deleted"
+    dc.is_active = False
+    dc.save(update_fields=["is_active"])
+    return "deactivated"
+
+
+def _check_scope_applicability(dc: DiscountCode, tier: TicketTier) -> None:
+    """Check if the discount code applies to the given tier (union logic).
+
+    Raises:
+        HttpError: If the discount code is not applicable to this tier.
+    """
+    has_scope = dc.tiers.exists() or dc.events.exists() or dc.series.exists()
+    if not has_scope:
+        return  # No scope narrowing = org-wide
+
+    tier_match = dc.tiers.filter(pk=tier.pk).exists()
+    event_match = dc.events.filter(pk=tier.event_id).exists()
+    series_match = tier.event.event_series_id is not None and dc.series.filter(pk=tier.event.event_series_id).exists()
+    if not (tier_match or event_match or series_match):
+        raise HttpError(400, str(_("This discount code is not valid for this ticket tier.")))
+
+
+def _validate_core(
+    code: str,
+    organization: Organization,
+    tier: TicketTier,
+) -> DiscountCode:
+    """Core validation shared by authenticated and anonymous flows.
+
+    Checks: lookup, dates, global usage limit (optimistic), tier type,
+    scope applicability and currency match. ``min_purchase_amount`` is **not**
+    checked here — see :func:`assert_min_purchase_amount`.
+
+    Args:
+        code: The discount code string.
+        organization: The organization owning the event.
+        tier: The ticket tier being purchased.
+
+    Returns:
+        The validated DiscountCode instance.
+
+    Raises:
+        HttpError: If the discount code is invalid or not applicable.
+    """
+    now = timezone.now()
+
+    try:
+        dc = DiscountCode.objects.get(code=code.upper(), organization=organization, is_active=True)
+    except DiscountCode.DoesNotExist:
+        raise HttpError(400, str(_("Invalid discount code.")))
+
+    # Date validity
+    if dc.valid_from and dc.valid_from > now:
+        raise HttpError(400, str(_("This discount code is not yet active.")))
+    if dc.valid_until and dc.valid_until < now:
+        raise HttpError(400, str(_("This discount code has expired.")))
+
+    # Global usage limit (optimistic — definitive check under lock in apply_discount)
+    if dc.max_uses is not None and dc.times_used >= dc.max_uses:
+        raise HttpError(400, str(_("This discount code has reached its usage limit.")))
+
+    # Tier type checks
+    if tier.payment_method == TicketTier.PaymentMethod.FREE:
+        raise HttpError(400, str(_("Discount codes cannot be applied to free tickets.")))
+    if tier.price_type == TicketTier.PriceType.PWYC:
+        raise HttpError(400, str(_("Discount codes cannot be applied to pay-what-you-can tickets.")))
+
+    _check_scope_applicability(dc, tier)
+
+    # Currency match for FIXED_AMOUNT
+    if dc.discount_type == DiscountCode.DiscountType.FIXED_AMOUNT and dc.currency != tier.currency:
+        raise HttpError(400, str(_("This discount code is not valid for this currency.")))
+
+    return dc
+
+
+def assert_min_purchase_amount(discount_code: DiscountCode, total_amount: Decimal) -> None:
+    """Enforce ``min_purchase_amount`` against a cart's real pre-discount total (spec §5.6).
+
+    Deferred out of :func:`_validate_core` deliberately. That runs before seats are
+    resolved, so the only total it could compute was ``tier.price * batch_size`` —
+    which is simply the wrong number on a category-priced tier, and which
+    :func:`validate_discount_code_anonymous` computed with a hardcoded
+    ``batch_size=1``. Checkout knows the real total and calls this under the tier lock.
+    A "conservative" pre-check off the cheapest category was considered and struck: it
+    *underestimates* the total, so it would falsely reject valid carts.
+
+    Args:
+        discount_code: The validated discount code.
+        total_amount: The cart's pre-discount total (sum of the resolved seat prices).
+
+    Raises:
+        HttpError: 400, if the cart is below the code's minimum.
+    """
+    if total_amount < discount_code.min_purchase_amount:
+        raise HttpError(
+            400,
+            str(_("Minimum purchase amount of {amount} required to use this discount code.")).format(
+                amount=discount_code.min_purchase_amount,
+            ),
+        )
+
+
+def _check_per_user_usage(dc: DiscountCode, user: RevelUser, batch_size: int) -> None:
+    """Optimistic per-user usage limit check.
+
+    Raises:
+        HttpError: If per-user usage limit would be exceeded.
+    """
+    user_usage = Ticket.objects.filter(
+        discount_code=dc,
+        user=user,
+        status__in=[Ticket.TicketStatus.PENDING, Ticket.TicketStatus.ACTIVE],
+    ).count()
+    if user_usage + batch_size > dc.max_uses_per_user:
+        raise HttpError(400, str(_("You have already used this discount code the maximum number of times.")))
+
+
+def validate_discount_code(
+    code: str,
+    organization: Organization,
+    tier: TicketTier,
+    user: RevelUser,
+    batch_size: int,
+) -> DiscountCode:
+    """Validate a discount code for a specific purchase.
+
+    Performs optimistic checks (dates, limits, scope, etc.). The definitive
+    usage-limit check happens under lock in apply_discount().
+
+    Args:
+        code: The discount code string.
+        organization: The organization owning the event.
+        tier: The ticket tier being purchased.
+        user: The purchasing user.
+        batch_size: Number of tickets in the purchase.
+
+    Returns:
+        The validated DiscountCode instance.
+
+    Raises:
+        HttpError: If the discount code is invalid or not applicable.
+    """
+    dc = _validate_core(code, organization, tier)
+
+    # Per-user usage limit (optimistic — definitive check under lock in apply_discount)
+    _check_per_user_usage(dc, user, batch_size)
+
+    logger.info(
+        "discount_code_validated",
+        code=dc.code,
+        user_id=str(user.id),
+        tier_id=str(tier.id),
+        discount_type=dc.discount_type,
+        discount_value=str(dc.discount_value),
+    )
+
+    return dc
+
+
+def validate_discount_code_anonymous(
+    code: str,
+    organization: Organization,
+    tier: TicketTier,
+) -> DiscountCode:
+    """Validate a discount code for anonymous (guest) users.
+
+    Skips per-user limit checks since there is no authenticated user.
+
+    Args:
+        code: The discount code string.
+        organization: The organization owning the event.
+        tier: The ticket tier being purchased.
+
+    Returns:
+        The validated DiscountCode instance.
+
+    Raises:
+        HttpError: If the discount code is invalid or not applicable.
+    """
+    return _validate_core(code, organization, tier)
+
+
+def _no_qualifying_group_error(errors: list[HttpError]) -> HttpError:
+    """Pick the error to raise when a cart code qualified for no group at all (#846).
+
+    A single generic "does not apply to any tier" message hid the real reason
+    (expired, usage limit reached, wrong currency...) that the deprecated
+    single-tier routes used to surface verbatim. So:
+
+    * one group checked → re-raise ITS error (byte-identical to the legacy path);
+    * several groups, all rejected for the SAME reason (identical messages, e.g. an
+      expired code, which fails the same way everywhere) → re-raise that error, it
+      is both more specific and unambiguous;
+    * several groups rejected for DIFFERENT reasons → the generic cart message, since
+      no single per-group reason describes the cart.
+
+    Args:
+        errors: The per-group rejections, in cart order (never empty in practice:
+            a cart has at least one group and no group qualified).
+
+    Returns:
+        The ``HttpError`` the caller should raise.
+    """
+    messages = {str(exc) for exc in errors}
+    if errors and len(messages) == 1:
+        return errors[0]
+    return HttpError(400, str(_("This discount code does not apply to any tier in your cart.")))
+
+
+def validate_cart_discount(
+    code: str,
+    event: Event,
+    groups: "t.Sequence[CartGroup]",
+    user: RevelUser,
+) -> tuple[DiscountCode, set[UUID]]:
+    """Validate a discount code against every tier in a multi-tier cart (#846).
+
+    A cart code need not apply to every group: the per-group pass runs
+    :func:`_validate_core` — **applicability only** (scope, a free/PWYC tier, currency
+    mismatch, plus the code-level active/window/global-limit checks, which fail
+    identically on every group) — and simply drops the groups it rejects rather than
+    failing the whole cart. Only when NO group qualifies is the cart itself rejected —
+    and then the specific per-group reason is surfaced whenever it is unambiguous
+    (see :func:`_no_qualifying_group_error`) instead of collapsing to one generic message.
+
+    The **per-user usage limit is deliberately not a per-group check**: it is a property
+    of the buyer and the whole cart, not of one tier's applicability. Running it per group
+    made a group larger than the buyer's remaining allowance drop out silently — a
+    3+1 cart under ``max_uses_per_user=2`` quietly discounted 1 ticket of 4, while the
+    same 2+2 cart (and the deprecated single-tier route) correctly 400'd. So it runs
+    exactly once, in the definitive validation call below: :func:`validate_discount_code`
+    reruns with the SUMMED ticket count across every applicable group, so the usage limits
+    see the cart's true consumption instead of one group's slice of it, and an over-limit
+    cart fails as a cart.
+
+    Args:
+        code: The discount code string.
+        event: The event being checked out.
+        groups: The cart's groups (one per tier, tier objects attached). Domain
+            objects, not the wire schema: the deprecated guest routes accept carts
+            wider than ``CheckoutGroupSchema``'s buyer-input bounds, and this
+            helper only ever reads the tier and the ticket count.
+        user: The purchasing user.
+
+    Returns:
+        The validated ``DiscountCode`` and the set of tier ids it applies to.
+
+    Raises:
+        HttpError: If the code applies to none of the cart's tiers — the single
+            per-group rejection when every group failed for the same reason,
+            otherwise 400 with the generic cart message — or if the cart's summed
+            ticket count exceeds a usage limit.
+    """
+    valid_tier_ids: set[UUID] = set()
+    applicable_count = 0
+    representative_tier: TicketTier | None = None
+    errors: list[HttpError] = []
+    for group in groups:
+        tier = group.tier
+        try:
+            _validate_core(code, event.organization, tier)
+        except HttpError as exc:
+            errors.append(exc)
+            continue
+        valid_tier_ids.add(tier.id)
+        applicable_count += len(group.items)
+        representative_tier = representative_tier or tier
+
+    if representative_tier is None:
+        raise _no_qualifying_group_error(errors)
+
+    # Any already-qualified tier stands in for the (redundant) scope/currency re-check;
+    # what this call is here for is the per-user usage limit — checked once, against the
+    # cart's real total rather than any single group's slice of it.
+    dc = validate_discount_code(code, event.organization, representative_tier, user, applicable_count)
+    return dc, valid_tier_ids
+
+
+def preview_discount_code(
+    code: str,
+    organization: Organization,
+    tier: TicketTier,
+    user: "RevelUser | AnonymousUser",
+) -> "schema.DiscountCodeValidationResponse":
+    """Validate a discount code and return a preview of the discounted price.
+
+    Handles both authenticated and anonymous users. Does not decrement usage.
+
+    ``discounted_price`` is omitted on a **category-priced** tier. There is no single
+    such price there: each seat discounts off its own category price, and ``tier.price``
+    is not what any painted seat costs — quoting it would hand the buyer a number
+    checkout will not honour (a 10% code on an 80.00 Premium seat is 72.00, not 4.50 off
+    a leftover flat 5.00). This endpoint deliberately does **not** grow a second price
+    computation to fix that: :func:`~events.service.seating.pricing.resolve_seat_price`
+    is the single price authority, and the seat-aware VAT preview
+    (``POST /events/{id}/vat-preview``) is the endpoint that already reaches it with the
+    buyer's actual seats or zone. What this endpoint exists to answer — is the code
+    valid, and what kind/size of discount is it — still comes back in full.
+
+    Args:
+        code: The discount code string.
+        organization: The organization owning the event.
+        tier: The ticket tier.
+        user: The user (may be anonymous).
+
+    Returns:
+        DiscountCodeValidationResponse with discount details; ``discounted_price`` is
+        ``None`` when the tier prices seats by category.
+
+    Raises:
+        HttpError: If the discount code is invalid or not applicable.
+    """
+    from events import schema
+
+    if user.is_anonymous:
+        dc = validate_discount_code_anonymous(code, organization, tier)
+    else:
+        dc = validate_discount_code(code, organization, tier, user, batch_size=1)
+
+    # Truthiness, not parse_price_map: this must not start raising on a legacy malformed
+    # map (same reasoning as `should_stamp_price_paid`).
+    discounted_price = None if tier.category_prices else calculate_discounted_price(tier, dc)
+    return schema.DiscountCodeValidationResponse(
+        valid=True,
+        discount_type=DiscountCode.DiscountType(dc.discount_type),
+        discount_value=dc.discount_value,
+        discounted_price=discounted_price,
+    )
+
+
+def calculate_discounted_unit_price(base_price: Decimal, discount_code: DiscountCode) -> Decimal:
+    """Apply a discount code to one unit price.
+
+    The per-unit primitive. ``calculate_discounted_price`` is the flat-tier
+    special case (``base_price = tier.price``); per-seat category pricing feeds
+    each seat's own resolved price in here instead.
+
+    Args:
+        base_price: The pre-discount unit price.
+        discount_code: The validated discount code.
+
+    Returns:
+        The discounted unit price (2 decimal places, non-negative).
+    """
+    if discount_code.discount_type == DiscountCode.DiscountType.PERCENTAGE:
+        discounted = (base_price * (Decimal("100") - discount_code.discount_value) / Decimal("100")).quantize(
+            Decimal("0.01")
+        )
+        return max(discounted, Decimal("0.00"))
+
+    # FIXED_AMOUNT
+    return max((base_price - discount_code.discount_value).quantize(Decimal("0.01")), Decimal("0.00"))
+
+
+def calculate_unit_discount_amount(base_price: Decimal, discount_code: DiscountCode) -> Decimal:
+    """Calculate how much a discount code subtracts from one unit price.
+
+    Args:
+        base_price: The pre-discount unit price.
+        discount_code: The validated discount code.
+
+    Returns:
+        The discount amount for that unit (never negative, never above ``base_price``).
+    """
+    return base_price - calculate_discounted_unit_price(base_price, discount_code)
+
+
+def calculate_discounted_price(tier: TicketTier, discount_code: DiscountCode) -> Decimal:
+    """Calculate the discounted price for a tier.
+
+    Args:
+        tier: The ticket tier.
+        discount_code: The validated discount code.
+
+    Returns:
+        The discounted unit price (2 decimal places, non-negative).
+    """
+    return calculate_discounted_unit_price(tier.price, discount_code)
+
+
+def calculate_discount_amount(tier: TicketTier, discount_code: DiscountCode) -> Decimal:
+    """Calculate the discount amount (how much is subtracted from the original price).
+
+    Args:
+        tier: The ticket tier.
+        discount_code: The validated discount code.
+
+    Returns:
+        The discount amount per ticket.
+    """
+    return calculate_unit_discount_amount(tier.price, discount_code)
+
+
+def apply_discount(discount_code: DiscountCode, user: RevelUser, batch_size: int) -> None:
+    """Atomically verify limits and increment the usage counter.
+
+    Must be called inside @transaction.atomic, AFTER bulk_create. Uses
+    select_for_update to serialize concurrent access and prevent exceeding
+    usage limits. The per-user ticket count already includes tickets created
+    by bulk_create in the current transaction.
+
+    Args:
+        discount_code: The discount code to increment.
+        user: The purchasing user.
+        batch_size: Number of tickets purchased.
+
+    Raises:
+        HttpError: If usage limits are exceeded (rolls back the transaction).
+    """
+    dc = DiscountCode.objects.select_for_update().get(pk=discount_code.pk)
+
+    # Re-check global limit under lock
+    if dc.max_uses is not None and dc.times_used + batch_size > dc.max_uses:
+        raise HttpError(400, str(_("This discount code has reached its usage limit.")))
+
+    # Re-check per-user limit under lock.
+    # user_usage already includes tickets from this transaction's bulk_create.
+    user_usage = Ticket.objects.filter(
+        discount_code=dc,
+        user=user,
+        status__in=[Ticket.TicketStatus.PENDING, Ticket.TicketStatus.ACTIVE],
+    ).count()
+    if user_usage > dc.max_uses_per_user:
+        raise HttpError(400, str(_("You have already used this discount code the maximum number of times.")))
+
+    DiscountCode.objects.filter(pk=dc.pk).update(times_used=F("times_used") + batch_size)
+    logger.info(
+        "discount_code_applied",
+        code=discount_code.code,
+        batch_size=batch_size,
+    )

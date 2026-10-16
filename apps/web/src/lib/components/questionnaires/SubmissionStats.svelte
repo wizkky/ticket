@@ -1,0 +1,74 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { Clock, Check, TrendingUp } from '@lucide/svelte';
+	import { Card } from '$lib/components/ui/card';
+	import ToneTile from '$lib/components/common/ToneTile.svelte';
+
+	interface Props {
+		pendingCount: number;
+		approvedCount: number;
+		rejectedCount: number;
+	}
+
+	const { pendingCount, approvedCount, rejectedCount }: Props = $props();
+
+	// Calculate approval rate
+	const totalEvaluated = $derived(approvedCount + rejectedCount);
+	const approvalRate = $derived(
+		totalEvaluated > 0 ? Math.round((approvedCount / totalEvaluated) * 100) : 0
+	);
+</script>
+
+<!--
+  Submission Statistics Component
+
+  Displays aggregate stats for questionnaire submissions including pending count,
+  approved count, and approval rate.
+
+  @component
+  @example
+  <SubmissionStats pendingCount={12} approvedCount={45} rejectedCount={3} />
+-->
+<div class="grid gap-4 md:grid-cols-3">
+	<!-- Pending Submissions -->
+	<Card class="p-6">
+		<div class="flex items-center justify-between">
+			<div>
+				<p class="text-sm font-medium text-muted-foreground">
+					{m['submissionStats.pendingReview']()}
+				</p>
+				<p class="text-3xl font-bold">{pendingCount}</p>
+				<p class="mt-1 text-xs text-muted-foreground">{m['submissionStats.needAttention']()}</p>
+			</div>
+			<ToneTile tone="warning" icon={Clock} size="lg" class="rounded-full" />
+		</div>
+	</Card>
+
+	<!-- Approved Submissions -->
+	<Card class="p-6">
+		<div class="flex items-center justify-between">
+			<div>
+				<p class="text-sm font-medium text-muted-foreground">{m['submissionStats.approved']()}</p>
+				<p class="text-3xl font-bold">{approvedCount}</p>
+				<p class="mt-1 text-xs text-muted-foreground">{m['submissionStats.totalApproved']()}</p>
+			</div>
+			<ToneTile tone="success" icon={Check} size="lg" class="rounded-full" />
+		</div>
+	</Card>
+
+	<!-- Approval Rate -->
+	<Card class="p-6">
+		<div class="flex items-center justify-between">
+			<div>
+				<p class="text-sm font-medium text-muted-foreground">
+					{m['submissionStats.approvalRate']()}
+				</p>
+				<p class="text-3xl font-bold">{approvalRate}%</p>
+				<p class="mt-1 text-xs text-muted-foreground">
+					{approvedCount}/{totalEvaluated} approved
+				</p>
+			</div>
+			<ToneTile tone="info" icon={TrendingUp} size="lg" class="rounded-full" />
+		</div>
+	</Card>
+</div>

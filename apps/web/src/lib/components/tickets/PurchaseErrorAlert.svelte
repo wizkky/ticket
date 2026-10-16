@@ -1,0 +1,151 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { Alert, AlertDescription } from '$lib/components/ui/alert';
+	import { AlertCircle } from '@lucide/svelte';
+	import { resolve } from '$app/paths';
+	import type { TierSchemaWithId } from '$lib/types/tickets';
+	import { isMembershipTierRefusal } from '$lib/utils/eligibility';
+	import { extractPurchaseErrorMessage } from './purchase-error';
+	import { Button } from '$lib/components/ui/button';
+	import {
+		GuestAccountRequiredError,
+		GuestCartTooLargeError
+	} from '../events/guest-cart-checkout-controller.svelte';
+
+	interface Props {
+		/** Whatever the purchase path threw, or `null` when there is no error. */
+		error?: unknown;
+		/** The tier being bought — a source of the required tier names. */
+		tier?: TierSchemaWithId;
+		/** Multiple tiers (cart checkout) — unioned with `tier` when both are given. */
+		tiers?: TierSchemaWithId[];
+		/**
+		 * Organizing org's slug. Without it the membership link is omitted rather
+		 * than guessed: a wrong destination is worse than none.
+		 */
+		organizationSlug?: string | null;
+		/**
+		 * The "split your purchase" CTA for `GuestCartTooLargeError` (issue #912):
+		 * the host closes the sheet — cart and quantities intact — so the buyer
+		 * can trim it down in the on-page cart. Without a handler the button is
+		 * omitted (a control that does nothing is worse than none); the log-in
+		 * way out still renders.
+		 */
+		onSplitPurchase?: () => void;
+	}
+
+	const { error = null, tier, tiers, organizationSlug = null, onSplitPurchase }: Props = $props();
+
+	const message = $derived(
+		error ? extractPurchaseErrorMessage(error, m['ticketConfirmationDialog.errorGeneric']()) : ''
+	);
+
+	// The purchase was refused because a tier in the purchase is gated to
+	// membership tiers the buyer does not hold (BE #807). It is the one purchase
+	// error with somewhere to send the buyer, so it gets a CTA the others don't.
+	const membershipGateRefused = $derived(isMembershipTierRefusal(error));
+
+	// Which membership tiers would satisfy the gate. The refusal payload names
+	// NONE of them (and cannot say whether the buyer is a non-member or a member
+	// on the wrong tier), so they come off the tier(s) — the same list TierCard
+	// reads. `tier` and `tiers` union (deduped) so a single-tier purchase and a
+	// multi-group cart checkout both work through the same prop.
+	const consideredTiers = $derived([...(tier ? [tier] : []), ...(tiers ?? [])]);
+	const requiredTierNames = $derived(
+		Array.from(
+			new Set(
+				consideredTiers.flatMap((t) =>
+					(t.restricted_to_membership_tiers ?? []).map((mt) => mt.name).filter(Boolean)
+				)
+			)
+		)
+	);
+
+	// The link below points at the org's membership page — the only surface where
+	// a qualifying tier can be obtained. Deliberately not "Join organization": a
+	// plain membership request grants no tier and would dead-end, which is why the
+	// backend refuses to send this case down the become_member path at all.
+
+	// A guest's next required step (e.g. become_member, complete_questionnaire)
+	// has no guest-compatible path (#853 PR 4 — `guest-cart-checkout-controller`'s
+	// error mapping). Ported from the legacy `GuestTicketErrorAlert`'s
+	// `requiresAccount` branch: extended here rather than kept as a separate
+	// component, since this is the one alert every checkout surface (single-tier
+	// and cart) already renders errors through — a guest wrapper would just
+	// re-implement the same message/Alert plumbing around it.
+	const requiresAccount = $derived(error instanceof GuestAccountRequiredError);
+
+	// guest_cart_too_large (backend #952, issue #912): the emailed confirmation
+	// link cannot carry a cart this big. Not a dead end — log in (authenticated
+	// checkout has no link-size ceiling) or split the purchase.
+	const cartTooLarge = $derived(error instanceof GuestCartTooLargeError);
+
+	// The login server action reads `returnUrl` (`safeReturnUrl`) — `redirect`
+	// is ignored there and used to strand the buyer on the dashboard. `email`
+	// prefills the sign-in form when the error knows the address that was
+	// refused (guest_account_exists) or entered (guest_cart_too_large).
+	const loginHref = $derived.by(() => {
+		const email =
+			error instanceof GuestAccountRequiredError || error instanceof GuestCartTooLargeError
+				? error.email
+				: undefined;
+		const emailSuffix = email ? `&email=${encodeURIComponent(email)}` : '';
+		return `${resolve('/(public)/login', {})}?returnUrl=${encodeURIComponent(window.location.pathname)}${emailSuffix}`;
+	});
+</script>
+
+{#if message}
+	<Alert variant="destructive">
+		<AlertCircle class="h-4 w-4" />
+		<AlertDescription>
+			<p class="font-medium">{m['ticketConfirmationDialog.unableToComplete']()}</p>
+			<p class="mt-1 text-sm">{message}</p>
+			{#if membershipGateRefused && requiredTierNames.length > 0}
+				<p class="mt-1 text-sm" data-testid="required-membership-tiers">
+					{m['tierCardAdmin.requiresMembership']({ tiers: requiredTierNames.join(', ') })}
+				</p>
+			{/if}
+			{#if membershipGateRefused && organizationSlug}
+				<a
+					href={resolve('/(public)/org/[slug]/membership', { slug: organizationSlug })}
+					class="mt-2 inline-block text-sm font-medium underline underline-offset-4"
+				>
+					{m['membershipPlans.viewMembership']()}
+				</a>
+			{/if}
+			{#if requiresAccount}
+				<p class="mt-2">
+					<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+					<a href={loginHref} class="font-medium underline hover:no-underline">
+						{m['guestTicketDialog.logIn']()}
+					</a>
+					<!-- eslint-enable svelte/no-navigation-without-resolve -->
+					{m['guestTicketDialog.or']()}
+					<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+					<a
+						href={`${resolve('/(public)/register', {})}?returnUrl=${encodeURIComponent(window.location.pathname)}`}
+						class="font-medium underline hover:no-underline"
+					>
+						{m['guestTicketDialog.createAnAccount']()}
+					</a>
+					<!-- eslint-enable svelte/no-navigation-without-resolve -->
+					{m['guestTicketDialog.toContinue']()}
+				</p>
+			{/if}
+			{#if cartTooLarge}
+				<div class="mt-3 flex flex-wrap items-center gap-3">
+					<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query cannot be expressed through resolve() -->
+					<a href={loginHref} class="font-medium underline hover:no-underline">
+						{m['guestTicketDialog.logIn']()}
+					</a>
+					<!-- eslint-enable svelte/no-navigation-without-resolve -->
+					{#if onSplitPurchase}
+						<Button variant="outline" size="sm" onclick={onSplitPurchase}>
+							{m['cart.splitPurchase']()}
+						</Button>
+					{/if}
+				</div>
+			{/if}
+		</AlertDescription>
+	</Alert>
+{/if}

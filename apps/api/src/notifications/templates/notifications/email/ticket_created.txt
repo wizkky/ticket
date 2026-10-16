@@ -1,0 +1,38 @@
+{% load i18n markdown_tags %}{% trans "Hello" %} {{ user.display_name }},
+
+{% if context.ticket_status == "pending" %}{% blocktranslate with event=context.event_name %}Your ticket for {{ event }} is pending payment confirmation.{% endblocktranslate %}
+
+{% trans "Event Details:" %}
+📅 {{ context.event_start_formatted }}
+{% if context.event_location %}📍 {{ context.event_location }}{% if context.address_url %} ({{ context.address_url }}){% endif %}{% endif %}
+
+{% trans "Ticket Information:" %}
+- {% trans "Tier:" %} {{ context.tier_name }}
+- {% trans "Status:" %} {% trans "Pending" %}
+- {% trans "Ticket ID:" %} {{ context.ticket_id }}
+
+{% if context.manual_payment_instructions %}{% trans "Payment Instructions:" %}
+{{ context.manual_payment_instructions|strip_leading_heading }}
+{% else %}{% trans "Please contact the organizer to complete the payment." %}
+{% endif %}
+{% trans "Your ticket will arrive by email as soon as your payment is confirmed." %}
+{% else %}{% blocktranslate with event=context.event_name %}Your ticket for {{ event }} is confirmed! 🎉{% endblocktranslate %}
+
+{% trans "Event Details:" %}
+📅 {{ context.event_start_formatted }}
+{% if context.event_location %}📍 {{ context.event_location }}{% if context.address_url %} ({{ context.address_url }}){% endif %}{% endif %}
+
+{% trans "Ticket Information:" %}
+- {% trans "Tier:" %} {{ context.tier_name }}
+- {% trans "Status:" %} {% trans "Active" %}
+- {% trans "Ticket ID:" %} {{ context.ticket_id }}
+{% if context.apple_wallet_signed_url %}
+{% trans "Add to Apple Wallet:" %} {{ context.apple_wallet_signed_url }}
+{% endif %}{% if context.google_wallet_save_url %}
+{% trans "Add to Google Wallet:" %} {{ context.google_wallet_save_url }}
+{% endif %}{% endif %}
+{% include "notifications/email/_tax_notice.txt" %}
+
+{% trans "View event details:" %} {{ context.event_url }}
+
+{% include "notifications/email/_footer.txt" %}

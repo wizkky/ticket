@@ -1,0 +1,100 @@
+"""Accounts-specific exceptions mapped to HTTP status codes.
+
+The exception → status mapping lives in :mod:`accounts.exception_handlers`,
+registered on the global API from :meth:`accounts.apps.AccountsConfig.ready`.
+"""
+
+import typing as t
+
+if t.TYPE_CHECKING:  # pragma: no cover - typing only
+    from accounts.service.referral_cleanup import ReferralForfeitureSummary
+
+
+class ReferralPayoutInFlightError(Exception):
+    """Raised when a user still has ``PENDING`` referral payouts.
+
+    Deleting the user now would race the disbursement task (a Stripe transfer may
+    already be in flight), so the deletion task retries with backoff instead.
+    Stale ``PENDING`` rows are reclaimed after an hour by ``process_referral_payouts``.
+    """
+
+
+class ReferralForfeitureConfirmationRequiredError(Exception):
+    """Raised when account deletion would forfeit unpaid referral earnings.
+
+    Carries the assessed :class:`~accounts.service.referral_cleanup.ReferralForfeitureSummary`
+    so the exception handler can render a machine-readable 409 payload for the
+    frontend's consequence screen. The user re-submits with ``force=true``.
+    """
+
+    def __init__(self, summary: "ReferralForfeitureSummary") -> None:
+        """Store the assessed forfeiture summary for the exception handler."""
+        self.summary = summary
+        super().__init__("Referral forfeiture confirmation required")
+
+
+OIDCErrorCode = t.Literal["state", "provider", "denied", "unverified_email", "no_email", "banned", "inactive"]
+
+
+class OIDCLoginError(Exception):
+    """Raised inside the OIDC start/callback flow. Carries a short machine code, never PII.
+
+    Both routes are browser navigations, so the accounts exception handler turns it into a
+    redirect to the frontend login page (``?error=oidc_<code>``) rather than a JSON body.
+    """
+
+    def __init__(self, code: OIDCErrorCode) -> None:
+        """Store the machine-readable error code."""
+        super().__init__(code)
+        self.code: OIDCErrorCode = code
+
+
+ReferralApplicationErrorCode = t.Literal[
+    "referral_applications_disabled",
+    "pending_application",
+    "code_taken",
+    "already_decided",
+    "blocked_email",
+    "open_invite",
+    "already_active",
+]
+
+
+class ReferralApplicationError(Exception):
+    """Base for referral application / invite failures.
+
+    Raised with a translated ``detail`` message and a stable machine-readable ``code`` that
+    the accounts exception handler renders as ``{"detail", "code"}`` (same shape as the
+    referral-forfeiture 409), so clients branch on the code rather than on translated text.
+    """
+
+    code: ReferralApplicationErrorCode
+
+    def __init__(self, message: str, *, code: ReferralApplicationErrorCode | None = None) -> None:
+        """Store the message; ``code`` overrides the subclass default when given."""
+        super().__init__(message)
+        if code is not None:
+            self.code = code
+
+
+class ReferralApplicationsDisabledError(ReferralApplicationError):
+    """Public applications are switched off in ``SiteSettings`` (404)."""
+
+    code = "referral_applications_disabled"
+
+
+class ReferralApplicationConflictError(ReferralApplicationError):
+    """Pending duplicate, taken code, blocked email, open invite or invalid transition (409).
+
+    Always raised with an explicit ``code``.
+    """
+
+
+class ReferralAlreadyActiveError(ReferralApplicationError):
+    """The invitee already has an active referral code (409)."""
+
+    code = "already_active"
+
+
+class TurnstileFailedError(Exception):
+    """Raised when a registration's Turnstile token is missing or rejected by Cloudflare (400)."""

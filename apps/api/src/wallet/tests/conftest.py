@@ -1,0 +1,571 @@
+"""Test fixtures for wallet app tests.
+
+This module provides fixtures for testing Apple Wallet pass generation,
+including mocked certificates and pre-configured test data.
+
+Note: This module reuses fixtures from src/events/tests/conftest.py for
+model fixtures (organization, event, ticket, etc.) and src/conftest.py
+for common fixtures. Only wallet-specific fixtures are defined here.
+"""
+
+import io
+import typing as t
+from collections.abc import Generator
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from uuid import UUID
+
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from PIL import Image
+
+from accounts.models import RevelUser
+
+# --- Mock Certificate Fixtures ---
+
+
+@pytest.fixture
+def mock_private_key() -> rsa.RSAPrivateKey:
+    """Generate a mock RSA private key for testing."""
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+@pytest.fixture
+def mock_certificate(mock_private_key: rsa.RSAPrivateKey) -> x509.Certificate:
+    """Generate a mock X.509 certificate for testing."""
+    from datetime import datetime
+    from datetime import timezone as dt_timezone
+
+    from cryptography.x509 import CertificateBuilder, Name, NameAttribute
+
+    subject = issuer = Name(
+        [
+            NameAttribute(NameOID.COUNTRY_NAME, "US"),
+            NameAttribute(NameOID.ORGANIZATION_NAME, "Test Org"),
+            NameAttribute(NameOID.COMMON_NAME, "Test Certificate"),
+        ]
+    )
+
+    now = datetime.now(dt_timezone.utc)
+    cert = (
+        CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(mock_private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=365))
+        .sign(mock_private_key, hashes.SHA256())
+    )
+    return cert
+
+
+@pytest.fixture
+def mock_wwdr_certificate(mock_private_key: rsa.RSAPrivateKey) -> x509.Certificate:
+    """Generate a mock Apple WWDR certificate for testing."""
+    from datetime import datetime
+    from datetime import timezone as dt_timezone
+
+    from cryptography.x509 import CertificateBuilder, Name, NameAttribute
+
+    subject = issuer = Name(
+        [
+            NameAttribute(NameOID.COUNTRY_NAME, "US"),
+            NameAttribute(NameOID.ORGANIZATION_NAME, "Apple Inc."),
+            NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, "Apple Worldwide Developer Relations"),
+            NameAttribute(NameOID.COMMON_NAME, "Apple Worldwide Developer Relations Certification Authority"),
+        ]
+    )
+
+    now = datetime.now(dt_timezone.utc)
+    cert = (
+        CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(mock_private_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=365))
+        .sign(mock_private_key, hashes.SHA256())
+    )
+    return cert
+
+
+@pytest.fixture
+def mock_signer(
+    mock_certificate: x509.Certificate,
+    mock_private_key: rsa.RSAPrivateKey,
+    mock_wwdr_certificate: x509.Certificate,
+) -> MagicMock:
+    """Create a fully mocked ApplePassSigner for testing."""
+    from wallet.apple.signer import ApplePassSigner
+
+    signer = MagicMock(spec=ApplePassSigner)
+    signer.certificate = mock_certificate
+    signer.private_key = mock_private_key
+    signer.wwdr_certificate = mock_wwdr_certificate
+    signer.is_configured.return_value = True
+
+    # Mock create_manifest to return valid JSON bytes
+    def mock_create_manifest(files: dict[str, bytes]) -> bytes:
+        import hashlib
+        import json
+
+        manifest = {}
+        for filename, content in files.items():
+            if filename not in ("manifest.json", "signature"):
+                manifest[filename] = hashlib.sha1(content).hexdigest()
+        return json.dumps(manifest).encode("utf-8")
+
+    signer.create_manifest.side_effect = mock_create_manifest
+    signer.sign_manifest.return_value = b"mock_signature_bytes"
+
+    return signer
+
+
+@pytest.fixture
+def patched_signer_certs(
+    mock_certificate: x509.Certificate,
+    mock_private_key: rsa.RSAPrivateKey,
+    mock_wwdr_certificate: x509.Certificate,
+) -> t.Any:
+    """Patch ApplePassSigner to use mock certificates.
+
+    This fixture patches the certificate loading methods to return
+    mock certificates, avoiding file system access.
+    """
+    with (
+        patch.object(
+            target=__import__("wallet.apple.signer", fromlist=["ApplePassSigner"]).ApplePassSigner,
+            attribute="_load_certificate",
+            return_value=mock_certificate,
+        ),
+        patch.object(
+            target=__import__("wallet.apple.signer", fromlist=["ApplePassSigner"]).ApplePassSigner,
+            attribute="_load_private_key",
+            return_value=mock_private_key,
+        ),
+    ):
+        yield
+
+
+# --- Image Fixtures ---
+
+
+@pytest.fixture
+def sample_logo_bytes() -> bytes:
+    """Generate a sample logo PNG for testing (100x100 red square).
+
+    This is different from png_bytes which is a minimal 1x1 image.
+    This fixture creates a larger image suitable for logo testing.
+    """
+    img = Image.new("RGB", (100, 100), (255, 0, 0))
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+# --- Mock Model Fixtures for Image Testing ---
+
+
+@pytest.fixture
+def mock_organization() -> MagicMock:
+    """Create a mock organization for testing image generation.
+
+    Uses MagicMock instead of real model to avoid database access
+    in pure unit tests for image generation functions.
+    """
+    org = MagicMock()
+    org.id = UUID("12345678-1234-5678-1234-567812345678")
+    org.name = "Test Organization"
+    return org
+
+
+@pytest.fixture
+def mock_event(mock_organization: MagicMock) -> MagicMock:
+    """Create a mock event for testing.
+
+    Uses MagicMock instead of real model for unit tests
+    that don't need database interaction.
+    """
+    event = MagicMock()
+    event.cover_art = None
+    event.event_series = None
+    event.organization = mock_organization
+    mock_organization.cover_art = None
+    return event
+
+
+# --- Controller Test Fixtures ---
+
+
+@pytest.fixture
+def apple_wallet_configured(settings: t.Any) -> None:
+    """Configure Apple Wallet settings for tests."""
+    settings.APPLE_WALLET_PASS_TYPE_ID = "pass.com.example.test"
+    settings.APPLE_WALLET_TEAM_ID = "TEAM123"
+    settings.APPLE_WALLET_CERT_PATH = "/path/cert.pem"
+    settings.APPLE_WALLET_KEY_PATH = "/path/key.pem"
+    settings.APPLE_WALLET_WWDR_CERT_PATH = "/path/wwdr.pem"
+
+
+@pytest.fixture
+def apple_wallet_not_configured(settings: t.Any) -> None:
+    """Clear Apple Wallet settings for tests."""
+    settings.APPLE_WALLET_PASS_TYPE_ID = ""
+    settings.APPLE_WALLET_TEAM_ID = ""
+    settings.APPLE_WALLET_CERT_PATH = ""
+    settings.APPLE_WALLET_KEY_PATH = ""
+    settings.APPLE_WALLET_WWDR_CERT_PATH = ""
+
+
+@pytest.fixture
+def mock_pass_generator() -> Generator[MagicMock, None, None]:
+    """Mock the ticket file service pkpass generation for controller tests."""
+    with patch("events.service.ticket_file_service.get_or_generate_pkpass") as mock_fn:
+        mock_fn.return_value = b"mock_pkpass_content"
+        yield mock_fn
+
+
+@pytest.fixture
+def mock_pdf_generator() -> Generator[MagicMock, None, None]:
+    """Mock the ticket file service PDF generation for controller tests."""
+    with patch("events.service.ticket_file_service.get_or_generate_pdf") as mock_fn:
+        mock_fn.return_value = b"%PDF-mock-content"
+        yield mock_fn
+
+
+# --- Model and Client Fixtures for Controller Tests ---
+# These fixtures follow the same pattern as events/tests/test_controllers/conftest.py
+
+
+@pytest.fixture
+def organization_owner_user(django_user_model: type[RevelUser]) -> RevelUser:
+    """Organization owner user."""
+    return django_user_model.objects.create_user(
+        username="wallet_org_owner",
+        email="wallet_owner@example.com",
+        password="pass",
+        email_verified=True,
+    )
+
+
+@pytest.fixture
+def organization(organization_owner_user: t.Any) -> t.Any:
+    """Organization for wallet tests."""
+    from events.models import Organization
+
+    return Organization.objects.create(
+        name="Wallet Test Org",
+        slug="wallet-test-org",
+        owner=organization_owner_user,
+    )
+
+
+@pytest.fixture
+def event(organization: t.Any) -> t.Any:
+    """Event for wallet controller tests."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from events.models import Event
+
+    now = timezone.now()
+    return Event.objects.create(
+        organization=organization,
+        name="Wallet Test Event",
+        slug="wallet-test-event",
+        event_type=Event.EventType.PUBLIC,
+        visibility=Event.Visibility.PUBLIC,
+        max_attendees=100,
+        start=now + timedelta(days=7),
+        end=now + timedelta(days=7, hours=3),
+        status="open",
+        requires_ticket=True,
+        address="123 Test Street",
+    )
+
+
+@pytest.fixture
+def event_ticket_tier(event: t.Any) -> t.Any:
+    """Ticket tier for wallet tests."""
+    from events.models import TicketTier
+
+    return TicketTier.objects.create(
+        event=event,
+        name="Wallet General Tier",
+        price=10.00,
+        currency="EUR",
+        payment_method=TicketTier.PaymentMethod.OFFLINE,
+    )
+
+
+@pytest.fixture
+def member_user(django_user_model: type[RevelUser]) -> RevelUser:
+    """Member user for wallet tests."""
+    return django_user_model.objects.create_user(
+        username="wallet_member",
+        email="wallet_member@example.com",
+        password="pass",
+        email_verified=True,
+    )
+
+
+@pytest.fixture
+def nonmember_user(django_user_model: type[RevelUser]) -> RevelUser:
+    """Non-member user for wallet tests."""
+    return django_user_model.objects.create_user(
+        username="wallet_nonmember",
+        email="wallet_nonmember@example.com",
+        password="pass",
+        email_verified=True,
+    )
+
+
+@pytest.fixture
+def ticket(event: t.Any, member_user: t.Any, event_ticket_tier: t.Any) -> t.Any:
+    """Ticket for wallet controller tests."""
+    from events.models import Ticket
+
+    return Ticket.objects.create(
+        event=event,
+        user=member_user,
+        tier=event_ticket_tier,
+        status=Ticket.TicketStatus.ACTIVE,
+        guest_name=member_user.get_display_name(),
+    )
+
+
+@pytest.fixture
+def member(organization: t.Any, member_user: t.Any) -> t.Any:
+    """Organization member for wallet membership pass tests."""
+    from events.models import OrganizationMember
+
+    return OrganizationMember.objects.create(organization=organization, user=member_user, tier=None)
+
+
+@pytest.fixture
+def tier(organization: t.Any) -> t.Any:
+    """Membership tier for wallet membership pass tests."""
+    from events.models import MembershipTier
+
+    return MembershipTier.objects.create(organization=organization, name="Gold")
+
+
+@pytest.fixture
+def member_client(member_user: t.Any, member: t.Any) -> t.Any:
+    """API client for a member user.
+
+    Depends on the ``member`` fixture (rather than creating its own
+    OrganizationMember row) so tests can request both ``member_client`` and
+    ``member`` together without hitting the (organization, user) unique
+    constraint.
+    """
+    from django.test.client import Client
+    from ninja_jwt.tokens import RefreshToken
+
+    refresh = RefreshToken.for_user(member_user)
+    return Client(HTTP_AUTHORIZATION=f"Bearer {str(refresh.access_token)}")  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def nonmember_client(nonmember_user: t.Any) -> t.Any:
+    """API client for a non-member user."""
+    from django.test.client import Client
+    from ninja_jwt.tokens import RefreshToken
+
+    refresh = RefreshToken.for_user(nonmember_user)
+    return Client(HTTP_AUTHORIZATION=f"Bearer {str(refresh.access_token)}")  # type: ignore[attr-defined]
+
+
+# --- Google Wallet Fixtures ---
+
+
+@pytest.fixture
+def google_sa_key_file(tmp_path: Path, mock_private_key: rsa.RSAPrivateKey) -> Path:
+    """Write a fake Google service-account JSON with a real RSA key."""
+    import json
+
+    from cryptography.hazmat.primitives import serialization
+
+    pem = mock_private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+    sa = {
+        "type": "service_account",
+        "project_id": "test-project",
+        "private_key_id": "test-key-id",
+        "private_key": pem,
+        "client_email": "wallet@test-project.iam.gserviceaccount.com",
+        "client_id": "1234567890",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+    path = tmp_path / "google_wallet_sa.json"
+    path.write_text(json.dumps(sa))
+    return path
+
+
+@pytest.fixture
+def google_wallet_configured_settings(settings: t.Any, google_sa_key_file: Path) -> None:
+    """Configure Google Wallet settings pointing at the fixture SA key."""
+    settings.GOOGLE_WALLET_ISSUER_ID = "3388000000012345678"
+    settings.GOOGLE_WALLET_SERVICE_ACCOUNT_KEY_PATH = str(google_sa_key_file)
+    settings.GOOGLE_WALLET_CLASS_PREFIX = "test"
+
+
+@pytest.fixture
+def google_wallet_not_configured(settings: t.Any) -> None:
+    """Clear Google Wallet settings for tests."""
+    settings.GOOGLE_WALLET_ISSUER_ID = ""
+    settings.GOOGLE_WALLET_SERVICE_ACCOUNT_KEY_PATH = ""
+
+
+# --- Seating Fixtures (shared by the Apple and Google rail tests) ---
+
+
+@pytest.fixture
+def seated_venue(organization: t.Any) -> t.Any:
+    """A venue with an address, for testing venue/sector/seat resolution."""
+    from events.models import Venue
+
+    return Venue.objects.create(organization=organization, name="Teatro Grande", address="1 Teatro Street")
+
+
+@pytest.fixture
+def seated_sector(seated_venue: t.Any) -> t.Any:
+    """The sector the seated tier sells."""
+    from events.models import VenueSector
+
+    return VenueSector.objects.create(venue=seated_venue, name="Platea")
+
+
+@pytest.fixture
+def seated_seat(seated_sector: t.Any) -> t.Any:
+    """A materialized seat in the sector."""
+    from events.models import VenueSeat
+
+    return VenueSeat.objects.create(sector=seated_sector, label="A-7", row_label="A", number=7)
+
+
+@pytest.fixture
+def seated_tier(event: t.Any, seated_venue: t.Any, seated_sector: t.Any) -> t.Any:
+    """A tier wired to the venue/sector, for user-choice seat assignment."""
+    from decimal import Decimal
+
+    from events.models import TicketTier
+
+    return TicketTier.objects.create(
+        event=event,
+        name="Platea Tier",
+        price=Decimal("10.00"),
+        currency="EUR",
+        payment_method=TicketTier.PaymentMethod.OFFLINE,
+        venue=seated_venue,
+        sector=seated_sector,
+        seat_assignment_mode=TicketTier.SeatAssignmentMode.USER_CHOICE,
+    )
+
+
+@pytest.fixture
+def seated_ticket(event: t.Any, member_user: t.Any, seated_tier: t.Any, seated_seat: t.Any) -> t.Any:
+    """A ticket for the seated tier, with a materialized seat assigned."""
+    from events.models import Ticket
+
+    return Ticket.objects.create(
+        event=event,
+        user=member_user,
+        tier=seated_tier,
+        seat=seated_seat,
+        status=Ticket.TicketStatus.ACTIVE,
+        guest_name=member_user.get_display_name(),
+    )
+
+
+# --- Series Pass Fixtures (shared by the Apple and Google rail tests) ---
+
+
+@pytest.fixture
+def event_series(organization: t.Any) -> t.Any:
+    """Event series for wallet series pass tests."""
+    from events.models import EventSeries
+
+    return EventSeries.objects.create(organization=organization, name="Wallet Series", slug="wallet-series")
+
+
+@pytest.fixture
+def series_pass(event_series: t.Any) -> t.Any:
+    """Series pass product for wallet tests."""
+    from decimal import Decimal
+
+    from events.models import SeriesPass, TicketTier
+
+    return SeriesPass.objects.create(
+        event_series=event_series,
+        name="Wallet Season Pass",
+        price=Decimal("60.00"),
+        pro_rata_discount=Decimal("10.00"),
+        currency="EUR",
+        payment_method=TicketTier.PaymentMethod.FREE,
+    )
+
+
+def make_covered_event(
+    organization: t.Any,
+    event_series: t.Any,
+    series_pass: t.Any,
+    name: str,
+    slug: str,
+    start_delta: timedelta,
+) -> t.Any:
+    """Create an OPEN covered event with a linked tier."""
+    from django.utils import timezone
+
+    from events.models import Event, SeriesPassTierLink, TicketTier
+
+    now = timezone.now()
+    covered = Event.objects.create(
+        organization=organization,
+        event_series=event_series,
+        name=name,
+        slug=slug,
+        start=now + start_delta,
+        end=now + start_delta + timedelta(hours=2),
+        requires_ticket=True,
+        status=Event.EventStatus.OPEN,
+    )
+    tier = TicketTier.objects.create(
+        event=covered, name=f"{name} Tier", price=10, currency="EUR", payment_method=TicketTier.PaymentMethod.FREE
+    )
+    SeriesPassTierLink.objects.create(series_pass=series_pass, event=covered, tier=tier)
+    return covered
+
+
+@pytest.fixture
+def covered_events(organization: t.Any, event_series: t.Any, series_pass: t.Any) -> list[t.Any]:
+    """Two future covered events (7 and 14 days out)."""
+    return [
+        make_covered_event(organization, event_series, series_pass, "Covered One", "covered-one", timedelta(days=7)),
+        make_covered_event(organization, event_series, series_pass, "Covered Two", "covered-two", timedelta(days=14)),
+    ]
+
+
+@pytest.fixture
+def held_pass(series_pass: t.Any, member_user: t.Any, covered_events: list[t.Any]) -> t.Any:
+    """An active held series pass covering two future events."""
+    from decimal import Decimal
+
+    from events.models import HeldSeriesPass
+
+    return HeldSeriesPass.objects.create(
+        series_pass=series_pass,
+        user=member_user,
+        status=HeldSeriesPass.HeldSeriesPassStatus.ACTIVE,
+        price_paid=Decimal("50.00"),
+    )

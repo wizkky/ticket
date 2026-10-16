@@ -1,0 +1,275 @@
+import typing as t
+
+from django.contrib import admin
+from django.db.models import F, OuterRef, Subquery
+from django.urls import reverse
+from django.utils.html import format_html
+from simple_history.admin import SimpleHistoryAdmin
+from solo.admin import SingletonModelAdmin
+from unfold.admin import ModelAdmin
+
+from . import models
+from .signing import get_file_url
+
+
+class UploaderLinkMixin:
+    """Mixin to add a link to an uploader.
+
+    ``uploader`` is an email string (not an FK), so the matching user id is
+    annotated onto the changelist queryset instead of looked up per row.
+    Must precede ``ModelAdmin`` in the bases so its ``get_queryset`` runs.
+    """
+
+    uploader_field = "uploader"  # lookup path to the uploader email
+
+    def get_queryset(self, request: t.Any) -> t.Any:
+        from accounts.models import RevelUser
+
+        qs = super().get_queryset(request)  # type: ignore[misc]
+        return qs.annotate(
+            uploader_email=F(self.uploader_field),
+            uploader_user_id=Subquery(RevelUser.objects.filter(email=OuterRef(self.uploader_field)).values("id")[:1]),
+        )
+
+    def uploader_link(self, obj: t.Any) -> str:
+        email = getattr(obj, "uploader_email", "")
+        if user_id := getattr(obj, "uploader_user_id", None):
+            url = reverse("admin:accounts_reveluser_change", args=[user_id])
+            return format_html('<a href="{}">{}</a>', url, email)
+        return t.cast(str, email)
+
+    uploader_link.short_description = "Uploader"  # type: ignore[attr-defined]
+
+
+@admin.register(models.Legal)
+class LegalAdmin(SingletonModelAdmin, SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
+    # Solo's template would shadow simple_history's; restore the browsable history view.
+    object_history_template = "simple_history/object_history.html"
+    list_display = ["__str__", "updated_at"]
+    readonly_fields = ["updated_at"]
+    search_fields = ["terms_and_conditions", "privacy_policy"]
+
+
+@admin.register(models.SiteSettings)
+class SiteSettingsAdmin(SingletonModelAdmin, SimpleHistoryAdmin, ModelAdmin):  # type: ignore[misc]
+    object_history_template = "simple_history/object_history.html"
+    list_display = [
+        "__str__",
+        "notify_user_joined",
+        "notify_organization_created",
+        "live_emails",
+        "data_retention_days",
+        "updated_at",
+    ]
+    readonly_fields = ["created_at", "updated_at"]
+    fieldsets = (
+        ("Notifications", {"fields": ("notify_user_joined", "notify_organization_created", "live_emails")}),
+        ("Data Management", {"fields": ("data_retention_days",)}),
+        ("URLs & Emails", {"fields": ("frontend_base_url", "internal_catchall_email")}),
+        (
+            "Platform Billing",
+            {
+                "fields": (
+                    "platform_business_name",
+                    "platform_business_address",
+                    "platform_vat_id",
+                    "platform_vat_country",
+                    "platform_vat_rate",
+                    "platform_invoice_bcc_email",
+                ),
+            },
+        ),
+        ("Public Links", {"fields": ("demo_booking_url",)}),
+        ("Referral Program", {"fields": ("referral_applications_enabled",)}),
+        (
+            "Maintenance Banner",
+            {
+                "fields": (
+                    "maintenance_message",
+                    "maintenance_severity",
+                    "maintenance_scheduled_at",
+                    "maintenance_ends_at",
+                ),
+                "description": "Configure a maintenance banner shown to all users. Leave the message blank to disable.",
+            },
+        ),
+        ("Timestamps", {"fields": ("created_at", "updated_at")}),
+    )
+
+
+@admin.register(models.EmailLog)
+class EmailLogAdmin(ModelAdmin):  # type: ignore[misc]
+    list_display = ["to", "subject", "sent_at", "test_only"]
+    list_filter = ["test_only", "sent_at"]
+    search_fields = ["to", "subject"]
+    readonly_fields = ["id", "created_at", "updated_at", "sent_at", "body", "html"]
+    date_hierarchy = "sent_at"
+    ordering = ["-sent_at"]
+    list_per_page = 50
+    show_full_result_count = False
+
+    def has_add_permission(self, request: t.Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: t.Any, obj: t.Any = None) -> bool:
+        return False
+
+
+@admin.register(models.Tag)
+class TagAdmin(ModelAdmin):  # type: ignore[misc]
+    list_display = ["name", "description", "color", "parent", "created_at"]
+    list_filter = ["parent", "created_at"]
+    search_fields = ["name", "description"]
+    readonly_fields = ["id", "created_at", "updated_at"]
+    ordering = ["name"]
+    autocomplete_fields = ["parent"]
+
+
+@admin.register(models.TagAssignment)
+class TagAssignmentAdmin(ModelAdmin):  # type: ignore[misc]
+    list_display = ["tag", "content_type", "object_id", "assigned_by", "created_at"]
+    list_select_related = ["tag", "content_type"]
+    list_filter = ["content_type", "created_at"]
+    search_fields = ["tag__name"]
+    readonly_fields = ["id", "created_at", "updated_at"]
+    autocomplete_fields = ["tag"]
+    ordering = ["-created_at"]
+
+
+@admin.register(models.FileExport)
+class FileExportAdmin(ModelAdmin):  # type: ignore[misc]
+    list_display = ["id", "requested_by", "export_type", "status", "error_preview", "completed_at", "created_at"]
+    list_select_related = ["requested_by"]
+    list_filter = ["export_type", "status", "created_at"]
+    search_fields = ["requested_by__email"]
+    readonly_fields = ["id", "created_at", "updated_at", "completed_at", "parameters"]
+    date_hierarchy = "created_at"
+    ordering = ["-created_at"]
+
+    @admin.display(description="Error")
+    def error_preview(self, obj: models.FileExport) -> str:
+        if obj.error_message:
+            return obj.error_message[:80] + ("…" if len(obj.error_message) > 80 else "")
+        return "—"
+
+    def has_add_permission(self, request: t.Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: t.Any, obj: t.Any = None) -> bool:
+        return False
+
+
+@admin.register(models.FileUploadAudit)
+class FileUploadAuditAdmin(UploaderLinkMixin, ModelAdmin):  # type: ignore[misc]
+    list_display = [
+        "uploader_link",
+        "app",
+        "model",
+        "field",
+        "status",
+        "file_hash",
+        "created_at",
+    ]
+    list_filter = ["status", "app", "model", "created_at"]
+    search_fields = ["uploader", "file_hash", "instance_pk"]
+    readonly_fields = ["id", "created_at", "updated_at"]
+    date_hierarchy = "created_at"
+    ordering = ["-created_at"]
+    list_per_page = 50
+    show_full_result_count = False
+
+    def has_add_permission(self, request: t.Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: t.Any, obj: t.Any = None) -> bool:
+        return False
+
+
+@admin.register(models.QuarantinedFile)
+class QuarantinedFileAdmin(UploaderLinkMixin, ModelAdmin):  # type: ignore[misc]
+    list_display = [
+        "audit_link",
+        "uploader_link",
+        "file_link",
+        "findings_summary",
+        "created_at",
+    ]
+    list_filter = ["created_at"]
+    search_fields = ["audit__uploader", "audit__file_hash"]
+    readonly_fields = ["id", "created_at", "updated_at", "findings", "file_link"]
+    # Quarantined files live under protected/ and are not publicly served. Hide the raw
+    # FileField (its direct URL would 403) and expose a signed download link instead.
+    exclude = ["file"]
+    date_hierarchy = "created_at"
+    ordering = ["-created_at"]
+    uploader_field = "audit__uploader"
+
+    def get_queryset(self, request: t.Any) -> t.Any:
+        return super().get_queryset(request).select_related("audit")
+
+    def file_link(self, obj: models.QuarantinedFile) -> str:
+        """Render a signed, authorized download link for the quarantined file.
+
+        Quarantined files are stored under protected/ (ProtectedFileField), so their
+        direct media URL is not publicly accessible. get_file_url() mints a short-lived
+        signed URL that Caddy's forward_auth validates, letting staff download the
+        original bytes for forensics without exposing them to the world.
+        """
+        url = get_file_url(obj.file)
+        if not url:
+            return "—"
+        return format_html('<a href="{}" rel="noopener noreferrer">{}</a>', url, obj.file.name)
+
+    file_link.short_description = "File"  # type: ignore[attr-defined]
+
+    def audit_link(self, obj: models.QuarantinedFile) -> str:
+        url = reverse("admin:common_fileuploadaudit_change", args=[obj.audit.id])
+        return format_html(
+            '<a href="{}">{} - {} - {}</a>',
+            url,
+            obj.audit.app,
+            obj.audit.model,
+            obj.audit.field,
+        )
+
+    audit_link.short_description = "Audit"  # type: ignore[attr-defined]
+
+    def findings_summary(self, obj: t.Any) -> str:
+        findings = obj.findings or {}
+        if not findings:
+            return "No findings"
+        # Extract malware names from findings
+        malware_names = []
+        for key, value in findings.items():
+            if isinstance(value, tuple) and len(value) >= 2:
+                malware_names.append(value[1])
+            elif isinstance(value, str) and value != "OK":
+                malware_names.append(value)
+        return ", ".join(malware_names) if malware_names else "Unknown threat"
+
+    findings_summary.short_description = "Threats Found"  # type: ignore[attr-defined]
+
+    def has_add_permission(self, request: t.Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: t.Any, obj: t.Any = None) -> bool:
+        return False
+
+
+@admin.register(models.ExchangeRate)
+class ExchangeRateAdmin(ModelAdmin):  # type: ignore[misc]
+    """Admin for ExchangeRate model (system-managed, readonly)."""
+
+    list_display = ["base", "date", "created_at"]
+    list_filter = ["base"]
+    readonly_fields = ["base", "date", "rates", "created_at", "updated_at"]
+    ordering = ["-date"]
+
+    def has_add_permission(self, request: t.Any) -> bool:
+        return False
+
+    def has_change_permission(self, request: t.Any, obj: t.Any = None) -> bool:
+        return False
+
+    def has_delete_permission(self, request: t.Any, obj: t.Any = None) -> bool:
+        return False

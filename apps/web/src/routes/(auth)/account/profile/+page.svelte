@@ -1,0 +1,697 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { setLocale } from '$lib/paraglide/runtime.js';
+	import { enhance, applyAction } from '$app/forms';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import type { PageData, ActionData } from './$types';
+	import { COMMON_PRONOUNS, SUPPORTED_LANGUAGES } from '$lib/schemas/profile';
+	import type { SupportedLanguage } from '$lib/schemas/profile';
+	import type { VisibilityValue } from '$lib/schemas/preferences';
+	import { Loader2, Check, Info, ShieldCheck, ShieldAlert, Mail, Eye, Gift } from '@lucide/svelte';
+	import DietaryPreferencesManager from '$lib/components/profile/DietaryPreferencesManager.svelte';
+	import DietaryRestrictionsManager from '$lib/components/profile/DietaryRestrictionsManager.svelte';
+	import TelegramConnectionManager from '$lib/components/profile/TelegramConnectionManager.svelte';
+	import ProfilePictureUploader from '$lib/components/profile/ProfilePictureUploader.svelte';
+	import AttendeeVisibilitySelect from '$lib/components/profile/AttendeeVisibilitySelect.svelte';
+	import MarkdownEditor from '$lib/components/forms/MarkdownEditor.svelte';
+	import {
+		accountResendVerificationEmail,
+		userpreferencesUpdateGeneralPreferences
+	} from '$lib/api/generated';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { toast } from 'svelte-sonner';
+	import PageHeader from '$lib/components/common/PageHeader.svelte';
+	import SectionHeader from '$lib/components/common/SectionHeader.svelte';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+
+	interface Props {
+		data: PageData;
+		form: ActionData;
+	}
+
+	const { data, form }: Props = $props();
+
+	let isSubmitting = $state(false);
+	let manuallyShowingCustom = $state(false);
+	let isResendingVerification = $state(false);
+	let isSavingVisibility = $state(false);
+	let attendeeListVisibility = $state<VisibilityValue>(
+		data.generalPreferences?.show_me_on_attendee_list ?? 'never'
+	);
+	let verificationEmailSent = $state(false);
+	let verificationError = $state<string | null>(null);
+	let resendCooldown = $state(0);
+	let cooldownInterval: ReturnType<typeof setInterval> | null = null;
+
+	// Form state - initialize from data.user on page load
+	let firstName = $state(data.user?.first_name || '');
+	let lastName = $state(data.user?.last_name || '');
+	let preferredName = $state(data.user?.preferred_name || '');
+	let pronouns = $state(data.user?.pronouns || '');
+	let language = $state<SupportedLanguage>((data.user?.language as SupportedLanguage) || 'en');
+	let bio = $state(data.user?.bio || '');
+
+	// Paraglide compiles one function per key, so the options cannot be built from
+	// a computed key string — map each supported code to its message explicitly.
+	const LANGUAGE_LABELS: Record<SupportedLanguage, () => string> = {
+		en: m['profile.language_en'],
+		de: m['profile.language_de'],
+		it: m['profile.language_it'],
+		fr: m['profile.language_fr'],
+		es: m['profile.language_es'],
+		pt: m['profile.language_pt']
+	};
+	let profilePictureUrl = $state<string | null>(data.user?.profile_picture_url ?? null);
+
+	// Check if current pronouns is custom (not in common list)
+	const showCustomPronouns = $derived(
+		manuallyShowingCustom ||
+			(pronouns !== '' &&
+				!COMMON_PRONOUNS.slice(0, -1).includes(pronouns as (typeof COMMON_PRONOUNS)[number]))
+	);
+
+	const success = $derived(form?.success || false);
+	const errors = $derived((form?.errors || {}) as Record<string, string>);
+	// Email comes from data.user (populated by load function)
+	const email = $derived(data.user?.email || '');
+	const emailVerified = $derived(data.user?.email_verified || false);
+	const canResendEmail = $derived(!isResendingVerification && resendCooldown === 0);
+
+	// Check for redirect URL (used when coming from events that require profile completion)
+	const redirectUrl = $derived($page.url.searchParams.get('redirect'));
+	const features = $derived($page.data.features);
+	/*
+	 * `authStore.user` (not `data.user`): the referral code only exists on the
+	 * full user fetched client-side, and the entry point must disappear the
+	 * moment someone is enrolled — showing "apply" to an existing referrer
+	 * sends them to a form the backend answers with a silent 202.
+	 */
+	const isReferrer = $derived(!!authStore.user?.referral_code);
+
+	/** True when the error carries a 429 status (top-level or on `error.response`). */
+	function isRateLimitedError(error: unknown): boolean {
+		if (typeof error !== 'object' || error === null) return false;
+		if ('status' in error && error.status === 429) return true;
+		return (
+			'response' in error &&
+			typeof error.response === 'object' &&
+			error.response !== null &&
+			'status' in error.response &&
+			error.response.status === 429
+		);
+	}
+
+	function startCooldown() {
+		resendCooldown = 60; // 60 second cooldown
+		cooldownInterval = setInterval(() => {
+			resendCooldown--;
+			if (resendCooldown <= 0) {
+				if (cooldownInterval) {
+					clearInterval(cooldownInterval);
+					cooldownInterval = null;
+				}
+			}
+		}, 1000);
+	}
+
+	async function handleResendVerification() {
+		if (!email || !canResendEmail) return;
+
+		isResendingVerification = true;
+		verificationEmailSent = false;
+		verificationError = null;
+
+		try {
+			await accountResendVerificationEmail({
+				body: { email }
+			});
+			verificationEmailSent = true;
+			startCooldown();
+		} catch (error) {
+			console.error('Failed to resend verification email:', error);
+
+			// Handle 429 Too Many Requests
+			if (isRateLimitedError(error)) {
+				verificationError = m['profile.email_rateLimitError']();
+				// Start cooldown even on rate limit to prevent immediate retry
+				startCooldown();
+			} else {
+				verificationError = m['profile.email_resendError']();
+			}
+		} finally {
+			isResendingVerification = false;
+		}
+	}
+
+	// Cleanup interval on component destroy
+	$effect(() => {
+		return () => {
+			if (cooldownInterval) {
+				clearInterval(cooldownInterval);
+			}
+		};
+	});
+
+	async function saveAttendeeVisibility(newValue: VisibilityValue) {
+		if (!authStore.accessToken) return;
+
+		isSavingVisibility = true;
+		try {
+			const { error } = await userpreferencesUpdateGeneralPreferences({
+				headers: { Authorization: `Bearer ${authStore.accessToken}` },
+				body: {
+					show_me_on_attendee_list: newValue
+				}
+			});
+
+			if (error) {
+				toast.error(m['accountSettingsPage.general.updateError']());
+			} else {
+				toast.success(m['accountSettingsPage.general.updateSuccess']());
+			}
+		} catch {
+			toast.error(m['accountSettingsPage.general.updateError']());
+		} finally {
+			isSavingVisibility = false;
+		}
+	}
+</script>
+
+<svelte:head>
+	<title>{m['profilePage.pageTitle']()}</title>
+	<meta name="description" content={m['profilePage.pageDescription']()} />
+</svelte:head>
+
+<div class="container mx-auto max-w-2xl px-4 py-8">
+	<PageHeader
+		kicker={m['myInvoices.account']()}
+		title={m['profilePage.heading']()}
+		subtitle={m['profilePage.subheading']()}
+		class="mb-8"
+	/>
+
+	{#if redirectUrl}
+		<!-- Composited tint mirrors ToneTile's audited info pair; body copy stays on --foreground. -->
+		<div class="mb-6 rounded-md border border-info/30 bg-info/10 p-4">
+			<p class="text-sm text-foreground">
+				<Info class="mr-2 inline-block h-4 w-4 text-info" aria-hidden="true" />
+				{m['profile.completeToReturn']()}
+			</p>
+		</div>
+	{/if}
+
+	{#if success}
+		<!-- Composited tint mirrors ToneTile's audited success pair. -->
+		<div role="status" class="mb-6 rounded-md border border-success/30 bg-success/10 p-4">
+			<div class="flex items-center gap-2">
+				<Check class="h-5 w-5 text-success" aria-hidden="true" />
+				<p class="text-sm font-medium text-foreground">
+					{#if redirectUrl}
+						{m['profile.savedRedirecting']()}
+					{:else}
+						{m['profilePage.updatedSuccess']()}
+					{/if}
+				</p>
+			</div>
+		</div>
+	{/if}
+
+	{#if errors.form}
+		<div role="alert" class="mb-6 rounded-md border border-destructive bg-destructive/10 p-4">
+			<p class="text-sm font-medium text-destructive">{errors.form}</p>
+		</div>
+	{/if}
+
+	<!-- Profile Picture Section -->
+	{#if authStore.accessToken && data.user}
+		<div class="mb-8 space-y-6">
+			<ProfilePictureUploader
+				currentPictureUrl={profilePictureUrl}
+				displayName={data.user.display_name}
+				firstName={data.user.first_name}
+				lastName={data.user.last_name}
+				accessToken={authStore.accessToken}
+				onUpdate={(newUrl, userData) => {
+					profilePictureUrl = newUrl;
+					if (userData) {
+						authStore.setUser(userData);
+					} else {
+						// Delete case — clear picture fields on current user
+						const currentUser = authStore.user;
+						if (currentUser) {
+							authStore.setUser({
+								...currentUser,
+								profile_picture_url: undefined,
+								profile_picture_thumbnail_url: undefined,
+								profile_picture_preview_url: undefined
+							});
+						}
+					}
+				}}
+			/>
+
+			<!-- Attendee List Visibility — surfaced here so users can set it right next to their photo -->
+			<div class="rounded-lg border bg-card p-4">
+				<div class="flex items-start gap-3">
+					<Eye class="mt-0.5 h-5 w-5 flex-shrink-0 text-muted-foreground" aria-hidden="true" />
+					<div class="flex-1 space-y-3">
+						<h2 class="text-base font-semibold">
+							{m['accountSettingsPage.attendeeListProfileHeading']()}
+						</h2>
+						<AttendeeVisibilitySelect
+							bind:value={attendeeListVisibility}
+							onValueChange={saveAttendeeVisibility}
+							showHeading={false}
+						/>
+						{#if isSavingVisibility}
+							<p class="flex items-center gap-1.5 text-xs text-muted-foreground" aria-live="polite">
+								<Loader2 class="h-3 w-3 animate-spin" aria-hidden="true" />
+								{m['accountSettingsPage.saving']()}
+							</p>
+						{/if}
+					</div>
+				</div>
+			</div>
+		</div>
+	{/if}
+
+	<form
+		method="POST"
+		action="?/updateProfile"
+		use:enhance={() => {
+			if (isSubmitting) return;
+			isSubmitting = true;
+			return async ({ result }) => {
+				isSubmitting = false;
+				// Don't call update() - it clears the form prop
+				// Instead, manually update the form fields from the result
+				if (result.type === 'success' && result.data?.user) {
+					const user = result.data.user as typeof data.user;
+					firstName = user?.first_name || '';
+					lastName = user?.last_name || '';
+					preferredName = user?.preferred_name || '';
+					pronouns = user?.pronouns || '';
+					language = (user?.language || 'en') as SupportedLanguage;
+					bio = user?.bio || '';
+					profilePictureUrl = user?.profile_picture_url ?? null;
+					// Propagate updated user to global auth store so navbar updates immediately
+					if (user) {
+						authStore.setUser(user);
+					}
+					// Update locale immediately on successful save
+					if (user?.language) {
+						setLocale(user.language as SupportedLanguage);
+					}
+					// Show success message by triggering a manual update with the result
+					// This will set the form prop without reloading
+					await applyAction(result);
+
+					// Check for redirect parameter and navigate if present
+					const redirectUrl = $page.url.searchParams.get('redirect');
+					if (redirectUrl) {
+						// Small delay to show success message before redirecting
+						setTimeout(() => {
+							// eslint-disable-next-line svelte/no-navigation-without-resolve -- post-auth return path read from the ?redirect query param; app-relative, not a static route id
+							goto(redirectUrl);
+						}, 1000);
+					}
+				} else if (result.type === 'failure') {
+					// On validation errors, apply the result to show errors
+					await applyAction(result);
+				}
+			};
+		}}
+		class="space-y-6"
+	>
+		<div class="space-y-2">
+			<label for="email" class="block text-sm font-medium">{m['profile.email_label']()}</label>
+			<div class="space-y-3">
+				<div class="flex items-center gap-2">
+					<input
+						id="email"
+						type="email"
+						value={email}
+						disabled
+						class="flex h-10 w-full cursor-not-allowed rounded-md border border-input bg-muted px-3 py-2 text-sm text-muted-foreground"
+					/>
+					{#if emailVerified}
+						<StatusBadge
+							tone="success"
+							icon={ShieldCheck}
+							label={m['profile.email_verified']()}
+							role="status"
+							srLabel={m['profile.email_verified_label']()}
+						/>
+					{:else}
+						<StatusBadge
+							tone="warning"
+							icon={ShieldAlert}
+							label={m['profile.email_unverified']()}
+							role="status"
+							srLabel={m['profile.email_unverified_label']()}
+						/>
+					{/if}
+				</div>
+
+				{#if !emailVerified}
+					<!-- Warning tint mirrors ToneTile's amber recipe (see security page). -->
+					<div class="rounded-md border border-highlight/40 bg-highlight/20 p-3">
+						<p class="mb-2 text-sm text-highlight-foreground dark:text-highlight">
+							{m['profile.email_verificationNeeded']()}
+						</p>
+						<button
+							type="button"
+							onclick={handleResendVerification}
+							disabled={!canResendEmail}
+							class="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-highlight px-3 py-2 text-sm font-medium text-highlight-foreground transition-colors hover:bg-highlight/90 focus:outline-none focus:ring-2 focus:ring-highlight focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							{#if isResendingVerification}
+								<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+								<span>{m['profile.email_resending']()}</span>
+							{:else if resendCooldown > 0}
+								<Mail class="h-4 w-4" aria-hidden="true" />
+								<span>{m['profile.email_resendWait']({ seconds: resendCooldown })}</span>
+							{:else}
+								<Mail class="h-4 w-4" aria-hidden="true" />
+								<span>{m['profile.email_resendButton']()}</span>
+							{/if}
+						</button>
+					</div>
+				{/if}
+
+				{#if verificationEmailSent}
+					<!-- Composited tint mirrors ToneTile's audited success pair. -->
+					<div
+						role="status"
+						class="space-y-2 rounded-md border border-success/30 bg-success/10 p-3"
+					>
+						<div class="flex items-center gap-2">
+							<Check class="h-5 w-5 text-success" aria-hidden="true" />
+							<p class="text-sm font-medium text-foreground">
+								{m['profile.email_resendSuccess']()}
+							</p>
+						</div>
+						<p class="text-sm text-muted-foreground">
+							{m['profile.email_checkSpam']()}
+						</p>
+					</div>
+				{/if}
+
+				{#if verificationError}
+					<!-- Border/tint carry the tone, the message reads on --foreground
+					     (danger-framing rule). `text-destructive` would clear AA on this
+					     tint too — 6.05:1 in dark since #781, against 2.68:1 before the
+					     token split — but error copy stays on the body-text pair. -->
+					<div role="alert" class="rounded-md border border-destructive bg-destructive/10 p-3">
+						<p class="text-sm font-medium text-foreground">
+							{verificationError}
+						</p>
+					</div>
+				{/if}
+
+				<p class="text-xs text-muted-foreground">{m['profile.email_hint']()}</p>
+				<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+				<a
+					href={`${resolve('/(auth)/account/security', {})}#email`}
+					class="inline-block text-sm text-primary underline-offset-4 hover:underline"
+				>
+					{m['profile.email_changeLink']()}
+				</a>
+				<!-- eslint-enable svelte/no-navigation-without-resolve -->
+			</div>
+		</div>
+
+		<div class="grid gap-6 sm:grid-cols-2">
+			<div class="space-y-2">
+				<label for="first_name" class="block text-sm font-medium">
+					{m['profile.firstName_label']()}
+					<span class="text-xs font-normal text-muted-foreground"
+						>{m['profile.preferredName_labelOptional']()}</span
+					>
+				</label>
+				<input
+					id="first_name"
+					name="first_name"
+					type="text"
+					bind:value={firstName}
+					aria-invalid={!!errors.first_name}
+					aria-describedby={errors.first_name ? 'first-name-error' : undefined}
+					disabled={isSubmitting}
+					class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.first_name
+						? 'border-destructive'
+						: ''}"
+				/>
+				{#if errors.first_name}
+					<p id="first-name-error" class="text-sm text-destructive" role="alert">
+						{errors.first_name}
+					</p>
+				{/if}
+			</div>
+
+			<div class="space-y-2">
+				<label for="last_name" class="block text-sm font-medium">
+					{m['profile.lastName_label']()}
+					<span class="text-xs font-normal text-muted-foreground"
+						>{m['profile.preferredName_labelOptional']()}</span
+					>
+				</label>
+				<input
+					id="last_name"
+					name="last_name"
+					type="text"
+					bind:value={lastName}
+					aria-invalid={!!errors.last_name}
+					aria-describedby={errors.last_name ? 'last-name-error' : undefined}
+					disabled={isSubmitting}
+					class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.last_name
+						? 'border-destructive'
+						: ''}"
+				/>
+				{#if errors.last_name}
+					<p id="last-name-error" class="text-sm text-destructive" role="alert">
+						{errors.last_name}
+					</p>
+				{/if}
+			</div>
+		</div>
+
+		<div class="space-y-2">
+			<label for="preferred_name" class="block text-sm font-medium">
+				{m['profile.preferredName_label']()}
+				<span class="text-xs font-normal text-muted-foreground"
+					>{m['profile.preferredName_labelOptional']()}</span
+				>
+			</label>
+			<input
+				id="preferred_name"
+				name="preferred_name"
+				type="text"
+				bind:value={preferredName}
+				aria-invalid={!!errors.preferred_name}
+				aria-describedby={errors.preferred_name ? 'preferred-name-error' : undefined}
+				disabled={isSubmitting}
+				class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.preferred_name
+					? 'border-destructive'
+					: ''}"
+				placeholder={m['profilePage.preferredNamePlaceholder']()}
+			/>
+			<p class="text-xs text-muted-foreground">
+				{m['profilePage.preferredNameHint']()}
+			</p>
+			{#if errors.preferred_name}
+				<p id="preferred-name-error" class="text-sm text-destructive" role="alert">
+					{errors.preferred_name}
+				</p>
+			{/if}
+		</div>
+
+		<div class="space-y-2">
+			<label for="pronouns-select" class="block text-sm font-medium"
+				>{m['profilePage.pronounsLabel']()}</label
+			>
+			{#if showCustomPronouns}
+				<div class="space-y-2">
+					<input
+						id="pronouns"
+						name="pronouns"
+						type="text"
+						required
+						bind:value={pronouns}
+						aria-invalid={!!errors.pronouns}
+						aria-describedby={errors.pronouns ? 'pronouns-error' : undefined}
+						disabled={isSubmitting}
+						maxlength="10"
+						class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.pronouns
+							? 'border-destructive'
+							: ''}"
+						placeholder={m['profilePage.pronounsPlaceholder']()}
+					/>
+					<button
+						type="button"
+						onclick={() => {
+							manuallyShowingCustom = false;
+							pronouns = 'they/them';
+						}}
+						class="text-sm text-primary underline-offset-4 hover:underline"
+					>
+						{m['profilePage.chooseCommonOptions']()}
+					</button>
+				</div>
+			{:else}
+				<select
+					id="pronouns-select"
+					bind:value={pronouns}
+					onchange={(e) => {
+						const val = (e.target as HTMLSelectElement).value;
+						if (val === 'custom') {
+							manuallyShowingCustom = true;
+							pronouns = '';
+						}
+					}}
+					disabled={isSubmitting}
+					class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+				>
+					{#each COMMON_PRONOUNS as option (option)}
+						<option value={option === 'custom' ? 'custom' : option}>
+							{option === 'custom' ? m['profilePage.pronounsCustomOption']() : option}
+						</option>
+					{/each}
+				</select>
+				<input type="hidden" name="pronouns" value={pronouns} />
+			{/if}
+			{#if errors.pronouns}
+				<p id="pronouns-error" class="text-sm text-destructive" role="alert">{errors.pronouns}</p>
+			{/if}
+		</div>
+
+		<div class="space-y-2">
+			<label for="language" class="block text-sm font-medium">{m['profile.language_label']()}</label
+			>
+			<select
+				id="language"
+				name="language"
+				bind:value={language}
+				disabled={isSubmitting}
+				class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+			>
+				{#each SUPPORTED_LANGUAGES as code (code)}
+					<option value={code}>{LANGUAGE_LABELS[code]()}</option>
+				{/each}
+			</select>
+			<p class="text-xs text-muted-foreground">{m['profile.language_hint']()}</p>
+			{#if errors.language}
+				<p id="language-error" class="text-sm text-destructive" role="alert">{errors.language}</p>
+			{/if}
+		</div>
+
+		<!-- Bio Field -->
+		<div class="space-y-2">
+			<MarkdownEditor
+				bind:value={bio}
+				id="bio"
+				label={m['profilePage.bio_label']()}
+				placeholder={m['profilePage.bio_placeholder']()}
+				rows={4}
+				disabled={isSubmitting}
+				error={errors.bio}
+			/>
+			<input type="hidden" name="bio" value={bio} />
+			<p class="text-xs text-muted-foreground">
+				{m['profilePage.bio_hint']()}
+			</p>
+		</div>
+
+		<div class="flex gap-4">
+			<button
+				type="submit"
+				disabled={isSubmitting}
+				class="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+			>
+				{#if isSubmitting}
+					<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+					<span>{m['profile.buttons_submittingText']()}</span>
+				{:else}
+					<span>{m['profile.buttons_submitText']()}</span>
+				{/if}
+			</button>
+		</div>
+	</form>
+
+	<!-- Dietary Preferences & Restrictions Section -->
+	{#if authStore.accessToken}
+		<div class="mt-12 space-y-6" id="dietary-section">
+			<div class="border-t pt-8">
+				<div class="mb-6">
+					<SectionHeader title={m['dietary.profile_heading']()} />
+					<p class="mt-2 text-sm text-muted-foreground">
+						{m['dietary.profile_description']()}
+					</p>
+
+					<!-- Visibility Info: composited tint mirrors ToneTile's audited info pair. -->
+					<div class="mt-4 flex gap-2 rounded-md border border-info/30 bg-info/10 p-3">
+						<Info class="h-5 w-5 flex-shrink-0 text-info" aria-hidden="true" />
+						<p class="text-sm text-foreground">
+							{m['dietary.profile_visibilityInfo']()}
+						</p>
+					</div>
+				</div>
+
+				<div class="space-y-8">
+					<DietaryPreferencesManager authToken={authStore.accessToken} />
+					<DietaryRestrictionsManager authToken={authStore.accessToken} />
+				</div>
+			</div>
+		</div>
+
+		<!-- Telegram Connection Section -->
+		<div class="mt-12" id="telegram-section">
+			<div class="border-t pt-8">
+				{#if features.telegram}
+					<TelegramConnectionManager authToken={authStore.accessToken} />
+				{:else}
+					<div
+						class="flex items-center gap-3 rounded-lg border border-dashed bg-muted/40 p-4 text-sm text-muted-foreground"
+					>
+						<Info class="h-4 w-4 shrink-0" aria-hidden="true" />
+						<span>{m['profile.telegramUnavailable']()}</span>
+					</div>
+				{/if}
+			</div>
+		</div>
+	{/if}
+
+	<!-- Referral Program Entry (FE #938)
+	     One quiet line for users who are NOT referrers yet — enrolled users
+	     already have the referral entries in the user menu and must not see
+	     both. Gated on the backend's `referral_applications` switch, which
+	     fails closed — and on `authStore.user` being loaded at all: it starts
+	     as null, so without that an enrolled referrer is shown the "apply"
+	     link for the length of the auth bootstrap and then has it taken away
+	     again. -->
+	{#if authStore.user && features.referral_applications && !isReferrer}
+		<div class="mt-12 border-t pt-8" id="referral-section">
+			<SectionHeader title={m['referralApply.accountTitle']()} />
+			<p class="mt-2 text-sm text-muted-foreground">{m['referralApply.accountBody']()}</p>
+			<a
+				href={resolve('/(public)/referral/apply', {})}
+				class="mt-4 inline-flex items-center gap-2 text-sm text-primary underline-offset-4 hover:underline"
+			>
+				<Gift class="h-4 w-4" aria-hidden="true" />
+				<span>{m['referralApply.accountCta']()}</span>
+			</a>
+		</div>
+	{/if}
+
+	<!-- Settings Link -->
+	<div class="mt-8 border-t pt-6">
+		<a
+			href={resolve('/(auth)/account/settings', {})}
+			class="inline-flex items-center gap-2 text-sm text-primary underline-offset-4 hover:underline"
+		>
+			<span>{m['profile.settingsLink_text']()}</span>
+			<span aria-hidden="true">→</span>
+		</a>
+	</div>
+</div>

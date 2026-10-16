@@ -1,0 +1,522 @@
+"""Tests for guest service layer functions."""
+
+from datetime import timedelta
+from decimal import Decimal
+from unittest.mock import Mock, patch
+from uuid import UUID
+
+import jwt
+import pytest
+from django.conf import settings
+from django.utils import timezone
+from ninja.errors import HttpError
+from ninja_jwt.token_blacklist.models import BlacklistedToken
+
+from accounts.models import RevelUser
+from events import schema
+from events.exceptions import GuestAccountExistsError, GuestCartTooLargeError
+from events.models import Event, EventRSVP, TicketTier
+from events.models.discount_code import DiscountCode
+from events.service import guest as guest_service
+from events.service.batch_ticket_service import CartGroup
+from events.service.event_manager import UserIsIneligibleError
+
+pytestmark = pytest.mark.django_db
+
+
+@pytest.mark.django_db(transaction=True)
+class TestGuestServiceLayer:
+    """Test guest service layer functions.
+
+    Uses ``transaction=True`` because ``handle_guest_rsvp`` and the non-online
+    branch of ``handle_guest_ticket_checkout`` schedule the confirmation email
+    via ``transaction.on_commit``. In default pytest-django mode the wrapping
+    transaction is rolled back and the callback never fires, breaking the
+    ``mock_send_email`` assertions.
+    """
+
+    def test_get_or_create_guest_user_creates_new(self) -> None:
+        """Test creating a new guest user."""
+        # Act
+        user = guest_service.get_or_create_guest_user("newuser@test.com", "New", "User")
+
+        # Assert
+        assert user.email == "newuser@test.com"
+        assert user.first_name == "New"
+        assert user.last_name == "User"
+        assert user.guest is True
+        assert user.is_active is True
+        assert user.email_verified is False
+        assert not user.has_usable_password()
+
+    def test_get_or_create_guest_user_preserves_existing_guest_name(self, existing_guest_user: RevelUser) -> None:
+        """Test that existing guest user's name is not overwritten."""
+        # Act
+        user = guest_service.get_or_create_guest_user(existing_guest_user.email, "Updated", "Name")
+
+        # Assert
+        assert user.id == existing_guest_user.id
+        assert user.first_name == "Old"
+        assert user.last_name == "Name"
+
+    def test_get_or_create_guest_user_rejects_non_guest(self, existing_regular_user: RevelUser) -> None:
+        """Test that attempting to create guest with existing non-guest email fails."""
+        # Act & Assert
+        with pytest.raises(GuestAccountExistsError):
+            guest_service.get_or_create_guest_user(existing_regular_user.email, "New", "Name")
+
+    def test_create_guest_rsvp_token(self, existing_guest_user: RevelUser, guest_event: Event) -> None:
+        """Test creating a guest RSVP JWT token."""
+        # Act
+        token = guest_service.create_guest_rsvp_token(existing_guest_user, guest_event.id, "yes")
+
+        # Assert
+        assert isinstance(token, str)
+
+        # Decode and verify
+        payload_decoded = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM], audience=settings.JWT_AUDIENCE
+        )
+        assert payload_decoded["type"] == "guest_rsvp"
+        assert payload_decoded["user_id"] == str(existing_guest_user.id)
+        assert payload_decoded["email"] == existing_guest_user.email
+        assert payload_decoded["event_id"] == str(guest_event.id)
+        assert payload_decoded["answer"] == "yes"
+        assert "jti" in payload_decoded
+        assert "exp" in payload_decoded
+
+    def test_create_guest_ticket_token(
+        self, existing_guest_user: RevelUser, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test creating a guest ticket JWT token."""
+        # Act
+        tickets = [schema.TicketPurchaseItem(guest_name="Test Guest")]
+        token = guest_service.create_guest_ticket_token(
+            existing_guest_user, guest_event_with_tickets.id, free_tier.id, tickets
+        )
+
+        # Assert
+        assert isinstance(token, str)
+
+        # Decode and verify
+        payload_decoded = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM], audience=settings.JWT_AUDIENCE
+        )
+        assert payload_decoded["type"] == "guest_ticket"
+        assert payload_decoded["user_id"] == str(existing_guest_user.id)
+        assert payload_decoded["email"] == existing_guest_user.email
+        assert payload_decoded["event_id"] == str(guest_event_with_tickets.id)
+        assert payload_decoded["tier_id"] == str(free_tier.id)
+        assert payload_decoded["pwyc_amount"] is None
+        assert len(payload_decoded["tickets"]) == 1
+        assert payload_decoded["tickets"][0]["guest_name"] == "Test Guest"
+
+    def test_create_guest_ticket_token_with_pwyc_amount(
+        self, existing_guest_user: RevelUser, guest_event_with_tickets: Event, pwyc_tier: TicketTier
+    ) -> None:
+        """Test creating a guest ticket JWT token with PWYC amount."""
+        # Act
+        pwyc_amount = Decimal("15.00")
+        tickets = [schema.TicketPurchaseItem(guest_name="PWYC Guest")]
+        token = guest_service.create_guest_ticket_token(
+            existing_guest_user, guest_event_with_tickets.id, pwyc_tier.id, tickets, pwyc_amount
+        )
+
+        # Assert
+        payload_decoded = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM], audience=settings.JWT_AUDIENCE
+        )
+        assert payload_decoded["pwyc_amount"] == "15.00"
+        assert len(payload_decoded["tickets"]) == 1
+
+    def test_validate_and_decode_guest_token_rsvp(self, existing_guest_user: RevelUser, guest_event: Event) -> None:
+        """Test validating and decoding a guest RSVP token."""
+        # Arrange
+        token = guest_service.create_guest_rsvp_token(existing_guest_user, guest_event.id, "no")
+
+        # Act
+        payload = guest_service.validate_and_decode_guest_token(token)
+
+        # Assert
+        assert isinstance(payload, schema.GuestRSVPJWTPayloadSchema)
+        assert payload.user_id == existing_guest_user.id
+        assert payload.event_id == guest_event.id
+        assert payload.answer == "no"
+
+    def test_validate_and_decode_guest_token_ticket(
+        self, existing_guest_user: RevelUser, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test validating and decoding a guest ticket token."""
+        # Arrange
+        tickets = [schema.TicketPurchaseItem(guest_name="Test Guest")]
+        token = guest_service.create_guest_ticket_token(
+            existing_guest_user, guest_event_with_tickets.id, free_tier.id, tickets
+        )
+
+        # Act
+        payload = guest_service.validate_and_decode_guest_token(token)
+
+        # Assert
+        assert isinstance(payload, schema.GuestTicketJWTPayloadSchema)
+        assert payload.user_id == existing_guest_user.id
+        assert payload.event_id == guest_event_with_tickets.id
+        assert payload.tier_id == free_tier.id
+        assert len(payload.tickets) == 1
+        assert payload.tickets[0].guest_name == "Test Guest"
+
+    def test_create_guest_ticket_token_with_accessible_required(
+        self, existing_guest_user: RevelUser, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test that accessible_required is embedded in the token and survives the roundtrip."""
+        # Arrange
+        tickets = [schema.TicketPurchaseItem(guest_name="Accessible Guest")]
+        token = guest_service.create_guest_ticket_token(
+            existing_guest_user, guest_event_with_tickets.id, free_tier.id, tickets, accessible_required=True
+        )
+
+        # Act
+        payload = guest_service.validate_and_decode_guest_token(token)
+
+        # Assert
+        assert isinstance(payload, schema.GuestTicketJWTPayloadSchema)
+        assert payload.accessible_required is True
+
+    def test_create_guest_ticket_token_single_tier_form_carries_attribution(
+        self, existing_guest_user: RevelUser, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """#922: the legacy single-tier form embeds attribution in the token like the cart form does."""
+        # Arrange
+        tickets = [schema.TicketPurchaseItem(guest_name="Attributed Guest")]
+        token = guest_service.create_guest_ticket_token(
+            existing_guest_user,
+            guest_event_with_tickets.id,
+            free_tier.id,
+            tickets,
+            attribution={"utm_source": "newsletter", "utm_campaign": "spring"},
+        )
+
+        # Act
+        payload = guest_service.validate_and_decode_guest_token(token)
+
+        # Assert
+        assert isinstance(payload, schema.GuestTicketJWTPayloadSchema)
+        assert payload.attribution == {"utm_source": "newsletter", "utm_campaign": "spring"}
+
+    def test_create_guest_ticket_token_accessible_required_defaults_false(
+        self, existing_guest_user: RevelUser, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test that a token created without the flag decodes with accessible_required=False."""
+        # Arrange
+        tickets = [schema.TicketPurchaseItem(guest_name="Regular Guest")]
+        token = guest_service.create_guest_ticket_token(
+            existing_guest_user, guest_event_with_tickets.id, free_tier.id, tickets
+        )
+
+        # Act
+        payload = guest_service.validate_and_decode_guest_token(token)
+
+        # Assert
+        assert isinstance(payload, schema.GuestTicketJWTPayloadSchema)
+        assert payload.accessible_required is False
+
+    def test_validate_and_decode_legacy_token_without_accessible_required(
+        self, existing_guest_user: RevelUser, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test that legacy tokens minted before accessible_required existed still validate."""
+        # Arrange: build a legacy-shaped payload (no accessible_required key at all)
+        raw_payload = schema.GuestTicketJWTPayloadSchema(
+            user_id=existing_guest_user.id,
+            email=existing_guest_user.email,
+            event_id=guest_event_with_tickets.id,
+            tier_id=free_tier.id,
+            tickets=[schema.GuestTicketItemPayload(guest_name="Legacy Guest")],
+            exp=timezone.now() + timedelta(hours=1),
+            jti="legacy-jti",
+        ).model_dump(mode="json")
+        raw_payload.pop("accessible_required")
+        legacy_token = jwt.encode(raw_payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+        # Act
+        payload = guest_service.validate_and_decode_guest_token(legacy_token)
+
+        # Assert: validates via the discriminated union and defaults to False
+        assert isinstance(payload, schema.GuestTicketJWTPayloadSchema)
+        assert payload.accessible_required is False
+        assert payload.tickets[0].guest_name == "Legacy Guest"
+
+    def test_validate_and_decode_guest_token_rejects_expired(
+        self, existing_guest_user: RevelUser, guest_event: Event
+    ) -> None:
+        """Test that an expired token raises HttpError 400."""
+        # Arrange
+        past_time = timezone.now() - timedelta(hours=2)
+        payload = schema.GuestRSVPJWTPayloadSchema(
+            user_id=existing_guest_user.id,
+            email=existing_guest_user.email,
+            event_id=guest_event.id,
+            answer="yes",
+            exp=past_time,
+            jti="expired-jti",
+        )
+        expired_token = jwt.encode(
+            payload.model_dump(mode="json"), settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM
+        )
+
+        # Act & Assert
+        with pytest.raises(HttpError) as exc_info:
+            guest_service.validate_and_decode_guest_token(expired_token)
+
+        assert exc_info.value.status_code == 400
+        assert "expired" in str(exc_info.value.message).lower()
+
+    def test_validate_and_decode_guest_token_rejects_tampered(self) -> None:
+        """Test that a tampered/garbled token raises HttpError 400."""
+        with pytest.raises(HttpError) as exc_info:
+            guest_service.validate_and_decode_guest_token("not.a.valid.jwt")
+
+        assert exc_info.value.status_code == 400
+        assert "invalid token" in str(exc_info.value.message).lower()
+
+    def test_validate_and_decode_guest_token_rejects_wrong_key(
+        self, existing_guest_user: RevelUser, guest_event: Event
+    ) -> None:
+        """Test that a token signed with a different key raises HttpError 400."""
+        # Arrange
+        payload = schema.GuestRSVPJWTPayloadSchema(
+            user_id=existing_guest_user.id,
+            email=existing_guest_user.email,
+            event_id=guest_event.id,
+            answer="yes",
+            exp=timezone.now() + timedelta(hours=1),
+            jti="wrong-key-jti",
+        )
+        wrong_key_token = jwt.encode(
+            payload.model_dump(mode="json"), "wrong-secret-key", algorithm=settings.JWT_ALGORITHM
+        )
+
+        # Act & Assert
+        with pytest.raises(HttpError) as exc_info:
+            guest_service.validate_and_decode_guest_token(wrong_key_token)
+
+        assert exc_info.value.status_code == 400
+        assert "invalid token" in str(exc_info.value.message).lower()
+
+    def test_validate_and_decode_guest_token_rejects_invalid_payload(self) -> None:
+        """Test that a valid JWT with an invalid payload structure raises HttpError 400."""
+        # Arrange: valid JWT but payload doesn't match the discriminated union schema
+        raw_payload = {
+            "type": "guest_rsvp",
+            "user_id": "not-a-uuid",
+            "aud": settings.JWT_AUDIENCE,
+        }
+        token = jwt.encode(raw_payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+        # Act & Assert
+        with pytest.raises(HttpError) as exc_info:
+            guest_service.validate_and_decode_guest_token(token)
+
+        assert exc_info.value.status_code == 400
+        assert "invalid token payload" in str(exc_info.value.message).lower()
+
+    def test_validate_and_decode_guest_token_rejects_unknown_type(self) -> None:
+        """Test that a valid JWT with an unrecognized type discriminator raises HttpError 400."""
+        # Arrange
+        raw_payload = {
+            "type": "unknown_type",
+            "user_id": "550e8400-e29b-41d4-a716-446655440000",
+            "email": "test@test.com",
+            "aud": settings.JWT_AUDIENCE,
+        }
+        token = jwt.encode(raw_payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
+
+        # Act & Assert
+        with pytest.raises(HttpError) as exc_info:
+            guest_service.validate_and_decode_guest_token(token)
+
+        assert exc_info.value.status_code == 400
+        assert "invalid token payload" in str(exc_info.value.message).lower()
+
+    @patch("events.tasks.send_guest_rsvp_confirmation.delay")
+    def test_handle_guest_rsvp(self, mock_send_email: Mock, guest_event: Event) -> None:
+        """Test handle_guest_rsvp service function."""
+        # Act
+        result = guest_service.handle_guest_rsvp(
+            guest_event, EventRSVP.RsvpStatus.YES, "service@test.com", "Service", "Test"
+        )
+
+        # Assert
+        assert isinstance(result, schema.GuestActionResponseSchema)
+        assert "email" in result.message.lower()
+
+        # Verify user was created
+        user = RevelUser.objects.get(email="service@test.com")
+        assert user.guest is True
+
+        # Verify email was sent
+        mock_send_email.assert_called_once()
+
+    @patch("events.tasks.send_guest_ticket_confirmation.delay")
+    def test_handle_guest_ticket_checkout_offline(
+        self, mock_send_email: Mock, guest_event_with_tickets: Event, offline_tier: TicketTier
+    ) -> None:
+        """Test handle_guest_ticket_checkout for offline payment (cart form, #846)."""
+        # Act
+        tickets = [schema.TicketPurchaseItem(guest_name="Offline Test")]
+        group = CartGroup(tier=offline_tier, items=tickets)
+        result = guest_service.handle_guest_ticket_checkout(
+            guest_event_with_tickets, [group], "offline@test.com", "Offline", "Test"
+        )
+
+        # Assert
+        assert isinstance(result, schema.GuestCheckoutResponseSchema)
+        assert result.message is not None
+        assert result.checkout_url is None
+        mock_send_email.assert_called_once()
+
+    @patch("events.tasks.send_guest_ticket_confirmation.delay")
+    def test_handle_guest_ticket_checkout_rejects_oversized_cart(
+        self, mock_send_email: Mock, guest_event_with_tickets: Event, offline_tier: TicketTier
+    ) -> None:
+        """A cart whose confirmation JWT would blow past the URL budget is a 400, not an email.
+
+        The non-online branch serializes the WHOLE cart into the emailed link's
+        token; a wide cart of long holder names mints a token mail clients and
+        proxies truncate, so the buyer would get a 200 and a dead link. The guard
+        must fire BEFORE the confirmation task is queued.
+        """
+        items = [schema.TicketPurchaseItem(guest_name="N" * 255) for _ in range(50)]
+        group = CartGroup(tier=offline_tier, items=items)
+
+        with pytest.raises(GuestCartTooLargeError):
+            guest_service.handle_guest_ticket_checkout(
+                guest_event_with_tickets, [group], "biggie@test.com", "Big", "Cart"
+            )
+
+        mock_send_email.assert_not_called()
+
+    def test_handle_guest_ticket_checkout_large_cart_with_discount(
+        self, guest_event_with_tickets: Event, online_tier: TicketTier
+    ) -> None:
+        """A >50-ticket legacy cart with a discount code must not 500 (#893 review).
+
+        The deprecated single-tier guest payload has no upper bound on ``tickets``,
+        but the discount step used to re-validate the cart through the wire
+        schema's 50-item cap — turning such carts into an unhandled pydantic
+        ValidationError instead of a checkout.
+        """
+        guest_event_with_tickets.max_tickets_per_user = None
+        guest_event_with_tickets.save(update_fields=["max_tickets_per_user"])
+        DiscountCode.objects.create(
+            code="BIG10",
+            organization=guest_event_with_tickets.organization,
+            discount_type=DiscountCode.DiscountType.PERCENTAGE,
+            discount_value=Decimal("10.00"),
+            currency="EUR",
+            is_active=True,
+            max_uses_per_user=100,
+        )
+        items = [schema.TicketPurchaseItem(guest_name=f"Guest {i}") for i in range(51)]
+        group = CartGroup(tier=online_tier, items=items)
+
+        result = guest_service.handle_guest_ticket_checkout(
+            guest_event_with_tickets,
+            [group],
+            "bigdiscount@test.com",
+            "Big",
+            "Discount",
+            discount_code="BIG10",
+        )
+
+        assert result.requires_payment is True
+        assert isinstance(result.reservation_id, UUID)
+
+    @patch("events.tasks.send_guest_ticket_confirmation.delay")
+    def test_handle_guest_ticket_checkout_ordinary_cart_is_unaffected(
+        self, mock_send_email: Mock, guest_event_with_tickets: Event, offline_tier: TicketTier
+    ) -> None:
+        """A realistic multi-ticket cart stays comfortably under the token ceiling."""
+        items = [schema.TicketPurchaseItem(guest_name=f"Guest {i}") for i in range(6)]
+        group = CartGroup(tier=offline_tier, items=items)
+
+        result = guest_service.handle_guest_ticket_checkout(
+            guest_event_with_tickets, [group], "normal@test.com", "Normal", "Cart"
+        )
+
+        assert result.message is not None
+        mock_send_email.assert_called_once()
+
+    def test_handle_guest_ticket_checkout_online(
+        self, guest_event_with_tickets: Event, online_tier: TicketTier
+    ) -> None:
+        """Online guest checkout should reserve (reservation_id, no checkout_url) without calling Stripe (#632)."""
+        # Act
+        tickets = [schema.TicketPurchaseItem(guest_name="Stripe Test")]
+        group = CartGroup(tier=online_tier, items=tickets)
+        with patch("stripe.checkout.Session.create") as mock_stripe:
+            result = guest_service.handle_guest_ticket_checkout(
+                guest_event_with_tickets, [group], "stripe@test.com", "Stripe", "Test"
+            )
+            mock_stripe.assert_not_called()
+
+        # Assert
+        assert isinstance(result, schema.GuestCheckoutResponseSchema)
+        assert result.requires_payment is True
+        assert isinstance(result.reservation_id, UUID)
+        assert result.checkout_url is None
+
+    def test_handle_guest_ticket_checkout_validates_pwyc_min(
+        self, guest_event_with_tickets: Event, pwyc_tier: TicketTier
+    ) -> None:
+        """Test that PWYC amount validation works in service layer."""
+        # Act & Assert
+        tickets = [schema.TicketPurchaseItem(guest_name="Test User")]
+        group = CartGroup(tier=pwyc_tier, items=tickets, pwyc_amount=Decimal("1.00"))  # Below min of 5.00
+        with pytest.raises(Exception) as exc_info:
+            guest_service.handle_guest_ticket_checkout(
+                guest_event_with_tickets,
+                [group],
+                "test@test.com",
+                "Test",
+                "User",
+            )
+        assert "at least" in str(exc_info.value).lower()
+
+    def test_handle_guest_ticket_checkout_validates_pwyc_max(
+        self, guest_event_with_tickets: Event, pwyc_tier: TicketTier
+    ) -> None:
+        """Test that PWYC max validation works in service layer."""
+        # Act & Assert
+        tickets = [schema.TicketPurchaseItem(guest_name="Test User")]
+        group = CartGroup(tier=pwyc_tier, items=tickets, pwyc_amount=Decimal("100.00"))  # Above max of 50.00
+        with pytest.raises(Exception) as exc_info:
+            guest_service.handle_guest_ticket_checkout(
+                guest_event_with_tickets,
+                [group],
+                "test@test.com",
+                "Test",
+                "User",
+            )
+        assert "at most" in str(exc_info.value).lower()
+
+    def test_confirm_guest_action_atomic_transaction(self, guest_event: Event, existing_guest_user: RevelUser) -> None:
+        """Test that confirm_guest_action is atomic (token blacklisted only on success)."""
+        # Arrange: Create token for an event that will fail capacity check
+        guest_event.max_attendees = 1
+        guest_event.save()
+
+        token = guest_service.create_guest_rsvp_token(existing_guest_user, guest_event.id, "yes")
+        # Fill the single seat with a *different* user so the guest's YES confirmation is a
+        # genuine new seat-claim that fails the capacity check (the guest has no prior RSVP,
+        # so it isn't a downgrade). See #691.
+        filler = RevelUser.objects.create_user(username="filler_guest", email="filler_guest@example.com")
+        EventRSVP.objects.create(user=filler, event=guest_event, status="yes")
+
+        # Act & Assert
+        with pytest.raises(UserIsIneligibleError):
+            guest_service.confirm_guest_action(token)
+
+        # Token should NOT be blacklisted since transaction rolled back
+        payload_decoded = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM], audience=settings.JWT_AUDIENCE
+        )
+        assert not BlacklistedToken.objects.filter(token__jti=payload_decoded["jti"]).exists()

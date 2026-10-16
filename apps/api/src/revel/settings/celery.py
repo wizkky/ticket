@@ -1,0 +1,30 @@
+from decouple import config
+
+from .base import DEBUG, REDIS_HOST, REDIS_PORT, TIME_ZONE
+
+CELERY_REDIS_DB = config("CELERY_REDIS_DB", default=0, cast=int)
+
+# CELERY
+CELERY_BROKER_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}/{CELERY_REDIS_DB}"
+CELERY_ACCEPT_CONTENT = ["application/json"]
+CELERY_RESULT_EXTENDED = True
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_RESULT_BACKEND = "django-db"
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_ALWAYS_EAGER = config("CELERY_TASK_ALWAYS_EAGER", cast=bool, default=DEBUG)
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+
+# Keep Django's structlog logging config: don't let the Celery worker hijack the root
+# logger at startup and replace our JSON ``ProcessorFormatter`` with its own text formatter
+# (which wraps every line in a ``[timestamp: LEVEL/Worker]`` banner, breaking JSON parsing
+# and mislabelling the stream level for the ``celery_default``/``beat`` services). Task
+# context (``task_id``/``task_name``/``trace_id``) is bound independently via
+# ``structlog.contextvars`` in the ``task_prerun`` signal, so it survives unchanged. See #478.
+CELERY_WORKER_HIJACK_ROOT_LOGGER = False
+
+# Task execution settings
+CELERY_TASK_TIME_LIMIT = 300  # Hard limit: kill task after 5 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 240  # Soft limit: raise exception after 4 minutes
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1  # Only prefetch 1 task at a time (important for solo pool)
+CELERY_TASK_ACKS_LATE = True  # Acknowledge tasks after completion (prevent task loss)

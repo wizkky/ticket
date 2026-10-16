@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, feature/*]
+  pull_request:
+    branches: [main, develop]
+
+# Least-privilege default for every job in this workflow (it only reads the repo).
+permissions:
+  contents: read
+
+jobs:
+  # Lint and type check
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        # Version is read from the "packageManager" field in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Run Prettier
+        run: pnpm prettier --check .
+
+      - name: Run ESLint
+        run: pnpm lint
+
+      # svelte-check resolves $lib/paraglide/messages, which is gitignored and
+      # generated — compile it first or every message reference is a type error.
+      - name: Compile translations
+        run: pnpm paraglide:compile
+
+      - name: Run SvelteKit type check
+        run: pnpm check
+
+      # The step above passed vacuously for an unknown number of merges (#704):
+      # svelte-check reported "0 errors" over a program that contained no
+      # project files. Only injecting a known type error and asserting it is
+      # reported can detect that — a green run and the scanned-file count both
+      # look identical either way.
+      - name: Assert the type gate is armed
+        run: ./scripts/check-type-gate-armed.sh
+
+      # The three make-check gates below previously ran only locally — anything
+      # committed without `make check` (web edits, external PRs) escaped them.
+      - name: Check file lengths
+        run: ./scripts/check-file-length.sh
+
+      - name: Guard against SSR access-token leaks
+        run: ./scripts/check-no-ssr-token.sh
+
+      - name: Audit image alt text
+        run: pnpm audit:images
+
+  # Unit tests (vitest), split across runners. Vitest's --shard divides test
+  # files evenly by count; `strategy.job-total` keeps the split in step with
+  # the matrix size.
+  test-shard:
+    name: Unit Tests (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        # Version is read from the "packageManager" field in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Tests render components that import $lib/paraglide/messages (gitignored,
+      # generated) — compile first, same as the lint job.
+      - name: Compile translations
+        run: pnpm paraglide:compile
+
+      - name: Run unit tests (shard ${{ matrix.shard }})
+        run: pnpm test --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+
+  # The branch ruleset requires a check named "Unit Tests"; matrix jobs report
+  # under per-shard names, so this job carries the required name and fails
+  # unless every shard passed (a skipped or cancelled shard counts as failure).
+  test:
+    name: Unit Tests
+    needs: test-shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every shard to pass
+        run: test "${{ needs.test-shard.result }}" = success
+
+  # Test translations
+  i18n:
+    name: Translation Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Validate translations
+        run: node scripts/validate-translations.js
+
+      - name: Guard against untranslated copy (value identical to English)
+        run: node scripts/check-i18n-untranslated.mjs
+
+      - name: Guard against new hardcoded (untranslated) strings
+        run: node scripts/check-i18n-hardcoded.mjs
+
+      - name: Check translation file formatting
+        run: |
+          for file in messages/*.json; do
+            echo "Checking $file..."
+            node -e "JSON.parse(require('fs').readFileSync('$file', 'utf-8'))" || exit 1
+          done
+
+  # Build check
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [i18n]
+    if: always()
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pnpm
+        # Version is read from the "packageManager" field in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Compile translations
+        run: pnpm paraglide:compile
+
+      - name: Read version from package.json
+        run: echo "VERSION=$(jq -r '.version' package.json)" >> "$GITHUB_ENV"
+
+      - name: Build application
+        run: pnpm build
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+          PUBLIC_API_URL: http://localhost:8000
+          PUBLIC_VERSION: ${{ env.VERSION }}
+
+      - name: Check build artifacts
+        run: |
+          if [ ! -d "build" ]; then
+            echo "Build directory not found!"
+            exit 1
+          fi
+          echo "Build successful! Artifacts:"
+          ls -lah build/ | head -20

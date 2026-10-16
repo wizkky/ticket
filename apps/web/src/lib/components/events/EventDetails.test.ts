@@ -1,0 +1,123 @@
+import { render, screen } from '@testing-library/svelte';
+import { describe, it, expect } from 'vitest';
+import EventDetails from './EventDetails.svelte';
+import type { EventDetailSchema } from '$lib/api/generated/types.gen';
+
+function createMockEvent(overrides: Partial<EventDetailSchema> = {}): EventDetailSchema {
+	return {
+		id: '123e4567-e89b-12d3-a456-426614174000',
+		name: 'Test Event',
+		slug: 'test-event',
+		description: 'A test event',
+		invitation_message: null,
+		start: '2025-12-01T18:00:00Z',
+		end: '2025-12-01T22:00:00Z',
+		rsvp_before: null,
+		max_attendees: 0,
+		attendee_count: 0,
+		waitlist_open: false,
+		event_type: 'public',
+		visibility: 'public',
+		status: 'approved',
+		requires_ticket: false,
+		potluck_open: false,
+		logo: null,
+		cover_art: null,
+		address: null,
+		city: null,
+		tags: [],
+		organization: {
+			id: '456',
+			name: 'Test Org',
+			slug: 'test-org',
+			logo: null,
+			description: 'Test organization',
+			website: null,
+			instagram: null,
+			facebook: null,
+			linkedin: null,
+			twitter: null,
+			member_count: 10
+		},
+		event_series: null,
+		is_open_ended: false,
+		...overrides
+	} as EventDetailSchema;
+}
+
+describe('EventDetails — open-ended end display', () => {
+	it('shows the end time for a timed event', () => {
+		render(EventDetails, { props: { event: createMockEvent() } });
+		expect(screen.getByText(/Ends/i)).toBeInTheDocument();
+	});
+
+	it('hides the end time and shows the open-ended hint when is_open_ended', () => {
+		render(EventDetails, { props: { event: createMockEvent({ is_open_ended: true }) } });
+		expect(screen.queryByText(/Ends/i)).not.toBeInTheDocument();
+		expect(screen.getByText(/Open-ended/i)).toBeInTheDocument();
+	});
+});
+
+describe('EventDetails — capacity disclosure', () => {
+	it('reports remaining spots when both numbers are disclosed', () => {
+		const event = createMockEvent({ max_attendees: 50, attendee_count: 45 });
+		render(EventDetails, { props: { event } });
+		expect(screen.getByText(/Only 5 spots left/i)).toBeInTheDocument();
+	});
+
+	it('says the event is full when the capacity is reached', () => {
+		const event = createMockEvent({ max_attendees: 50, attendee_count: 50 });
+		render(EventDetails, { props: { event } });
+		expect(screen.getByText(/Event is full/i)).toBeInTheDocument();
+	});
+
+	// #825 regression guard: a withheld `max_attendees` is null, and the previous
+	// `=== undefined` guard let it through — `null - count` is negative, so the
+	// card claimed "Event is full" for every discreet event.
+	it('says nothing about capacity when max_attendees is withheld', () => {
+		const event = createMockEvent({ max_attendees: null, attendee_count: 12 });
+		render(EventDetails, { props: { event } });
+		expect(screen.queryByText(/Event is full/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/spots left/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/attending/i)).not.toBeInTheDocument();
+	});
+
+	it('says nothing about capacity when attendee_count is withheld', () => {
+		const event = createMockEvent({ max_attendees: 50, attendee_count: null });
+		render(EventDetails, { props: { event } });
+		expect(screen.queryByText(/Event is full/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/spots left/i)).not.toBeInTheDocument();
+	});
+
+	// #690: `is_full` is always public, so the one fact the organizer cannot hide
+	// still gets said even when both numbers are withheld.
+	it('still says the event is full when the numbers are withheld but is_full is set', () => {
+		const event = createMockEvent({ max_attendees: null, attendee_count: null, is_full: true });
+		render(EventDetails, { props: { event } });
+		expect(screen.getByText(/Event is full/i)).toBeInTheDocument();
+	});
+
+	// Deliberately no "limited spots" hedge: `is_full === false` is equally true
+	// of an uncapped event, so a scarcity cue there would be invented.
+	it('omits the attendance row entirely when the numbers are withheld and it is not full', () => {
+		const event = createMockEvent({ max_attendees: null, attendee_count: null, is_full: false });
+		render(EventDetails, { props: { event } });
+		expect(screen.queryByText(/Attendance/i)).not.toBeInTheDocument();
+	});
+});
+
+describe('EventDetails — RSVP deadline', () => {
+	// PR #812 regression guard: getRSVPDeadlineRelative returns null for a passed
+	// deadline; the tile must keep showing the translated closed copy, not vanish
+	// (null here means "closed", not "no deadline set").
+	it('shows "RSVP closed" when the deadline has passed', () => {
+		const event = createMockEvent({ rsvp_before: '2020-01-01T00:00:00Z' });
+		render(EventDetails, { props: { event } });
+		expect(screen.getByText(/RSVP closed/i)).toBeInTheDocument();
+	});
+
+	it('omits the deadline tile when no deadline is set', () => {
+		render(EventDetails, { props: { event: createMockEvent({ rsvp_before: null }) } });
+		expect(screen.queryByText(/RSVP Deadline/i)).not.toBeInTheDocument();
+	});
+});

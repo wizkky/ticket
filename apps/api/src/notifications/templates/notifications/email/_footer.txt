@@ -1,0 +1,7 @@
+{% load i18n %}{% if context.event_start_formatted %}{% include "notifications/email/_timezone_note.txt" %}
+{% endif %}{{ context.org_signature_md }}
+
+---
+{% if context.is_mandatory_notification %}{% trans "Manage notification preferences:" %}{% else %}{% trans "Unsubscribe or manage notification preferences:" %}{% endif %} {{ context.unsubscribe_link }}
+
+let's revel.

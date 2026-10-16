@@ -1,0 +1,611 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { enhance } from '$app/forms';
+	import type { ActionData } from './$types';
+	import {
+		Trash2,
+		AlertTriangle,
+		Mail,
+		Loader2,
+		Download,
+		Check,
+		FileIcon,
+		FolderOpen
+	} from '@lucide/svelte';
+	import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
+	import { questionnairefileListFiles, questionnairefileDeleteFile } from '$lib/api/generated';
+	import type { QuestionnaireFileSchema } from '$lib/api/generated';
+	import { getImageUrl } from '$lib/utils';
+	import { Button } from '$lib/components/ui/button';
+	import AudioPlayer from '$lib/components/questionnaires/AudioPlayer.svelte';
+	import { isAudio } from '$lib/utils/audio';
+	import PageHeader from '$lib/components/common/PageHeader.svelte';
+	import SectionHeader from '$lib/components/common/SectionHeader.svelte';
+	import EmptyState from '$lib/components/common/EmptyState.svelte';
+
+	interface Props {
+		form: ActionData;
+	}
+
+	const { form }: Props = $props();
+
+	// State for confirmation modal
+	let showDeletionModal = $state(false);
+	let confirmed = $state(false);
+	let isSubmitting = $state(false);
+	let isExporting = $state(false);
+
+	// Files section state
+	let deletingFileId = $state<string | null>(null);
+	let showFileDeleteModal = $state(false);
+	let fileToDelete = $state<QuestionnaireFileSchema | null>(null);
+
+	// Success states
+	const success = $derived(form?.success || false);
+	const exportSuccess = $derived(form?.exportSuccess || false);
+
+	// Error handling
+	const errors = $derived((form?.errors || {}) as Record<string, string>);
+
+	// Query client for cache invalidation
+	const queryClient = useQueryClient();
+
+	// Query for user's files
+	const filesQuery = createQuery(() => ({
+		queryKey: ['user-files'],
+		queryFn: async () => {
+			const response = await questionnairefileListFiles({
+				query: { page: 1, page_size: 100 }
+			});
+			return response.data?.results || [];
+		}
+	}));
+
+	// Mutation for deleting files
+	// The generated client resolves with `{ error }` on HTTP errors, so the
+	// mutationFn must throw it; with no local onError, the failure then reaches
+	// the global mutation handler (root layout), which toasts it.
+	const deleteMutation = createMutation(() => ({
+		mutationFn: async (fileId: string) => {
+			const res = await questionnairefileDeleteFile({ path: { file_id: fileId } });
+			if (res.error) throw res.error;
+			return fileId;
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['user-files'] });
+			queryClient.invalidateQueries({ queryKey: ['questionnaire-files'] });
+		},
+		onSettled: () => {
+			deletingFileId = null;
+		}
+	}));
+
+	function openFileDeleteModal(file: QuestionnaireFileSchema) {
+		fileToDelete = file;
+		showFileDeleteModal = true;
+	}
+
+	function closeFileDeleteModal() {
+		showFileDeleteModal = false;
+		fileToDelete = null;
+	}
+
+	function confirmDeleteFile() {
+		if (!fileToDelete) return;
+		deletingFileId = fileToDelete.id;
+		deleteMutation.mutate(fileToDelete.id);
+		closeFileDeleteModal();
+	}
+
+	function formatFileSize(bytes: number): string {
+		if (bytes === 0) return '0 B';
+		const k = 1024;
+		const sizes = ['B', 'KB', 'MB', 'GB'];
+		const i = Math.floor(Math.log(bytes) / Math.log(k));
+		return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+	}
+
+	function isImage(mimeType: string): boolean {
+		return mimeType.startsWith('image/');
+	}
+
+	function openDeletionModal() {
+		showDeletionModal = true;
+		confirmed = false;
+	}
+
+	function closeDeletionModal() {
+		showDeletionModal = false;
+		confirmed = false;
+	}
+</script>
+
+<svelte:head>
+	<title>{m['accountPrivacyPage.pageTitle']()}</title>
+	<meta name="description" content={m['accountPrivacyPage.pageDescription']()} />
+</svelte:head>
+
+<div class="container mx-auto max-w-4xl px-4 py-8">
+	<PageHeader
+		kicker={m['myInvoices.account']()}
+		title={m['accountPrivacyPage.title']()}
+		subtitle={m['accountPrivacyPage.subtitle']()}
+		class="mb-8"
+	/>
+
+	<!-- Success Message -->
+	{#if success}
+		<!-- Composited tint mirrors ToneTile's audited success pair (>=3:1 vs
+		     background/card); body copy stays on --foreground/--muted-foreground. -->
+		<div role="status" class="mb-8 rounded-md border border-success/30 bg-success/10 p-6">
+			<div class="flex items-start gap-3">
+				<Mail class="h-6 w-6 flex-shrink-0 text-success" aria-hidden="true" />
+				<div class="flex-1 space-y-2">
+					<p class="text-sm font-medium text-foreground">
+						{m['accountPrivacyPage.deletionEmailSent']()}
+					</p>
+					<p class="text-sm text-muted-foreground">
+						{m['accountPrivacyPage.deletionEmailBody']()}
+					</p>
+					<p class="text-xs text-muted-foreground">
+						{m['accountPrivacyPage.deletionEmailIgnore']()}
+					</p>
+				</div>
+			</div>
+		</div>
+	{/if}
+
+	<!-- Error Message -->
+	{#if errors.form}
+		<div role="alert" class="mb-8 rounded-md border border-destructive bg-destructive/10 p-4">
+			<p class="text-sm font-medium text-destructive">{errors.form}</p>
+		</div>
+	{/if}
+
+	<!-- Data Export Section -->
+	<section class="mb-12 rounded-lg border border-border bg-card p-6">
+		<div class="flex items-start gap-4">
+			<div
+				class="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-primary/10"
+			>
+				<Download class="h-6 w-6 text-primary" aria-hidden="true" />
+			</div>
+			<div class="flex-1">
+				<SectionHeader title={m['accountPrivacyPage.exportDataTitle']()} class="flex-1" />
+				<p class="mt-2 text-sm text-muted-foreground">
+					{m['accountPrivacyPage.exportDataDescription']()}
+				</p>
+
+				<!-- Export Success Message -->
+				{#if exportSuccess}
+					<!-- Composited tint mirrors ToneTile's audited success pair. -->
+					<div role="status" class="mt-4 rounded-md border border-success/30 bg-success/10 p-4">
+						<div class="flex items-start gap-2">
+							<Check class="h-5 w-5 flex-shrink-0 text-success" aria-hidden="true" />
+							<div class="flex-1">
+								<p class="text-sm font-medium text-foreground">
+									{m['accountPrivacyPage.exportRequestReceived']()}
+								</p>
+								<p class="mt-1 text-sm text-muted-foreground">
+									{m['accountPrivacyPage.exportEmailNote']()}
+								</p>
+							</div>
+						</div>
+					</div>
+				{/if}
+
+				<!-- Export Error Message -->
+				{#if errors.exportForm}
+					<div role="alert" class="mt-4 rounded-md border border-destructive bg-destructive/10 p-4">
+						<p class="text-sm font-medium text-destructive">{errors.exportForm}</p>
+					</div>
+				{/if}
+
+				<div class="mt-4">
+					<h3 class="text-sm font-medium">{m['accountPrivacyPage.whatsIncluded']()}</h3>
+					<ul class="mt-2 space-y-1 text-sm text-muted-foreground">
+						<li class="flex items-center gap-2">
+							<span class="text-primary">•</span>
+							{m['accountPrivacyPage.export_profileInfo']()}
+						</li>
+						<li class="flex items-center gap-2">
+							<span class="text-primary">•</span>
+							{m['accountPrivacyPage.export_eventRsvps']()}
+						</li>
+						<li class="flex items-center gap-2">
+							<span class="text-primary">•</span>
+							{m['accountPrivacyPage.export_questionnaires']()}
+						</li>
+						<li class="flex items-center gap-2">
+							<span class="text-primary">•</span>
+							{m['accountPrivacyPage.export_organizations']()}
+						</li>
+					</ul>
+				</div>
+
+				<form
+					method="POST"
+					action="?/exportData"
+					use:enhance={() => {
+						if (isExporting) return;
+						isExporting = true;
+
+						return async ({ update }) => {
+							isExporting = false;
+							await update();
+						};
+					}}
+					class="mt-6"
+				>
+					<button
+						type="submit"
+						disabled={isExporting || exportSuccess}
+						class="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						{#if isExporting}
+							<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+							<span>{m['accountPrivacyPage.requestingExport']()}</span>
+						{:else if exportSuccess}
+							<Check class="h-4 w-4" aria-hidden="true" />
+							<span>{m['accountPrivacyPage.exportRequested']()}</span>
+						{:else}
+							<Download class="h-4 w-4" aria-hidden="true" />
+							<span>{m['accountPrivacyPage.requestDataExport']()}</span>
+						{/if}
+					</button>
+					<p class="mt-2 text-xs text-muted-foreground">
+						{m['accountPrivacyPage.exportLimitNote']()}
+					</p>
+				</form>
+			</div>
+		</div>
+	</section>
+
+	<!-- Your Files Section -->
+	<section class="mb-12 rounded-lg border border-border bg-card p-6">
+		<div class="flex items-start gap-4">
+			<div
+				class="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-primary/10"
+			>
+				<FolderOpen class="h-6 w-6 text-primary" aria-hidden="true" />
+			</div>
+			<div class="flex-1">
+				<SectionHeader title={m['accountPrivacyPage.yourFilesTitle']()} class="flex-1" />
+				<p class="mt-2 text-sm text-muted-foreground">
+					{m['accountPrivacyPage.yourFilesDescription']()}
+				</p>
+
+				<div class="mt-6">
+					{#if filesQuery.isPending}
+						<div class="flex items-center justify-center py-8">
+							<Loader2 class="h-6 w-6 animate-spin text-muted-foreground" aria-hidden="true" />
+							<span class="ml-2 text-sm text-muted-foreground"
+								>{m['accountPrivacyPage.loadingFiles']()}</span
+							>
+						</div>
+					{:else if filesQuery.error}
+						<div class="rounded-md border border-destructive bg-destructive/10 p-4">
+							<p class="text-sm text-destructive">{m['accountPrivacyPage.filesLoadError']()}</p>
+						</div>
+					{:else if filesQuery.data && filesQuery.data.length > 0}
+						<div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+							{#each filesQuery.data as file (file.id)}
+								<div class="relative flex items-center gap-3 rounded-lg border bg-background p-3">
+									{#if file.file_url && isAudio(file.mime_type)}
+										<!-- Audio file: show inline player -->
+										<div class="min-w-0 flex-1">
+											<p class="mb-1 truncate text-sm font-medium">{file.original_filename}</p>
+											<AudioPlayer
+												src={getImageUrl(file.file_url) as string}
+												filename={file.original_filename}
+											/>
+										</div>
+									{:else if isImage(file.mime_type) && file.file_url}
+										<img
+											src={getImageUrl(file.file_url)}
+											alt={file.original_filename}
+											class="h-12 w-12 rounded object-cover"
+										/>
+										<div class="min-w-0 flex-1">
+											<p class="truncate text-sm font-medium">{file.original_filename}</p>
+											<p class="text-xs text-muted-foreground">
+												{formatFileSize(file.file_size)}
+											</p>
+										</div>
+									{:else}
+										<div class="flex h-12 w-12 items-center justify-center rounded bg-muted">
+											<FileIcon class="h-6 w-6 text-muted-foreground" aria-hidden="true" />
+										</div>
+										<div class="min-w-0 flex-1">
+											<p class="truncate text-sm font-medium">{file.original_filename}</p>
+											<p class="text-xs text-muted-foreground">
+												{formatFileSize(file.file_size)}
+											</p>
+										</div>
+									{/if}
+									<Button
+										variant="ghost"
+										size="icon"
+										class="h-8 w-8 shrink-0 text-destructive hover:bg-destructive/10 hover:text-destructive"
+										onclick={() => openFileDeleteModal(file)}
+										disabled={deletingFileId === file.id}
+										aria-label={m['accountPrivacyPage.deleteFile']()}
+									>
+										{#if deletingFileId === file.id}
+											<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+										{:else}
+											<Trash2 class="h-4 w-4" aria-hidden="true" />
+										{/if}
+									</Button>
+								</div>
+							{/each}
+						</div>
+						<p class="mt-4 text-xs text-muted-foreground">
+							{m['accountPrivacyPage.filesCount']({
+								count: filesQuery.data.length
+							})}
+						</p>
+					{:else}
+						<EmptyState
+							icon={FolderOpen}
+							level={3}
+							title={m['accountPrivacyPage.noFilesTitle']()}
+							body={m['accountPrivacyPage.noFilesDescription']()}
+						/>
+					{/if}
+				</div>
+			</div>
+		</div>
+	</section>
+
+	<!-- Account Deletion Section -->
+	<section class="rounded-lg border border-destructive/30 bg-destructive/5 p-6">
+		<div class="flex items-start gap-4">
+			<div
+				class="flex h-12 w-12 flex-shrink-0 items-center justify-center rounded-full bg-destructive/10"
+			>
+				<AlertTriangle class="h-6 w-6 text-destructive" aria-hidden="true" />
+			</div>
+			<div class="flex-1">
+				<!-- The icon + border/tint already carry "danger zone", so the heading
+				     stays on the body-text pair (danger-framing rule). Since #781 a
+				     destructive heading would also pass here (6.05:1 dark, against
+				     2.85:1 before the token split) — the rule is editorial, not a
+				     contrast workaround. -->
+				<SectionHeader title={m['accountPrivacyPage.dangerZone']()} class="flex-1" />
+				<p class="mt-2 text-sm text-muted-foreground">
+					{m['accountPrivacyPage.dangerZoneDescription']()}
+				</p>
+
+				<div class="mt-6">
+					<h3 class="text-sm font-medium">{m['accountPrivacyPage.whatWillBeDeleted']()}</h3>
+					<ul class="mt-2 space-y-1 text-sm text-muted-foreground">
+						<li class="flex items-center gap-2">
+							<span class="text-destructive">✗</span>
+							{m['accountPrivacyPage.delete_profileCredentials']()}
+						</li>
+						<li class="flex items-center gap-2">
+							<span class="text-destructive">✗</span>
+							{m['accountPrivacyPage.delete_rsvpsTickets']()}
+						</li>
+						<li class="flex items-center gap-2">
+							<span class="text-destructive">✗</span>
+							{m['accountPrivacyPage.export_questionnaires']()}
+						</li>
+						<li class="flex items-center gap-2">
+							<span class="text-destructive">✗</span>
+							{m['accountPrivacyPage.delete_memberships']()}
+						</li>
+						<li class="flex items-center gap-2">
+							<span class="text-destructive">✗</span>
+							{m['accountPrivacyPage.delete_files']()}
+						</li>
+					</ul>
+				</div>
+
+				<button
+					type="button"
+					onclick={openDeletionModal}
+					disabled={success}
+					class="mt-6 inline-flex h-10 items-center justify-center gap-2 rounded-md bg-destructive px-4 py-2 text-sm font-semibold text-destructive-foreground transition-colors hover:bg-destructive/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+				>
+					<Trash2 class="h-4 w-4" aria-hidden="true" />
+					{m['accountPrivacyPage.deleteMyAccount']()}
+				</button>
+			</div>
+		</div>
+	</section>
+</div>
+
+<!-- Deletion Confirmation Modal -->
+{#if showDeletionModal}
+	<div
+		class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+		role="dialog"
+		aria-modal="true"
+		aria-labelledby="deletion-modal-title"
+		tabindex="-1"
+		onclick={(e) => {
+			if (e.target === e.currentTarget) closeDeletionModal();
+		}}
+		onkeydown={(e) => {
+			if (e.key === 'Escape') closeDeletionModal();
+		}}
+	>
+		<div class="w-full max-w-md rounded-lg bg-background p-6 shadow-lg">
+			<div class="mb-4 flex items-start gap-3">
+				<div
+					class="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-destructive/10"
+				>
+					<AlertTriangle class="h-5 w-5 text-destructive" aria-hidden="true" />
+				</div>
+				<div class="flex-1">
+					<h2 id="deletion-modal-title" class="text-lg font-semibold">
+						{m['accountPrivacyPage.modal_title']()}
+					</h2>
+					<p class="mt-1 text-sm text-muted-foreground">
+						{m['accountPrivacyPage.modal_confirmationEmailNote']()}
+					</p>
+				</div>
+			</div>
+
+			<div class="mb-6 space-y-2 rounded-md bg-destructive/5 p-4">
+				<h3 class="text-sm font-medium">{m['accountPrivacyPage.modal_listTitle']()}</h3>
+				<ul class="space-y-1 text-sm text-muted-foreground">
+					<li class="flex items-center gap-2">
+						<span class="text-destructive">✗</span>
+						{m['accountPrivacyPage.modal_profileData']()}
+					</li>
+					<li class="flex items-center gap-2">
+						<span class="text-destructive">✗</span>
+						{m['accountPrivacyPage.delete_rsvpsTickets']()}
+					</li>
+					<li class="flex items-center gap-2">
+						<span class="text-destructive">✗</span>
+						{m['accountPrivacyPage.modal_questionnaires']()}
+					</li>
+					<li class="flex items-center gap-2">
+						<span class="text-destructive">✗</span>
+						{m['accountPrivacyPage.modal_memberships']()}
+					</li>
+				</ul>
+			</div>
+
+			<form
+				method="POST"
+				action="?/requestDeletion"
+				use:enhance={() => {
+					if (isSubmitting || !confirmed) return;
+					isSubmitting = true;
+
+					return async ({ update }) => {
+						isSubmitting = false;
+						await update();
+						closeDeletionModal();
+					};
+				}}
+				class="space-y-4"
+			>
+				<!-- Confirmation Checkbox -->
+				<div class="flex items-start gap-2">
+					<input
+						id="confirm-deletion"
+						type="checkbox"
+						bind:checked={confirmed}
+						disabled={isSubmitting}
+						class="mt-0.5 h-4 w-4 rounded border-input text-destructive transition-colors focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+						required
+					/>
+					<label for="confirm-deletion" class="text-sm">
+						{m['accountPrivacyPage.modal_confirmLabel']()}
+					</label>
+				</div>
+
+				<!-- Action Buttons -->
+				<div class="flex gap-3">
+					<button
+						type="button"
+						onclick={closeDeletionModal}
+						disabled={isSubmitting}
+						class="inline-flex h-10 flex-1 items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						{m['accountPrivacyPage.modal_cancel']()}
+					</button>
+					<button
+						type="submit"
+						disabled={isSubmitting || !confirmed}
+						class="inline-flex h-10 flex-1 items-center justify-center gap-2 rounded-md bg-destructive px-4 py-2 text-sm font-semibold text-destructive-foreground transition-colors hover:bg-destructive/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						{#if isSubmitting}
+							<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+							<span>{m['accountPrivacyPage.modal_sending']()}</span>
+						{:else}
+							<span>{m['accountPrivacyPage.modal_sendEmail']()}</span>
+						{/if}
+					</button>
+				</div>
+			</form>
+		</div>
+	</div>
+{/if}
+
+<!-- File Deletion Confirmation Modal -->
+{#if showFileDeleteModal && fileToDelete}
+	<div
+		class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+		role="dialog"
+		aria-modal="true"
+		aria-labelledby="file-deletion-modal-title"
+		tabindex="-1"
+		onclick={(e) => {
+			if (e.target === e.currentTarget) closeFileDeleteModal();
+		}}
+		onkeydown={(e) => {
+			if (e.key === 'Escape') closeFileDeleteModal();
+		}}
+	>
+		<div class="w-full max-w-md rounded-lg bg-background p-6 shadow-lg">
+			<div class="mb-4 flex items-start gap-3">
+				<div
+					class="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full bg-destructive/10"
+				>
+					<AlertTriangle class="h-5 w-5 text-destructive" aria-hidden="true" />
+				</div>
+				<div class="flex-1">
+					<h2 id="file-deletion-modal-title" class="text-lg font-semibold">
+						{m['accountPrivacyPage.fileDeleteModal_title']()}
+					</h2>
+					<p class="mt-1 text-sm text-muted-foreground">
+						{m['accountPrivacyPage.fileDeleteModal_description']()}
+					</p>
+				</div>
+			</div>
+
+			<div class="mb-6 rounded-md bg-muted/50 p-4">
+				<div class="flex items-center gap-3">
+					{#if isImage(fileToDelete.mime_type) && fileToDelete.file_url}
+						<img
+							src={getImageUrl(fileToDelete.file_url)}
+							alt={fileToDelete.original_filename}
+							class="h-12 w-12 rounded object-cover"
+						/>
+					{:else}
+						<div class="flex h-12 w-12 items-center justify-center rounded bg-muted">
+							<FileIcon class="h-6 w-6 text-muted-foreground" aria-hidden="true" />
+						</div>
+					{/if}
+					<div class="min-w-0 flex-1">
+						<p class="truncate text-sm font-medium">{fileToDelete.original_filename}</p>
+						<p class="text-xs text-muted-foreground">{formatFileSize(fileToDelete.file_size)}</p>
+					</div>
+				</div>
+			</div>
+
+			<!-- Warning tint mirrors ToneTile's amber recipe (see security page); raw
+			     text-highlight alone fails AA on the light background. -->
+			<div class="mb-6 rounded-md border border-highlight/40 bg-highlight/20 p-4">
+				<p class="text-sm text-highlight-foreground dark:text-highlight">
+					{m['accountPrivacyPage.fileDeleteModal_warning']()}
+				</p>
+			</div>
+
+			<div class="flex gap-3">
+				<button
+					type="button"
+					onclick={closeFileDeleteModal}
+					class="inline-flex h-10 flex-1 items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					{m['accountPrivacyPage.fileDeleteModal_cancel']()}
+				</button>
+				<button
+					type="button"
+					onclick={confirmDeleteFile}
+					class="inline-flex h-10 flex-1 items-center justify-center gap-2 rounded-md bg-destructive px-4 py-2 text-sm font-semibold text-destructive-foreground transition-colors hover:bg-destructive/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					<Trash2 class="h-4 w-4" aria-hidden="true" />
+					{m['accountPrivacyPage.fileDeleteModal_confirm']()}
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}

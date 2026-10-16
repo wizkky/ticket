@@ -1,0 +1,273 @@
+"""Google Wallet pass payload builder.
+
+Builds the ``eventTicketClasses`` / ``eventTicketObjects`` payload embedded in
+a fat "save to Google Wallet" JWT. Unlike the Apple rail there is no file to
+generate: Google creates the class and object server-side when the user opens
+the signed save link.
+
+See: https://developers.google.com/wallet/tickets/events
+"""
+
+import typing as t
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from django.conf import settings
+from django.urls import reverse
+
+from events.compliance.enforcement import ticket_fields
+from events.models import Event, HeldSeriesPass, Organization, OrganizationMember, Ticket
+from events.utils import get_event_timezone, get_organization_timezone
+from wallet.apple.formatting import format_iso_date, format_price, get_theme_hex_background
+from wallet.apple.generator import PASS_EXPIRATION_GRACE_PERIOD, POWERED_BY_URL
+from wallet.resolution import resolve_series_window, resolve_ticket_location
+
+
+def _pass_id(kind: str, entity_id: t.Any) -> str:
+    """Build a namespaced Google Wallet class/object ID."""
+    return f"{settings.GOOGLE_WALLET_ISSUER_ID}.{settings.GOOGLE_WALLET_CLASS_PREFIX}.{kind}.{entity_id}"
+
+
+def _localized(value: str) -> dict[str, t.Any]:
+    """Wrap a string in Google's LocalizedString shape."""
+    return {"defaultValue": {"language": "en", "value": value}}
+
+
+def _powered_by_links() -> dict[str, t.Any]:
+    """Platform attribution link — mirrors the Apple rail's powered_by back field."""
+    return {"uris": [{"id": "powered_by", "uri": POWERED_BY_URL, "description": "Powered by Revel"}]}
+
+
+def _org_logo_url(org: Organization) -> str | None:
+    """Stable indirection URL for the org logo, or None when unset.
+
+    Raw media URLs die when a logo is replaced (uploads delete the old file),
+    which would void every save link already sitting in ticket emails. The
+    API endpoint always serves the *current* logo or a placeholder.
+    """
+    if not (org.logo_thumbnail or org.logo):
+        return None
+    path = reverse("api:organization_logo", kwargs={"organization_id": org.id})
+    return f"{settings.BASE_URL.rstrip('/')}{path}"
+
+
+def _event_cover_url(event: Event) -> str | None:
+    """Stable indirection URL for the event cover art, or None when unset."""
+    if not event.cover_art:
+        return None
+    path = reverse("api:event_cover_art", kwargs={"event_id": event.id})
+    return f"{settings.BASE_URL.rstrip('/')}{path}"
+
+
+def _image(url: str | None) -> dict[str, t.Any] | None:
+    """Wrap a URL in Google's Image shape.
+
+    Google's servers fetch the image when the pass is saved and reject
+    non-HTTPS URLs, which voids the entire save link (e.g. local dev's
+    http://localhost media URLs) — omit the image instead.
+    """
+    if not url or not url.startswith("https://"):
+        return None
+    return {"sourceUri": {"uri": url}}
+
+
+def _build_class(
+    class_id: str,
+    issuer_name: str,
+    event_name: str,
+    start: datetime,
+    end: datetime,
+    tz: ZoneInfo,
+    venue_name: str | None,
+    address: str | None,
+    logo_url: str | None,
+    hero_url: str | None,
+) -> dict[str, t.Any]:
+    """Build an EventTicketClass dict."""
+    cls: dict[str, t.Any] = {
+        "id": class_id,
+        "issuerName": issuer_name,
+        "eventName": _localized(event_name),
+        "reviewStatus": "UNDER_REVIEW",
+        "hexBackgroundColor": get_theme_hex_background(),
+        "dateTime": {
+            "start": format_iso_date(start, tz=tz),
+            "end": format_iso_date(end, tz=tz),
+        },
+    }
+    # Google's EventVenue requires both name and address; fall back to whichever exists.
+    if venue_name or address:
+        cls["venue"] = {
+            "name": _localized(venue_name or t.cast(str, address)),
+            "address": _localized(address or t.cast(str, venue_name)),
+        }
+    if logo := _image(logo_url):
+        cls["logo"] = logo
+    if hero := _image(hero_url):
+        cls["heroImage"] = hero
+    return cls
+
+
+def build_ticket_payload(ticket: Ticket) -> dict[str, t.Any]:
+    """Build the fat-JWT payload for a ticket.
+
+    Venue, sector and seat come from :func:`wallet.resolution.resolve_ticket_location`
+    and the price (with the other fiscal lines) from the organizer's compliance policy,
+    which resolves it with :func:`events.service.ticket_price.resolve_ticket_price` — the same
+    helpers ``ApplePassGenerator._build_pass_data`` uses, so both rails show the
+    same data (pinned by ``wallet/tests/test_cross_rail_parity.py``).
+
+    Args:
+        ticket: The ticket to build a payload for.
+
+    Returns:
+        ``{"eventTicketClasses": [...], "eventTicketObjects": [...]}``
+    """
+    event = ticket.event
+    org = event.organization
+    tz = get_event_timezone(event)
+
+    location = resolve_ticket_location(ticket)
+
+    cls = _build_class(
+        class_id=_pass_id("event", event.id),
+        issuer_name=org.name,
+        event_name=event.name,
+        start=event.start,
+        end=event.end,
+        tz=tz,
+        venue_name=location.venue_name,
+        address=location.address,
+        logo_url=_org_logo_url(org),
+        hero_url=_event_cover_url(event),
+    )
+
+    obj: dict[str, t.Any] = {
+        "id": _pass_id("ticket", ticket.id),
+        "classId": cls["id"],
+        "state": "ACTIVE",
+        "barcode": {"type": "QR_CODE", "value": str(ticket.id)},
+        "ticketType": _localized(ticket.tier.name),
+        "validTimeInterval": {"end": {"date": format_iso_date(event.end + PASS_EXPIRATION_GRACE_PERIOD, tz=tz)}},
+        # The organizer's country policy lines (EU layer 1). The common set carries the
+        # ``price`` module, formatted exactly like the Apple rail's price field.
+        "textModulesData": [
+            {"id": item.key, "header": item.label, "body": item.value} for item in ticket_fields(ticket)
+        ],
+        "linksModuleData": _powered_by_links(),
+    }
+    if ticket.guest_name:
+        obj["ticketHolderName"] = ticket.guest_name
+    seat_info: dict[str, t.Any] = {}
+    if location.sector:
+        seat_info["section"] = _localized(location.sector.name)
+    if location.seat_label:
+        seat_info["seat"] = _localized(location.seat_label)
+    if seat_info:
+        obj["seatInfo"] = seat_info
+
+    return {"eventTicketClasses": [cls], "eventTicketObjects": [obj]}
+
+
+def build_series_pass_payload(held_pass: HeldSeriesPass) -> dict[str, t.Any]:
+    """Build the fat-JWT payload for a held series pass.
+
+    Event-shaped fields are derived from the covered events as a whole by
+    :func:`wallet.resolution.resolve_series_window`, shared with
+    ``ApplePassGenerator._build_series_pass_data``: the soonest upcoming covered
+    event is the representative (falling back to the most recent past one), and
+    the pass stays valid until the latest covered end. Only the hero image is
+    rail-specific (Google fetches a URL, Apple embeds bytes).
+
+    Args:
+        held_pass: The held series pass to build a payload for.
+
+    Returns:
+        ``{"eventTicketClasses": [...], "eventTicketObjects": [...]}``
+    """
+    series_pass = held_pass.series_pass
+    org = series_pass.event_series.organization
+
+    window = resolve_series_window(held_pass)
+    hero_url = _event_cover_url(window.representative_event) if window.representative_event else None
+
+    cls = _build_class(
+        class_id=_pass_id("series", series_pass.id),
+        issuer_name=org.name,
+        event_name=series_pass.name,
+        start=window.start,
+        end=window.end,
+        tz=window.tz,
+        venue_name=window.venue_name,
+        address=window.address,
+        logo_url=_org_logo_url(org),
+        hero_url=hero_url,
+    )
+
+    obj: dict[str, t.Any] = {
+        "id": _pass_id("pass", held_pass.id),
+        "classId": cls["id"],
+        "state": "ACTIVE",
+        "barcode": {"type": "QR_CODE", "value": held_pass.qr_payload},
+        "ticketType": _localized("Series Pass"),
+        "validTimeInterval": {
+            "end": {"date": format_iso_date(window.end + PASS_EXPIRATION_GRACE_PERIOD, tz=window.tz)}
+        },
+        "textModulesData": [
+            {"id": "price", "header": "Price", "body": format_price(held_pass.price_paid, series_pass.currency)}
+        ],
+        "linksModuleData": _powered_by_links(),
+    }
+    return {"eventTicketClasses": [cls], "eventTicketObjects": [obj]}
+
+
+def build_membership_payload(member: OrganizationMember) -> dict[str, t.Any]:
+    """Build the fat-JWT payload for a membership card (generic pass).
+
+    The tier is baked into the OBJECT ID (``membercard.<member_id>-<tier_id>``):
+    Google treats a save JWT whose object ID already exists as a no-op (it serves
+    the stored object without updating it), so a tier change must mint a NEW
+    object for the re-download to show the new tier. The superseded card lingers
+    in the user's wallet until manually removed — hence the note text module.
+    The barcode, by contrast, is always the stable ``member:<member_id>`` payload.
+
+    Args:
+        member: The organization member to build a card payload for.
+
+    Returns:
+        ``{"genericClasses": [...], "genericObjects": [...]}``
+    """
+    org = member.organization
+    tz = get_organization_timezone(org)
+
+    cls: dict[str, t.Any] = {"id": _pass_id("memberorg", org.id)}
+
+    tier_suffix = str(member.tier_id) if member.tier_id else "base"
+    obj: dict[str, t.Any] = {
+        "id": _pass_id("membercard", f"{member.id}-{tier_suffix}"),
+        "classId": cls["id"],
+        "state": "ACTIVE",
+        "cardTitle": _localized(org.name),
+        "header": _localized(member.user.get_display_name()),
+        "hexBackgroundColor": get_theme_hex_background(),
+        "barcode": {"type": "QR_CODE", "value": member.qr_payload},
+        "textModulesData": [
+            {
+                "id": "member_since",
+                "header": "Member since",
+                "body": format_iso_date(member.created_at, tz=tz)[:10],
+            },
+            {
+                "id": "note",
+                "header": "Note",
+                "body": "Your newest membership card supersedes any older ones.",
+            },
+        ],
+        "linksModuleData": _powered_by_links(),
+    }
+    if member.tier:
+        obj["subheader"] = _localized(member.tier.name)
+    if logo := _image(_org_logo_url(org)):
+        obj["logo"] = logo
+
+    return {"genericClasses": [cls], "genericObjects": [obj]}

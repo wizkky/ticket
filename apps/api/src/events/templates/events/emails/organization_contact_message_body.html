@@ -1,0 +1,19 @@
+{% extends "emails/base.html" %}
+
+{% block preheader %}New contact message for {{ organization_name }}{% endblock %}
+
+{% block content %}
+<h2 style="margin-top:0;">New contact message for <strong>{{ organization_name }}</strong></h2>
+
+<div class="card">
+  <div class="info-row"><span style="color:#666;display:inline-block;min-width:70px;">From:</span> {{ sender_email }}</div>
+  {% if subject %}<div class="info-row"><span style="color:#666;display:inline-block;min-width:70px;">Subject:</span> {{ subject }}</div>{% endif %}
+</div>
+
+<div class="card card--info" style="white-space:pre-wrap;word-wrap:break-word;">{{ message }}</div>
+
+{% if admin_link %}<a href="{{ admin_link }}" class="button">View in admin</a>{% endif %}
+
+<p style="color:#666;font-size:13px;">Reply directly to this email to reach the sender. The Reply-To header is set to their address.</p>
+<p>Thank you,<br>The Revel Team</p>
+{% endblock %}

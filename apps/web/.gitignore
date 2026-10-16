@@ -1,0 +1,122 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+build/
+.svelte-kit/
+.vercel/
+.netlify/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Testing
+coverage/
+.nyc_output/
+test-results/
+playwright-report/
+playwright/.cache/
+*.lcov
+.tests.output
+.tests.output.full
+.e2e.output
+
+# Vite
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# TypeScript
+*.tsbuildinfo
+*.tgz
+
+# API Client (auto-generated)
+# Uncomment if you want to version control generated API client:
+# !src/lib/api/generated/
+
+# Paraglide (auto-generated i18n runtime)
+src/lib/paraglide/
+# Tree-shakeable production variant (`pnpm build`; see scripts/compile-i18n.js)
+.paraglide-build/
+
+# Inlang plugin cache (auto-generated)
+project.inlang/cache/
+
+# IDE & Editor
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Package manager lock files (keep pnpm-lock.yaml)
+package-lock.json
+yarn.lock
+
+# Debug
+.lighthouseci/
+
+# Local development
+.cache/
+.turbo/
+
+# Miscellaneous
+*.bak
+*.backup
+*.orig
+
+# Development documentation (keep locally only)
+.dev-docs/
+docs/superpowers/
+.superpowers/
+
+# Backend symlink
+revel-backend
+
+.playwright-mcp/
+screenshots/
+
+# Temporary fixtures written by scripts/check-type-gate-armed.sh. The script
+# removes them on exit; these entries only matter if a run is hard-killed.
+src/lib/__type_gate_canary__.ts
+src/routes/__TypeGateCanary__.svelte
+
+# Local brand styleguide PDF (working asset, never committed)
+/Revel_Digital-Styleguide.pdf
+
+__pycache__/
+*.pyc

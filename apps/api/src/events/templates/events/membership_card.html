@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Membership Card - {{ organization_name }}</title>
+    {% include "events/_pass_base_styles.html" %}
+    <style>
+        .banner-overlay .eyebrow {
+            margin: 0 0 1.2mm; font-size: 6.5pt; font-weight: 600;
+            letter-spacing: 1.6px; text-transform: uppercase; opacity: 0.92;
+        }
+
+        /* Member identity row */
+        .identity {
+            display: flex; align-items: center;
+            padding: 7mm 9mm;
+            border-bottom: 1px solid #EDE7F6;
+        }
+        .logo {
+            width: 16mm; height: 16mm; border-radius: 10px;
+            overflow: hidden; flex-shrink: 0; margin-right: 5mm;
+            border: 1px solid #EDE7F6;
+        }
+        .logo img { width: 100%; height: 100%; object-fit: cover; }
+        .identity .who { flex: 1; }
+        .identity .name { margin: 0; font-size: 15pt; font-weight: 600; }
+        .identity .since { margin: 1.2mm 0 0; font-size: 9pt; color: #46405E; }
+        .tier-badge {
+            display: inline-block;
+            background: #8C3CDD; color: #FFFFFF;
+            font-size: 7.5pt; font-weight: 600; letter-spacing: 0.8px;
+            text-transform: uppercase;
+            padding: 1.6mm 4mm; border-radius: 999px;
+            margin-left: 4mm; vertical-align: middle;
+        }
+
+        /* QR centerpiece */
+        .qr-zone {
+            flex: 1;
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            text-align: center;
+            padding: 8mm 9mm;
+        }
+        .qr-zone .eyebrow {
+            font-size: 6.5pt; font-weight: 600; letter-spacing: 1.6px;
+            text-transform: uppercase; color: #8C3CDD; margin: 0 0 3mm;
+        }
+        .qr-sticker { padding: 5mm; margin: 0 0 5mm; }
+        .qr-sticker img { display: block; width: 48mm; height: 48mm; }
+        .instruction { font-size: 9pt; color: #46405E; margin: 0; line-height: 1.5; }
+        .mid { font-family: monospace; font-size: 8pt; color: #8C3CDD; margin: 4mm 0 0; }
+    </style>
+</head>
+<body>
+<div class="page">
+    <div class="card">
+        <div class="banner">
+            {% if cover_art_url %}<img class="cover" src="{{ cover_art_url }}" alt="">{% endif %}
+            <div class="banner-overlay">
+                <p class="eyebrow">Membership</p>
+                <h1>{{ organization_name }}</h1>
+            </div>
+        </div>
+
+        <div class="identity">
+            {% if logo_url %}
+            <div class="logo"><img src="{{ logo_url }}" alt=""></div>
+            {% endif %}
+            <div class="who">
+                <p class="name">{{ member_name }}{% if tier_name %}<span class="tier-badge">{{ tier_name }}</span>{% endif %}</p>
+                <p class="since">Member since {{ member_since }}</p>
+            </div>
+        </div>
+
+        <div class="qr-zone">
+            <p class="eyebrow">Member</p>
+            <div class="qr-sticker">
+                <img src="data:image/png;base64,{{ qr_code_base64 }}" alt="Membership Card QR Code">
+            </div>
+            <p class="instruction">Present this QR code to verify your membership.</p>
+            <p class="mid">{{ member_id_short }}</p>
+        </div>
+
+        <div class="footer">
+            <p class="legal">Status is confirmed at scan time &middot; Event entry requires a valid ticket &middot; {{ member_id }}</p>
+            <div class="powered">
+                <img src="file://{{ brand_mark }}" alt="">
+                <span class="by">Powered by</span>
+                <span class="wordmark"><span style="color:#8C3CDD">r</span><span style="color:#A33AB0">e</span><span style="color:#B93884">v</span><span style="color:#D03557">e</span><span style="color:#E6332A">l</span><span class="dot">.</span></span>
+            </div>
+        </div>
+    </div>
+</div>
+</body>
+</html>

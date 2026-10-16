@@ -1,0 +1,110 @@
+import { test, expect } from '../../support/fixtures';
+import { getBackendUrl } from '../../support/api';
+import {
+	createTicketedEvent,
+	createTicketTier,
+	createVerifiedUser,
+	issueDraftInvoiceFor,
+	setOrgInvoicingMode,
+	startOnlineCheckout
+} from '../../support/factories';
+import { authenticateContext } from '../../support/session';
+import { gotoHydrated, waitForClientAuth } from '../../support/navigation';
+import {
+	completeStripeCheckout,
+	expectWebhookEffect,
+	requireStripeWebhooks
+} from '../../support/stripe';
+
+// J22 (USER_JOURNEYS.md) — buyer-side attendee invoicing: a paid online
+// purchase with billing info generates an invoice that, once issued, the
+// buyer finds under /account/invoices with the PDF served from a signed URL.
+//
+// Requires the full Stripe test-mode setup (tests/e2e/README.md) — the
+// invoice is generated from the webhook's payment record. The suite pins Org
+// Alpha (the only Stripe-connected org) to HYBRID invoicing — the mode is
+// read at webhook time and mixed modes would race parallel workers' checkouts
+// (see setOrgInvoicingMode) — so the arrange issues the draft via the admin
+// API; the organizer-side draft→issue UI journey is j22 hybrid-flow.
+
+test.describe('J22 buyer invoices @p2', () => {
+	test('invoiced purchase → issued invoice in /account/invoices → PDF', async ({ browser }) => {
+		// Stripe hosted checkout + webhook + invoice generation.
+		test.setTimeout(240_000);
+		requireStripeWebhooks();
+
+		await setOrgInvoicingMode('hybrid');
+		const [event, buyer] = await Promise.all([
+			createTicketedEvent({ freeTier: false }),
+			createVerifiedUser('Invoiced')
+		]);
+		const tier = await createTicketTier(event.id, { name: 'Invoiced Entry', price: '10.00' });
+		// Billing info at checkout is what opts the buyer into an invoice.
+		const checkoutUrl = await startOnlineCheckout(buyer, event.id, tier.id, {
+			billingInfo: {
+				billing_name: `${buyer.firstName} ${buyer.lastName}`,
+				billing_address: 'Musterstraße 1, 1010 Wien',
+				vat_country_code: 'AT',
+				billing_email: buyer.email
+			}
+		});
+
+		const context = await browser.newContext();
+		await authenticateContext(context, buyer);
+		const page = await context.newPage();
+		try {
+			await page.goto(checkoutUrl);
+			await completeStripeCheckout(page);
+
+			// Hybrid mode leaves the generated invoice as a draft — wait for it and
+			// issue it as the org owner (API arrange; the UI journey is hybrid-flow).
+			// The draft only exists because the checkout webhook recorded a payment,
+			// so this is the run's webhook checkpoint for this spec.
+			await expectWebhookEffect(
+				'the checkout webhook to generate the draft attendee invoice',
+				() => issueDraftInvoiceFor(buyer.email),
+				{ timeout: 120_000 }
+			);
+
+			// A fresh buyer has exactly one invoice — poll for its Issued table row.
+			const invoiceRow = page.getByRole('row').filter({ hasText: 'Issued' });
+			await expect(async () => {
+				await gotoHydrated(page, '/account/invoices');
+				await expect(invoiceRow).toBeVisible({ timeout: 5_000 });
+			}).toPass({ timeout: 90_000 });
+			await waitForClientAuth(page);
+
+			// Gross amount (€10.00) renders in the row.
+			await expect(invoiceRow.getByText(/10[.,]00/).first()).toBeVisible();
+
+			// Detail dialog opens from the invoice-number button; Escape closes it
+			// (the footer Close and the X share the same accessible name).
+			await invoiceRow.getByRole('button', { name: /View details/ }).click();
+			const detail = page.getByRole('dialog', { name: 'Invoice Details' });
+			await expect(detail).toBeVisible({ timeout: 15_000 });
+			await page.keyboard.press('Escape');
+			await expect(detail).not.toBeVisible({ timeout: 15_000 });
+
+			// "Download PDF" resolves a signed URL from the API and window.open()s
+			// it — Chromium turns the PDF into a download, so the popup never
+			// commits a URL. Assert the journey at the network layer instead:
+			// capture the resolved download_url and fetch the PDF from it (a 404
+			// means the PDF is still rendering — the loop clicks again).
+			await expect(async () => {
+				const responsePromise = page.waitForResponse(
+					(r) => /\/api\/dashboard\/invoices\/[^/]+\/download/.test(r.url()),
+					{ timeout: 10_000 }
+				);
+				await invoiceRow.getByRole('button', { name: /Download PDF/ }).click();
+				const response = await responsePromise;
+				expect(response.status()).toBe(200);
+				const { download_url } = (await response.json()) as { download_url: string };
+				const pdf = await page.request.get(getBackendUrl(download_url));
+				expect(pdf.status()).toBe(200);
+				expect(pdf.headers()['content-type'] ?? '').toContain('pdf');
+			}).toPass({ timeout: 60_000 });
+		} finally {
+			await context.close();
+		}
+	});
+});

@@ -1,0 +1,35 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+
+{% if context.user_name %}
+    <p>{% blocktranslate with user=context.user_name event=context.event_name response=context.response %}<strong>{{ user }}</strong> has RSVP'd <strong>{{ response }}</strong> for <strong>{{ event }}</strong>.{% endblocktranslate %}</p>
+
+    <div class="card">
+        <h3 style="margin-top: 0;">{% trans "RSVP Details" %}</h3>
+        <div class="info-row"><span class="label">{% trans "User:" %}</span> {{ context.user_name }} ({{ context.user_email }})</div>
+        <div class="info-row"><span class="label">{% trans "Response:" %}</span> {{ context.response }}</div>
+        {% if context.rsvp_note %}<div class="info-row"><span class="label">{% trans "Note:" %}</span> {{ context.rsvp_note }}</div>{% endif %}
+    </div>
+{% else %}
+    <p style="font-size: 18px;">{% blocktranslate with event=context.event_name response=context.response %}Your RSVP (<strong>{{ response }}</strong>) for <strong>{{ event }}</strong> has been confirmed! ✅{% endblocktranslate %}</p>
+
+    <div class="card">
+        <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+        <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+        {% if context.event_location %}<div class="info-row">📍 {{ context.event_location }}</div>{% endif %}
+    </div>
+
+    <div class="card">
+        <h3 style="margin-top: 0;">{% trans "Your Response" %}</h3>
+        <div class="info-row"><span class="label">{% trans "Response:" %}</span> <strong>{{ context.response }}</strong></div>
+        {% if context.guest_count %}<div class="info-row"><span class="label">{% trans "Guests:" %}</span> {{ context.guest_count }}</div>{% endif %}
+        {% if context.dietary_restrictions %}<div class="info-row"><span class="label">{% trans "Dietary restrictions:" %}</span> {{ context.dietary_restrictions }}</div>{% endif %}
+    </div>
+{% endif %}
+
+<center>
+    <a href="{{ context.event_url }}" class="button">{% trans "View Event Details" %}</a>
+</center>
+{% endblock %}

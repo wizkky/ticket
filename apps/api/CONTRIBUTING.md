@@ -1,0 +1,92 @@
+# Contributing to Revel
+
+Thank you for your interest in contributing to Revel! We're excited to have you join our community. Whether you're reporting a bug, suggesting a new feature, or writing code, your contributions are valuable.
+
+This document provides guidelines for contributing to the project to ensure a smooth and effective process for everyone.
+
+> 🤖 **Using AI?** Revel embraces AI-assisted coding but rejects vibe coding. If you contribute
+> PRs or Issues created with AI, read **[AI_USAGE.md](AI_USAGE.md)** first: it describes the
+> required workflow. Following it is not optional.
+
+## How to Contribute
+
+There are several ways you can contribute to the project:
+
+*   **Reporting Bugs:** If you find a bug, please check our [GitHub Issues](https://github.com/letsrevel/revel-backend/issues) to see if it has already been reported. If not, please open a new issue. **Found a security vulnerability? Do not open a public issue** — see [Reporting Security Vulnerabilities](#reporting-security-vulnerabilities) below.
+*   **Suggesting Enhancements:** If you have an idea for a new feature or an improvement to an existing one, open an issue to start a discussion.
+*   **Writing Code:** If you're ready to contribute code, you can pick an existing issue or propose a new one.
+
+## Setting Up Your Development Environment
+
+Our goal is to make setup as easy as possible. You'll need `make`, Docker, Python 3.14+, [uv](https://docs.astral.sh/uv/), and the native libraries listed in the [README](README.md#local-development).
+
+1.  **Fork** the repository on GitHub.
+2.  **Clone** your fork locally:
+    ```bash
+    git clone https://github.com/your-username/revel-backend.git
+    cd revel-backend
+    ```
+3.  **Run the setup command:**
+    ```bash
+    make setup
+    ```
+    This single command handles everything: creating a virtual environment, installing dependencies, setting up Docker services, and running the server.
+
+## Development Workflow
+
+1.  **Create a branch** for your feature or bugfix from the `main` branch:
+    ```bash
+    git checkout -b feature/my-new-feature
+    ```
+2.  **Write your code.** Follow the project's coding style and structure (see below).
+3.  **Write tests** for your changes. We use `pytest` and aim for high test coverage. All new features must be accompanied by tests.
+4.  **Run all checks** to ensure your code is clean, formatted, and passes all tests:
+    ```bash
+    make check
+    make test
+    ```
+    These commands must pass before you submit your changes.
+5.  **Commit your changes.** We recommend using [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for clear and descriptive commit messages (e.g., `feat: Add RSVP deadline to events`).
+6.  **Push your branch** to your fork:
+    ```bash
+    git push origin feature/my-new-feature
+    ```
+7.  **Open a Pull Request** on the main Revel repository. Provide a clear description of your changes and link to any relevant issues.
+
+## Coding Style and Conventions
+
+Consistency is key. We follow these standards to maintain a clean and readable codebase.
+
+*   **Style Guide:** [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html).
+*   **Service Layer:** We use a hybrid approach - function-based services for stateless operations (CRUD, queries), class-based for stateful workflows (checkout, eligibility). See `CLAUDE.md` for detailed patterns.
+*   **Formatting & Linting:** We use `ruff` for both. Run `make format` to automatically format your code before committing. `make lint` will check for style issues.
+*   **Type Hinting:** All new code must be fully type-hinted using Python 3.14+ syntax. We use `mypy` for static analysis. Run `make mypy` to check your types.
+    *   Always use `import typing as t` (never `from typing import ...`).
+    *   Do not use `# type: ignore[no-untyped-def]`. All function signatures must be typed.
+    *   Use string forward references for type hints where necessary (e.g., `-> 'MyModel'`).
+*   **Docstrings:** Use Google-style docstrings for all public modules, classes, functions, and methods.
+*   **Internationalization (i18n):** All user-facing strings must be wrapped with Django's translation utilities. See [i18n.md](i18n.md) for detailed guidelines on adding translatable strings and supporting new languages.
+
+## Reporting Security Vulnerabilities
+
+Please **do not** report security issues through public GitHub issues or pull
+requests. Instead, use GitHub's private vulnerability reporting via the
+repository's **Security** tab →
+**[Report a vulnerability](https://github.com/letsrevel/revel-backend/security/advisories/new)**.
+
+For our full security posture — CI controls, scheduled audits, the CVE
+suppression policy, and what to include in a report — see
+**[SECURITY.md](SECURITY.md)**.
+
+## Issue Tracking
+
+We use GitHub Issues to track bugs and feature requests. You can create a new issue using the GitHub CLI:
+
+```bash
+gh issue create --title 'Your Issue Title' --body $'A detailed description of the issue.\n\nUse newlines for clarity.' --assignee @me
+```
+
+Please add relevant labels (bug, enhancement, user story) to your issue.
+
+## Final Word
+Clean code is the most important principle of this project. By following these guidelines, you help us keep the codebase maintainable, scalable, and a pleasure to work on. Thank you for your contribution!

@@ -1,0 +1,229 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { Button } from '$lib/components/ui/button';
+	import { Input } from '$lib/components/ui/input';
+	import { Tag, X, ChevronDown, Loader2 } from '@lucide/svelte';
+	import type { DiscountCodeValidationResponse } from '$lib/api/generated/types.gen';
+	import { eventpublicticketsValidateDiscount } from '$lib/api/generated/sdk.gen';
+	import { formatMoney } from '$lib/utils/format';
+
+	interface Props {
+		eventId: string;
+		tierId: string;
+		currency: string;
+		originalPrice: number;
+		quantity: number;
+		isProcessing: boolean;
+		initialOpen?: boolean;
+		initialCode?: string;
+		/** The currently applied discount code */
+		appliedDiscountCode: string;
+		/** The validated discount result */
+		discountResult: DiscountCodeValidationResponse | null;
+		/** Callback when discount is applied */
+		onApply: (code: string, result: DiscountCodeValidationResponse) => void;
+		/** Callback when discount is removed */
+		onRemove: () => void;
+	}
+
+	const {
+		eventId,
+		tierId,
+		currency,
+		originalPrice,
+		quantity,
+		isProcessing,
+		initialOpen = false,
+		initialCode = '',
+		appliedDiscountCode,
+		discountResult,
+		onApply,
+		onRemove
+	}: Props = $props();
+
+	let discountOpen = $state(initialOpen);
+	let discountCodeInput = $state(initialCode);
+	let isValidatingDiscount = $state(false);
+	let discountError = $state('');
+
+	// Computed discounted price
+	const discountedPrice = $derived.by(() => {
+		if (!discountResult?.discounted_price) return null;
+		return parseFloat(discountResult.discounted_price);
+	});
+
+	const discountBadge = $derived.by(() => {
+		if (!discountResult) return '';
+		if (discountResult.discount_type === 'percentage') {
+			return `-${discountResult.discount_value}%`;
+		}
+		return `-${formatMoney(discountResult.discount_value, currency)}`;
+	});
+
+	async function validateDiscountCode() {
+		const code = discountCodeInput.trim().toUpperCase();
+		if (!code) {
+			discountError = m['discountCodeInput.enterCodeError']();
+			return;
+		}
+
+		isValidatingDiscount = true;
+		discountError = '';
+
+		try {
+			const response = await eventpublicticketsValidateDiscount({
+				path: { event_id: eventId, tier_id: tierId },
+				body: { code }
+			});
+
+			if (response.error) {
+				const err: unknown = response.error;
+				const detail =
+					err && typeof err === 'object' ? (err as { detail?: unknown }).detail : undefined;
+				discountError =
+					typeof detail === 'string'
+						? detail
+						: Array.isArray(detail)
+							? detail.map((d: { msg?: string }) => d.msg || String(d)).join(', ')
+							: m['discountCodeInput.validateFailed']();
+				return;
+			}
+
+			if (response.data) {
+				if (response.data.valid) {
+					discountError = '';
+					onApply(code, response.data);
+				} else {
+					discountError = response.data.message || m['discountCodeInput.invalidCode']();
+				}
+			}
+		} catch {
+			discountError = m['discountCodeInput.validateFailed']();
+		} finally {
+			isValidatingDiscount = false;
+		}
+	}
+
+	function handleRemove() {
+		discountCodeInput = '';
+		discountError = '';
+		onRemove();
+	}
+
+	/** Reset input state when the parent removes the discount externally */
+	export function resetInput(code: string, open: boolean) {
+		discountCodeInput = code;
+		discountOpen = open;
+		discountError = '';
+	}
+</script>
+
+<div class="rounded-lg border">
+	<button
+		type="button"
+		onclick={() => (discountOpen = !discountOpen)}
+		class="flex w-full items-center justify-between px-4 py-3 text-sm font-medium hover:bg-accent"
+		aria-expanded={discountOpen}
+	>
+		<span class="flex items-center gap-2">
+			<Tag class="h-4 w-4" aria-hidden="true" />
+			{m['discountCodeInput.haveCode']()}
+		</span>
+		<ChevronDown
+			class="h-4 w-4 transition-transform {discountOpen ? 'rotate-180' : ''}"
+			aria-hidden="true"
+		/>
+	</button>
+
+	{#if discountOpen}
+		<div class="space-y-3 border-t px-4 py-3">
+			{#if appliedDiscountCode && discountResult?.valid}
+				<!-- Applied discount display -->
+				<div class="rounded-md bg-success/10 p-3">
+					<div class="flex items-center justify-between">
+						<div class="flex items-center gap-2">
+							<Tag class="h-4 w-4 text-success" aria-hidden="true" />
+							<span class="font-mono font-semibold text-foreground">
+								{appliedDiscountCode}
+							</span>
+							<span
+								class="rounded-full bg-success px-2 py-0.5 text-xs font-medium text-success-foreground"
+							>
+								{discountBadge}
+							</span>
+						</div>
+						<button
+							type="button"
+							onclick={handleRemove}
+							disabled={isProcessing}
+							class="rounded-md p-1 text-foreground hover:bg-success/20"
+							aria-label={m['discountCodeInput.removeCode']()}
+						>
+							<X class="h-4 w-4" />
+						</button>
+					</div>
+
+					{#if discountedPrice !== null}
+						<div class="mt-2 text-sm">
+							<span class="text-muted-foreground line-through">
+								{formatMoney(originalPrice, currency)}
+							</span>
+							<span class="ml-2 font-semibold text-foreground">
+								{formatMoney(discountedPrice, currency)}
+							</span>
+							<span class="text-muted-foreground"> {m['discountCodeInput.perTicket']()}</span>
+
+							{#if quantity > 1}
+								<p class="mt-1 font-medium text-foreground">
+									{m['discountCodeInput.total']()}
+									{formatMoney(discountedPrice * quantity, currency)}
+								</p>
+							{/if}
+						</div>
+					{/if}
+				</div>
+			{:else}
+				<!-- Discount code input -->
+				<div class="flex gap-2">
+					<Input
+						type="text"
+						bind:value={discountCodeInput}
+						placeholder={m['discountCodeInput.codePlaceholder']()}
+						disabled={isProcessing || isValidatingDiscount}
+						class="flex-1 uppercase"
+						aria-label={m['discountCodeInput.discountCode']()}
+						aria-invalid={discountError ? 'true' : undefined}
+						aria-describedby={discountError ? 'discount-error' : undefined}
+						oninput={() => {
+							discountCodeInput = discountCodeInput.replace(/[^\p{L}\p{N}]/gu, '').toUpperCase();
+						}}
+						onkeydown={(e) => {
+							if (e.key === 'Enter') {
+								e.preventDefault();
+								e.stopPropagation();
+								validateDiscountCode();
+							}
+						}}
+					/>
+					<Button
+						variant="outline"
+						onclick={validateDiscountCode}
+						disabled={isProcessing || isValidatingDiscount || !discountCodeInput.trim()}
+					>
+						{#if isValidatingDiscount}
+							<Loader2 class="h-4 w-4 animate-spin" />
+						{:else}
+							{m['discountCodeInput.apply']()}
+						{/if}
+					</Button>
+				</div>
+
+				{#if discountError}
+					<p id="discount-error" class="text-sm text-destructive" role="alert">
+						{discountError}
+					</p>
+				{/if}
+			{/if}
+		</div>
+	{/if}
+</div>

@@ -1,0 +1,460 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import type {
+		CitySchema,
+		VenueDetailSchema,
+		EventVisibilitySettings,
+		ResourceVisibility
+	} from '$lib/api/generated';
+	import CityAutocomplete from '$lib/components/forms/CityAutocomplete.svelte';
+	import VenueSelector from './VenueSelector.svelte';
+	import {
+		MapPin,
+		Building2,
+		Eye,
+		Map,
+		ChevronDown,
+		ChevronRight,
+		HelpCircle,
+		ArrowLeft
+	} from '@lucide/svelte';
+	import { extractMapEmbedUrl } from '$lib/utils/maps';
+
+	type LocationMode = 'none' | 'address' | 'venue';
+
+	interface Props {
+		formData: {
+			venue_id?: string | null;
+			address?: string | null;
+			is_virtual?: boolean;
+			visibility_settings?: EventVisibilitySettings;
+			location_maps_url?: string | null;
+			location_maps_embed?: string | null;
+		};
+		selectedCity: CitySchema | null;
+		selectedVenue: VenueDetailSchema | null;
+		organizationSlug: string;
+		validationErrors: Record<string, string>;
+		onUpdate: (data: Record<string, unknown>) => void;
+		onCitySelect: (city: CitySchema | null) => void;
+		onVenueSelect: (venue: VenueDetailSchema | null) => void;
+	}
+
+	const {
+		formData,
+		selectedCity,
+		selectedVenue,
+		organizationSlug,
+		validationErrors,
+		onUpdate,
+		onCitySelect,
+		onVenueSelect
+	}: Props = $props();
+
+	// Derive the expected mode from formData
+	// Note: city_id is not used for detection because it may be inherited from the organization
+	const derivedMode = $derived.by((): LocationMode => {
+		if (formData.venue_id) return 'venue';
+		if (formData.address) return 'address';
+		return 'none';
+	});
+
+	// Track if user has manually selected a mode (to prevent auto-switching)
+	let userSelectedMode = $state<LocationMode | null>(null);
+
+	// Location mode: use user selection if available, otherwise derive from data
+	const locationMode = $derived(userSelectedMode ?? derivedMode);
+
+	// Maps section expanded state - derive from whether maps data exists
+	const hasMapsData = $derived(!!formData.location_maps_url || !!formData.location_maps_embed);
+	let mapsExpanded = $state(false);
+
+	// Auto-expand maps section when data exists
+	$effect(() => {
+		if (hasMapsData && !mapsExpanded) {
+			mapsExpanded = true;
+		}
+	});
+
+	/**
+	 * Set location mode and clear data if switching modes
+	 */
+	function setMode(mode: LocationMode) {
+		// Clear previous data when switching modes
+		if (mode === 'address' && locationMode === 'venue') {
+			// Switching from venue to address - clear venue data
+			onVenueSelect(null);
+			onUpdate({ venue_id: null });
+		} else if (mode === 'venue' && locationMode === 'address') {
+			// Switching from address to venue - clear address data
+			onCitySelect(null);
+			onUpdate({
+				city_id: null,
+				address: null,
+				visibility_settings: { ...formData.visibility_settings, address_visibility: 'public' },
+				location_maps_url: null,
+				location_maps_embed: null
+			});
+		}
+		userSelectedMode = mode;
+	}
+
+	/**
+	 * Handle going back to CTA selection
+	 */
+	function goBackToSelection() {
+		// Clear all location data
+		onVenueSelect(null);
+		onCitySelect(null);
+		onUpdate({
+			venue_id: null,
+			city_id: null,
+			address: null,
+			visibility_settings: { ...formData.visibility_settings, address_visibility: 'public' },
+			location_maps_url: null,
+			location_maps_embed: null
+		});
+		userSelectedMode = 'none';
+	}
+
+	/**
+	 * Handle city selection in address mode
+	 */
+	function handleCitySelect(city: CitySchema | null) {
+		onCitySelect(city);
+		onUpdate({ city_id: city?.id || null });
+	}
+
+	/**
+	 * Handle venue selection
+	 */
+	function handleVenueSelect(venue: VenueDetailSchema | null) {
+		onVenueSelect(venue);
+		if (venue) {
+			// Auto-populate city from venue
+			if (venue.city) {
+				onCitySelect(venue.city);
+				onUpdate({
+					venue_id: venue.id,
+					city_id: venue.city.id,
+					address: venue.address || null
+				});
+			} else {
+				onUpdate({
+					venue_id: venue.id,
+					address: venue.address || null
+				});
+			}
+		} else {
+			onUpdate({ venue_id: null });
+		}
+	}
+
+	/**
+	 * Handle maps embed input - validates and sanitizes the URL
+	 */
+	function handleMapsEmbedInput(value: string | null): void {
+		const extractedUrl = extractMapEmbedUrl(value);
+		onUpdate({ location_maps_embed: extractedUrl });
+	}
+
+	/**
+	 * Format city for display
+	 */
+	function formatCity(city: CitySchema | null): string {
+		if (!city) return '';
+		const parts = [city.name];
+		if (city.admin_name) parts.push(city.admin_name);
+		if (city.country) parts.push(city.country);
+		return parts.join(', ');
+	}
+</script>
+
+<div class="space-y-4 rounded-lg border border-border p-4">
+	<!-- Section Header -->
+	<div class="flex items-center justify-between">
+		<h3 class="flex items-center gap-2 font-semibold">
+			<MapPin class="h-5 w-5" aria-hidden="true" />
+			{m['locationSection.title']()}
+		</h3>
+		{#if locationMode !== 'none'}
+			<button
+				type="button"
+				onclick={goBackToSelection}
+				class="flex items-center gap-1 text-sm text-muted-foreground transition-colors hover:text-foreground"
+			>
+				<ArrowLeft class="h-4 w-4" aria-hidden="true" />
+				{m['locationSection.changeLocationType']()}
+			</button>
+		{/if}
+	</div>
+
+	<!-- Mode: None - Show CTAs -->
+	{#if locationMode === 'none'}
+		<div class="grid gap-4 sm:grid-cols-2">
+			<!-- Add Address Card -->
+			<button
+				type="button"
+				onclick={() => setMode('address')}
+				class="flex flex-col items-center gap-3 rounded-lg border-2 border-dashed border-input p-6 text-center transition-colors hover:border-primary hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+			>
+				<MapPin class="h-8 w-8 text-muted-foreground" aria-hidden="true" />
+				<div>
+					<p class="font-medium">{m['locationSection.addAddress']()}</p>
+					<p class="text-sm text-muted-foreground">
+						{m['locationSection.addAddressHint']()}
+					</p>
+				</div>
+			</button>
+
+			<!-- Select Venue Card -->
+			{#if organizationSlug}
+				<button
+					type="button"
+					onclick={() => setMode('venue')}
+					class="flex flex-col items-center gap-3 rounded-lg border-2 border-dashed border-input p-6 text-center transition-colors hover:border-primary hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+				>
+					<Building2 class="h-8 w-8 text-muted-foreground" aria-hidden="true" />
+					<div>
+						<p class="font-medium">{m['locationSection.selectVenue']()}</p>
+						<p class="text-sm text-muted-foreground">
+							{m['locationSection.selectVenueHint']()}
+						</p>
+					</div>
+				</button>
+			{/if}
+		</div>
+	{/if}
+
+	<!-- Mode: Address - Manual entry form -->
+	{#if locationMode === 'address'}
+		<div class="space-y-4">
+			<!-- City -->
+			<CityAutocomplete
+				value={selectedCity}
+				onSelect={handleCitySelect}
+				error={validationErrors.city_id}
+				label={m['locationSection.cityLabel']()}
+				description=""
+			/>
+			{#if validationErrors.city_id}
+				<p class="text-sm text-destructive" role="alert">
+					{validationErrors.city_id}
+				</p>
+			{/if}
+
+			<!-- Address. For virtual events (#830) the same field doubles as the
+			     meeting link: an http(s) URL entered here renders as a clickable
+			     join link on the public page (visibility still follows the
+			     address-visibility setting below). -->
+			<div class="space-y-2">
+				<label for="location-address" class="block text-sm font-medium">
+					<span class="flex items-center gap-2">
+						<MapPin class="h-4 w-4" aria-hidden="true" />
+						{formData.is_virtual
+							? m['locationSection.addressLabelVirtual']()
+							: m['locationSection.addressLabel']()}
+					</span>
+				</label>
+				<input
+					id="location-address"
+					type="text"
+					value={formData.address || ''}
+					oninput={(e) => onUpdate({ address: e.currentTarget.value || null })}
+					placeholder={formData.is_virtual
+						? m['locationSection.addressPlaceholderVirtual']()
+						: m['locationSection.addressPlaceholder']()}
+					aria-describedby={formData.is_virtual ? 'location-address-virtual-hint' : undefined}
+					class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				/>
+				{#if formData.is_virtual}
+					<p id="location-address-virtual-hint" class="text-xs text-muted-foreground">
+						{m['locationSection.addressVirtualHint']()}
+					</p>
+				{/if}
+			</div>
+
+			<!-- Address Visibility -->
+			<div class="space-y-2">
+				<label for="location-address-visibility" class="block text-sm font-medium">
+					<span class="flex items-center gap-2">
+						<Eye class="h-4 w-4" aria-hidden="true" />
+						{m['locationSection.addressVisibility']()}
+					</span>
+				</label>
+				<select
+					id="location-address-visibility"
+					value={formData.visibility_settings?.address_visibility || 'public'}
+					onchange={(e) =>
+						onUpdate({
+							visibility_settings: {
+								...formData.visibility_settings,
+								address_visibility: e.currentTarget.value as ResourceVisibility
+							}
+						})}
+					class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					<option value="public">{m['detailsStep.addressVisibilityPublic']()}</option>
+					<option value="members-only">{m['detailsStep.addressVisibilityMembersOnly']()}</option>
+					<option value="attendees-only">{m['detailsStep.addressVisibilityAttendeesOnly']()}</option
+					>
+					<option value="private">{m['detailsStep.addressVisibilityPrivate']()}</option>
+				</select>
+				<p class="text-xs text-muted-foreground">
+					{m['detailsStep.addressVisibilityHint']()}
+				</p>
+			</div>
+
+			<!-- Maps Sub-section (Collapsible) -->
+			<div class="rounded-lg border border-border">
+				<button
+					type="button"
+					onclick={() => (mapsExpanded = !mapsExpanded)}
+					class="flex w-full items-center justify-between p-3 text-left transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+					aria-expanded={mapsExpanded}
+				>
+					<div class="flex items-center gap-2 text-sm font-medium">
+						<Map class="h-4 w-4" aria-hidden="true" />
+						{m['locationSection.mapsSection']()}
+					</div>
+					{#if mapsExpanded}
+						<ChevronDown class="h-4 w-4" aria-hidden="true" />
+					{:else}
+						<ChevronRight class="h-4 w-4" aria-hidden="true" />
+					{/if}
+				</button>
+
+				{#if mapsExpanded}
+					<div class="space-y-4 border-t p-3">
+						<!-- Info Box -->
+						<div
+							class="flex items-start gap-3 rounded-md border border-info/40 bg-info/10 p-3 text-sm text-info"
+						>
+							<HelpCircle class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
+							<div class="space-y-2">
+								<p class="font-medium">
+									{m['detailsStep.mapsHelpTitle']()}
+								</p>
+								<ol class="list-inside list-decimal space-y-1 text-xs">
+									<li>
+										{m['detailsStep.mapsHelpStep1']()}
+									</li>
+									<li>{m['detailsStep.mapsHelpStep2']()}</li>
+									<li>
+										{m['detailsStep.mapsHelpStep3']()}
+									</li>
+									<li>
+										{m['detailsStep.mapsHelpStep4']()}
+									</li>
+								</ol>
+							</div>
+						</div>
+
+						<!-- Maps URL -->
+						<div class="space-y-2">
+							<label for="location-maps-url" class="block text-sm font-medium">
+								{m['locationSection.mapsUrl']()}
+							</label>
+							<input
+								id="location-maps-url"
+								type="url"
+								value={formData.location_maps_url || ''}
+								oninput={(e) => onUpdate({ location_maps_url: e.currentTarget.value || null })}
+								placeholder={m['detailsStep.mapsUrlPlaceholder']()}
+								class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+							/>
+							<p class="text-xs text-muted-foreground">
+								{m['locationSection.mapsUrlHint']()}
+							</p>
+						</div>
+
+						<!-- Maps Embed -->
+						<div class="space-y-2">
+							<label for="location-maps-embed" class="block text-sm font-medium">
+								{m['locationSection.mapsEmbed']()}
+							</label>
+							<textarea
+								id="location-maps-embed"
+								value={formData.location_maps_embed || ''}
+								oninput={(e) => handleMapsEmbedInput(e.currentTarget.value || null)}
+								placeholder={m['detailsStep.mapsEmbedPlaceholder']()}
+								rows={3}
+								class="flex w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+							></textarea>
+							<p class="text-xs text-muted-foreground">
+								{m['locationSection.mapsEmbedHint']()}
+							</p>
+						</div>
+
+						<!-- Preview -->
+						{#if formData.location_maps_embed}
+							<div class="space-y-2">
+								<p class="text-sm font-medium">{m['detailsStep.mapsPreview']()}</p>
+								<div class="overflow-hidden rounded-lg border">
+									<iframe
+										src={formData.location_maps_embed}
+										width="100%"
+										height="200"
+										style="border:0;"
+										sandbox="allow-scripts"
+										loading="lazy"
+										referrerpolicy="no-referrer-when-downgrade"
+										title={m['detailsStep.mapsPreviewTitle']()}
+									></iframe>
+								</div>
+							</div>
+						{/if}
+					</div>
+				{/if}
+			</div>
+		</div>
+	{/if}
+
+	<!-- Mode: Venue - Venue selection form -->
+	{#if locationMode === 'venue'}
+		<div class="space-y-4">
+			<!-- Venue Selector -->
+			<VenueSelector {organizationSlug} {selectedVenue} onSelect={handleVenueSelect} />
+
+			<!-- Read-only City (from venue) -->
+			{#if selectedVenue?.city}
+				<div class="space-y-2">
+					<label class="block text-sm font-medium">
+						<span class="flex items-center gap-2">
+							<MapPin class="h-4 w-4" aria-hidden="true" />
+							{m['locationSection.cityLabel']()}
+						</span>
+					</label>
+					<div
+						class="flex h-10 w-full items-center rounded-md border border-input bg-muted/50 px-3 py-2 text-sm text-muted-foreground"
+					>
+						{formatCity(selectedVenue.city)}
+					</div>
+					<p class="text-xs text-muted-foreground">
+						{m['locationSection.cityFromVenue']()}
+					</p>
+				</div>
+			{/if}
+
+			<!-- Read-only Address (from venue) -->
+			{#if selectedVenue?.address}
+				<div class="space-y-2">
+					<label class="block text-sm font-medium">
+						<span class="flex items-center gap-2">
+							<MapPin class="h-4 w-4" aria-hidden="true" />
+							{m['locationSection.addressLabel']()}
+						</span>
+					</label>
+					<div
+						class="flex h-10 w-full items-center rounded-md border border-input bg-muted/50 px-3 py-2 text-sm text-muted-foreground"
+					>
+						{selectedVenue.address}
+					</div>
+					<p class="text-xs text-muted-foreground">
+						{m['locationSection.addressFromVenue']()}
+					</p>
+				</div>
+			{/if}
+		</div>
+	{/if}
+</div>

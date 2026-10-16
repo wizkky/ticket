@@ -1,0 +1,942 @@
+import typing as t
+import uuid
+from collections import Counter
+from datetime import datetime
+from uuid import UUID
+
+from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
+from django.contrib.gis.db import models
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
+from django.db.models import Prefetch, Q
+from django.utils.translation import gettext_lazy as _
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic import ValidationError as PydanticValidationError
+
+from accounts.models import RevelUser
+from common.fields import MarkdownField
+from common.models import StripeConnectMixin, TagAssignment, TaggableMixin, TimeStampedModel
+from events.utils.visibility import get_excluded_org_ids, get_valid_member_org_ids
+
+from .mixins import (
+    LocationMixin,
+    LogoCoverValidationMixin,
+    SlugFromNameMixin,
+    SocialMediaMixin,
+    TokenMixin,
+    UserRequestMixin,
+    VisibilityMixin,
+)
+
+ALLOWED_MEMBERSHIP_REQUEST_METHODS = ["telegram", "email", "webform"]  # kept for backwards compatibility
+
+
+def _validate_membership_request_methods(value: list[str]) -> None:
+    pass  # kept for backwards compatibility
+
+
+class OrgTractionRow(t.NamedTuple):
+    """A single ranked row in the 'top organizations by traction' leaderboard."""
+
+    organization_id: UUID
+    name: str
+    distinct_users: int
+
+
+class OrganizationQuerySet(models.QuerySet["Organization"]):
+    def with_tags(self) -> t.Self:
+        """Prefetch tags and related tag objects for max performance."""
+        return self.prefetch_related(
+            Prefetch(
+                "tags",  # the GenericRelation on Event
+                queryset=TagAssignment.objects.select_related("tag"),
+                to_attr="prefetched_tagassignments",  # Optional: if you want to use a custom attribute
+            )
+        )
+
+    def with_city(self) -> t.Self:
+        """Select the city as well."""
+        return self.select_related("city")
+
+    def for_user(self, user: RevelUser | AnonymousUser, allowed_ids: list[UUID] | None = None) -> t.Self:
+        """Get queryset for user using a high-performance UNION-based strategy.
+
+        Avoid slow, multi-JOIN queries.
+
+        Membership status handling:
+        - BANNED/blacklisted users: Cannot see the organization at all, whatever branch would
+          otherwise grant access (public, membership, staff, ``allowed_ids``), unless they own it
+        - CANCELLED users: Treated as if they have no membership
+        - PAUSED/ACTIVE users: Can see organizations based on visibility rules
+        """
+        is_allowed_special = Q(id__in=allowed_ids) if allowed_ids else Q()
+
+        # --- Fast paths for special users ---
+        if user.is_superuser or user.is_staff:
+            return self.all()
+        if user.is_anonymous:
+            # UNLISTED orgs are accessible like PUBLIC (e.g. via direct link);
+            # discovery listings use discoverable_for_user() to hide them.
+            return self.filter(Q(visibility__in=Organization.Visibility.publicly_accessible()) | is_allowed_special)
+
+        # --- Check if user is banned or blacklisted from any organization ---
+        # If a user is banned/blacklisted, they cannot see the organization at all (applied at the end)
+        excluded_org_ids = get_excluded_org_ids(user)
+
+        # --- "Gather-then-filter" strategy for standard users ---
+
+        # 1. Gather IDs from all distinct sources of visibility.
+
+        # A) Publicly accessible organizations (PUBLIC + UNLISTED).
+        #    UNLISTED orgs are accessible like PUBLIC ones (e.g. via direct link),
+        #    but are filtered out from discovery listings by discoverable_for_user().
+        public_orgs_qs = self.filter(visibility__in=Organization.Visibility.publicly_accessible()).values("id")
+
+        # B) Organizations the user owns
+        owned_orgs_qs = self.filter(owner=user).values("id")
+
+        # C) Organizations where the user is a staff member
+        staff_orgs_qs = self.filter(staff_members=user).values("id")
+
+        # D) Restricted organizations where the user is a valid member (not cancelled, not banned)
+        member_orgs_qs = self.filter(
+            visibility__in=[Organization.Visibility.MEMBERS_ONLY, Organization.Visibility.PRIVATE],
+            id__in=get_valid_member_org_ids(user),
+        ).values("id")
+
+        # 2. Combine the querysets of IDs using UNION.
+        # This is extremely fast and efficiently handled by the database.
+        visible_org_ids_qs = public_orgs_qs.union(owned_orgs_qs, staff_orgs_qs, member_orgs_qs)
+
+        # 3. Filter the main queryset using the gathered IDs.
+        # This final query is very fast as it filters on the primary key.
+        qs = self.filter(Q(id__in=visible_org_ids_qs) | is_allowed_special)
+
+        # 4. A ban/blacklist trumps every branch above; only the owner is exempt
+        #    (see events.utils.visibility.not_excluded_q).
+        if excluded_org_ids:
+            qs = qs.filter(~Q(id__in=excluded_org_ids) | Q(owner=user))
+        return qs.distinct()
+
+    def discoverable_for_user(self, user: RevelUser | AnonymousUser, allowed_ids: list[UUID] | None = None) -> t.Self:
+        """Get queryset for discovery listings (browse/search).
+
+        Wraps for_user() and additionally hides UNLISTED organizations
+        from users who are not the owner or staff of that organization.
+        """
+        qs = self.for_user(user, allowed_ids)
+        if user.is_superuser or user.is_staff:
+            return qs
+        if user.is_anonymous:
+            return qs.exclude(visibility=Organization.Visibility.UNLISTED)
+        is_owner_or_staff = Q(owner=user) | Q(staff_members=user)
+        return qs.exclude(Q(visibility=Organization.Visibility.UNLISTED) & ~is_owner_or_staff)
+
+    def top_by_traction(self, since: datetime, limit: int = 10) -> list[OrgTractionRow]:
+        """Rank organizations by the number of distinct users they reached since ``since``.
+
+        Traction is the count of distinct users who, with an RSVP/ticket
+        ``created_at`` on or after ``since``, engaged with any event belonging to
+        the organization, where "engaged" means either:
+
+        - an :class:`EventRSVP` with status ``yes`` or ``maybe``, **or**
+        - a :class:`Ticket` with status ``active``, ``checked_in`` or ``pending``.
+
+        A user is counted **once per organization** even if they both RSVP'd and
+        bought a ticket: the two ``(organization, user)`` pair sets are combined with
+        a DB-side ``UNION`` (not ``UNION ALL``), so identical pairs are deduplicated
+        in PostgreSQL before they reach Python.
+
+        Name resolution is scoped to ``self``, so calling this on a filtered queryset
+        (e.g. ``Organization.objects.for_user(user)``) restricts the leaderboard to
+        the organizations in that queryset. Note that the engagement scan itself is
+        global: ``self`` only filters the final org set, so the result is correctly
+        scoped even though the RSVP/ticket pair counts are computed across all
+        organizations (this keeps the all-orgs dashboard path free of a redundant
+        ``organization_id__in`` subquery).
+
+        Performance: the ``UNION`` is deduplicated in the DB, but the per-organization
+        count is done in Python via :class:`collections.Counter`. The Counter consumes
+        the cursor lazily, so peak app memory is bounded by the number of distinct
+        organizations (small); the cost that scales with engagement volume is the
+        DB→app transfer of the deduplicated pairs, not memory. This is acceptable for
+        a low-frequency admin dashboard. If the transfer ever becomes a bottleneck,
+        swap the body for a single raw-SQL ``GROUP BY`` over the ``UNION`` subquery —
+        the ``(since, limit)`` signature is the seam, so callers, the dashboard helper,
+        the template and the tests stay unchanged.
+
+        Args:
+            since: Inclusive lower bound on the RSVP/ticket ``created_at``.
+            limit: Maximum number of organizations to return.
+
+        Returns:
+            Up to ``limit`` rows, ranked by ``distinct_users`` descending, ties broken
+            alphabetically (case-insensitive) by organization name. Organizations with
+            zero qualifying users are omitted.
+        """
+        from events.models import EventRSVP, Ticket
+
+        rsvp_pairs = EventRSVP.objects.filter(
+            status__in=[EventRSVP.RsvpStatus.YES, EventRSVP.RsvpStatus.MAYBE],
+            created_at__gte=since,
+        ).values_list("event__organization_id", "user_id")
+        ticket_pairs = Ticket.objects.filter(
+            status__in=[
+                Ticket.TicketStatus.ACTIVE,
+                Ticket.TicketStatus.CHECKED_IN,
+                Ticket.TicketStatus.PENDING,
+            ],
+            created_at__gte=since,
+        ).values_list("event__organization_id", "user_id")
+
+        # UNION (the default, not UNION ALL) deduplicates identical (org, user) rows in
+        # the DB, so a user who both RSVP'd and bought a ticket for the same org is
+        # counted once. Counting per org happens here because Django cannot apply a
+        # GROUP BY on top of a .union() queryset.
+        counts: Counter[UUID] = Counter(org_id for org_id, _user_id in rsvp_pairs.union(ticket_pairs))
+        if not counts:
+            return []
+
+        names: dict[UUID, str] = dict(self.filter(id__in=list(counts)).values_list("id", "name"))
+        rows = [
+            OrgTractionRow(organization_id=org_id, name=names[org_id], distinct_users=count)
+            for org_id, count in counts.items()
+            if org_id in names
+        ]
+        rows.sort(key=lambda row: (-row.distinct_users, row.name.casefold()))
+        return rows[:limit]
+
+
+class OrganizationManager(models.Manager["Organization"]):
+    def get_queryset(self) -> OrganizationQuerySet:
+        """Get base queryset."""
+        return OrganizationQuerySet(self.model, using=self._db)
+
+    def for_user(self, user: RevelUser | AnonymousUser, allowed_ids: list[UUID] | None = None) -> OrganizationQuerySet:
+        """Get queryset for user."""
+        return self.get_queryset().for_user(user, allowed_ids)
+
+    def discoverable_for_user(
+        self, user: RevelUser | AnonymousUser, allowed_ids: list[UUID] | None = None
+    ) -> OrganizationQuerySet:
+        """Get queryset for discovery listings."""
+        return self.get_queryset().discoverable_for_user(user, allowed_ids)
+
+    def with_tags(self) -> OrganizationQuerySet:
+        """Returns a queryset prefetching tags."""
+        return self.get_queryset().with_tags()
+
+    def with_city(self) -> OrganizationQuerySet:
+        """Returns a queryset with city."""
+        return self.get_queryset().with_city()
+
+    def full(self) -> OrganizationQuerySet:
+        """Returns a queryset prefetching the full organizations."""
+        return self.get_queryset().with_city().with_tags()
+
+    def top_by_traction(self, since: datetime, limit: int = 10) -> list[OrgTractionRow]:
+        """Rank organizations by distinct users reached since ``since`` (see queryset method)."""
+        return self.get_queryset().top_by_traction(since=since, limit=limit)
+
+
+class Organization(
+    TaggableMixin,
+    SlugFromNameMixin,
+    TimeStampedModel,
+    VisibilityMixin,
+    LocationMixin,
+    LogoCoverValidationMixin,
+    SocialMediaMixin,
+    StripeConnectMixin,
+):
+    class InvoicingMode(models.TextChoices):
+        """Attendee invoicing mode."""
+
+        NONE = "none", "None"
+        HYBRID = "hybrid", "Hybrid (draft + manual send)"
+        AUTO = "auto", "Auto (generate + send)"
+
+    class ContactMethod(models.TextChoices):
+        """How non-members can reach the organization."""
+
+        NONE = "none", "None"
+        EMAIL = "email", "Email"
+        FORM = "form", "Form"
+
+    class RevenueReportCadence(models.TextChoices):
+        """Cadence for scheduled revenue & VAT report delivery."""
+
+        NONE = "none", "None"
+        QUARTERLY = "quarterly", "Quarterly"
+        MONTHLY = "monthly", "Monthly"
+
+    name = models.CharField(max_length=255, unique=True)
+    slug = models.SlugField(max_length=255, unique=True)
+    description = MarkdownField(null=True, blank=True)
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="owned_organizations",
+    )
+    staff_members = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name="staff_organizations",
+        through="events.OrganizationStaff",
+        blank=True,
+    )
+    members = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        related_name="member_organizations",
+        through="events.OrganizationMember",
+        blank=True,
+    )
+    platform_fee_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=settings.DEFAULT_PLATFORM_FEE_PERCENT,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="The percentage platform fee Revel takes on ticket sales for this organization.",
+    )
+    platform_fee_fixed = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=settings.DEFAULT_PLATFORM_FEE_FIXED,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="The fixed platform fee for this organization.",
+    )
+    # VAT / billing information
+    vat_id = models.CharField(
+        max_length=20,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text="EU VAT identification number including country prefix (e.g., IT12345678901).",
+    )
+    vat_country_code = models.CharField(
+        max_length=2,
+        blank=True,
+        default="",
+        help_text="ISO 3166-1 alpha-2 country code for VAT purposes.",
+    )
+    vat_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Default VAT rate for ticket sales (e.g., 22.00 for 22%).",
+    )
+    vat_id_validated = models.BooleanField(
+        default=False,
+        help_text="Whether the VAT ID has been validated via VIES.",
+    )
+    vat_id_validated_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the VAT ID was last validated via VIES.",
+    )
+    vies_request_identifier = models.CharField(
+        max_length=50,
+        blank=True,
+        default="",
+        help_text="VIES request identifier from the last validation (compliance audit trail).",
+    )
+    billing_address = models.TextField(
+        blank=True,
+        default="",
+        help_text="Organization billing address for invoicing.",
+    )
+    billing_email = models.EmailField(
+        blank=True,
+        default="",
+        help_text="Email address for invoice delivery and the attendee-invoice BCC copy. When empty, the "
+        "invoice copy falls back to the contact email only if it is verified.",
+    )
+    billing_name = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text=(
+            "Legal entity name for invoicing (e.g., company or individual name as registered)."
+            " Falls back to the organization name if empty."
+        ),
+    )
+
+    # Attendee invoicing
+    invoicing_mode = models.CharField(
+        max_length=10,
+        choices=InvoicingMode.choices,
+        default=InvoicingMode.NONE,
+        help_text="Attendee invoicing mode: none, hybrid (draft + manual send), or auto (generate + send).",
+    )
+
+    # Revenue report delivery
+    revenue_report_cadence = models.CharField(
+        max_length=10,
+        choices=RevenueReportCadence.choices,
+        default=RevenueReportCadence.NONE,
+        help_text="Cadence for emailed revenue & VAT reports. Requires billing_email when not 'none'.",
+    )
+    last_revenue_report_sent_period = models.CharField(
+        max_length=16,
+        blank=True,
+        default="",
+        help_text="Last period for which a revenue report was sent (e.g. '2024-Q1' or '2024-03').",
+    )
+
+    # Membership subscriptions
+    membership_grace_period_days = models.PositiveIntegerField(
+        default=7,
+        help_text=_("Days a PAST_DUE subscription stays valid before expiring."),
+    )
+    membership_subscription_revival_window_days = models.PositiveIntegerField(
+        default=30,
+        help_text=_(
+            "Days after subscription expiry during which a member can revive in place. "
+            "Set to 0 to disable revival entirely."
+        ),
+    )
+    membership_refund_policy = MarkdownField(blank=True, default="")
+
+    accept_membership_requests = models.BooleanField(default=False)
+    contact_email = models.EmailField(blank=True, null=True)
+    contact_email_verified = models.BooleanField(default=False)
+    attribution = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="Campaign tags (utm_source/medium/campaign/content) the owner arrived with, "
+        "as sent by the create-organization payload (#1075). Null when the URL carried none. Never updated.",
+    )
+    contact_method = models.CharField(
+        max_length=10,
+        choices=ContactMethod.choices,
+        default=ContactMethod.NONE,
+        help_text=(
+            "How non-members can reach the organization: NONE hides contact info; "
+            "EMAIL exposes the verified contact_email; FORM enables the in-platform contact form."
+        ),
+    )
+
+    default_membership_questionnaire = models.ForeignKey(
+        "events.OrganizationQuestionnaire",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="default_for_organizations",
+        # Must be a string literal to avoid circular import — keep in sync with
+        # OrganizationQuestionnaire.QuestionnaireType.MEMBERSHIP.
+        limit_choices_to={"questionnaire_type": "membership"},
+        help_text=_("Default membership questionnaire applied to all tiers (overridable per tier)."),
+    )
+    default_requires_membership_approval = models.BooleanField(
+        default=False,
+        help_text=_("When True, every membership application requires manual staff approval."),
+    )
+
+    objects = OrganizationManager()
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+    def clean(self) -> None:
+        """Validate contact_method invariants and the default membership questionnaire.
+
+        Setting contact_method to EMAIL or FORM requires a verified contact_email.
+        Service-layer callers should enforce the same rule, but this safety net
+        guarantees the invariant when models are saved via admin or other paths.
+
+        Additionally validates that ``default_membership_questionnaire`` (when set)
+        belongs to this organization and is of type ``MEMBERSHIP``. ``limit_choices_to``
+        is admin-only and not enforced on direct ORM ``save()``, so this check matters.
+        """
+        super().clean()
+        if self.contact_method != self.ContactMethod.NONE and not (self.contact_email and self.contact_email_verified):
+            raise DjangoValidationError(
+                {
+                    "contact_method": _(
+                        "A verified contact email is required to enable a contact method other than NONE."
+                    )
+                }
+            )
+        if self.default_membership_questionnaire_id and self.pk:
+            # Lazy import to avoid circular dependency: questionnaire.py imports organization.py.
+            from .questionnaire import OrganizationQuestionnaire
+
+            oq = self.default_membership_questionnaire
+            if oq is not None and oq.organization_id != self.pk:
+                raise DjangoValidationError(
+                    {
+                        "default_membership_questionnaire": _(
+                            "Default membership questionnaire must belong to this organization."
+                        )
+                    }
+                )
+            if oq is not None and oq.questionnaire_type != OrganizationQuestionnaire.QuestionnaireType.MEMBERSHIP:
+                raise DjangoValidationError(
+                    {"default_membership_questionnaire": _("Membership questionnaire must be of type MEMBERSHIP.")}
+                )
+
+    def is_owner_or_staff(self, user: RevelUser) -> bool:
+        """Check if user is the organization owner or a staff member."""
+        return self.owner_id == user.id or OrganizationStaff.objects.filter(organization=self, user_id=user.id).exists()
+
+    def has_org_permission(self, user_id: UUID, action: str) -> bool:
+        """Check if user has a specific permission on this organization.
+
+        Owners implicitly have all permissions. Staff members are checked
+        against their permission map for the given action.
+        """
+        if self.owner_id == user_id:
+            return True
+        if staff := OrganizationStaff.objects.filter(organization=self, user_id=user_id).first():
+            return staff.has_permission(action)
+        return False
+
+
+# Canonical set of staff-permission keys. Every ``PermissionMap`` field below must appear
+# here (and vice versa) so that ``OrganizationPermission("...")`` and the other map-resolving
+# permission classes only accept real keys — a bogus key can never be granted, so it would
+# silently deny all non-owner staff (see #683). The two are kept in sync by a unit test.
+PermissionKey = t.Literal[
+    "view_organization_details",
+    "create_event",
+    "create_event_series",
+    "edit_event_series",
+    "delete_event_series",
+    "edit_event",
+    "delete_event",
+    "open_event",
+    "manage_tickets",
+    "close_event",
+    "manage_event",
+    "check_in_attendees",
+    "invite_to_event",
+    "edit_organization",
+    "manage_members",
+    "manage_potluck",
+    "create_questionnaire",
+    "edit_questionnaire",
+    "delete_questionnaire",
+    "evaluate_questionnaire",
+    "send_announcements",
+    "manage_subscriptions",
+    "manage_polls",
+]
+
+
+class PermissionMap(BaseModel):
+    view_organization_details: bool = True
+    create_event: bool = False
+    create_event_series: bool = False
+    edit_event_series: bool = False
+    delete_event_series: bool = False
+    edit_event: bool = True
+    delete_event: bool = False
+    open_event: bool = True
+    manage_tickets: bool = True
+    close_event: bool = True
+    manage_event: bool = True
+    check_in_attendees: bool = True
+    invite_to_event: bool = True
+    edit_organization: bool = False
+    manage_members: bool = False
+    manage_potluck: bool = False
+    create_questionnaire: bool = False
+    edit_questionnaire: bool = False
+    delete_questionnaire: bool = False
+    evaluate_questionnaire: bool = True
+    send_announcements: bool = False
+    manage_subscriptions: bool = True
+    manage_polls: bool = False
+
+
+class PermissionsSchema(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    default: PermissionMap = Field(default_factory=PermissionMap)
+    event_overrides: dict[uuid.UUID, PermissionMap] = Field(default_factory=dict)
+
+
+def _get_default_permissions() -> dict[str, t.Any]:
+    return PermissionsSchema().model_dump(mode="json")
+
+
+def _validate_permissions(value: dict[str, t.Any]) -> None:
+    try:
+        PermissionsSchema.model_validate(value)
+    except PydanticValidationError as e:
+        raise DjangoValidationError(e.errors())
+
+
+class OrganizationStaff(TimeStampedModel):
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="staff_memberships",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="organization_staff_memberships",
+    )
+    permissions = models.JSONField(
+        default=_get_default_permissions,
+        blank=True,
+        validators=[_validate_permissions],
+    )
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["organization", "user"], name="unique_organization_staff")]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.user_id} @ {self.organization_id} (staff)"
+
+    def has_permission(self, permission: str, event_id: str | None = None) -> bool:
+        """Verify if a user has permission to perform this action."""
+        if event_id:
+            event_permissions = self.permissions.get("event_overrides", {}).get(event_id, {})
+            if event_permissions:
+                return bool(event_permissions.get(permission, False))
+        return bool(self.permissions.get("default", {}).get(permission, False))
+
+
+class MembershipTier(TimeStampedModel):
+    """Represents a membership tier within an organization."""
+
+    name = models.CharField(max_length=255)
+    description = MarkdownField(blank=True, null=True)
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="tiers",
+    )
+    display_order = models.PositiveIntegerField(default=0, db_index=True)
+    membership_questionnaire = models.ForeignKey(
+        "events.OrganizationQuestionnaire",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="tiers",
+        # Must be a string literal to avoid circular import — keep in sync with
+        # OrganizationQuestionnaire.QuestionnaireType.MEMBERSHIP.
+        limit_choices_to={"questionnaire_type": "membership"},
+        help_text=_("Tier-specific membership questionnaire. NULL = inherit org default."),
+    )
+    requires_membership_approval = models.BooleanField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_("Tier-specific manual-approval override. NULL = inherit org.default_requires_membership_approval."),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "name"],
+                name="unique_organization_tier_name",
+            )
+        ]
+        ordering = ["organization", "display_order", "name"]
+        indexes = [
+            models.Index(fields=["organization", "display_order"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.organization.name} - {self.name}"
+
+    def clean(self) -> None:
+        """Validate tier-level membership questionnaire references the same organization and is MEMBERSHIP type."""
+        super().clean()
+        if self.membership_questionnaire_id and self.organization_id:
+            # Lazy import to avoid circular dependency: questionnaire.py imports organization.py.
+            from .questionnaire import OrganizationQuestionnaire
+
+            oq = self.membership_questionnaire
+            if oq is not None and oq.organization_id != self.organization_id:
+                raise DjangoValidationError(
+                    {"membership_questionnaire": _("Membership questionnaire must belong to the same organization.")}
+                )
+            if oq is not None and oq.questionnaire_type != OrganizationQuestionnaire.QuestionnaireType.MEMBERSHIP:
+                raise DjangoValidationError(
+                    {"membership_questionnaire": _("Membership questionnaire must be of type MEMBERSHIP.")}
+                )
+
+
+class OrganizationMemberQuerySet(models.QuerySet["OrganizationMember"]):
+    """Custom QuerySet for OrganizationMember with membership status filtering."""
+
+    def for_visibility(self) -> t.Self:
+        """Return memberships that grant visibility access.
+
+        Excludes:
+        - CANCELLED: Treated as if the membership doesn't exist
+        - BANNED: No access, not even to public resources
+        """
+        return self.exclude(
+            status__in=[OrganizationMember.MembershipStatus.CANCELLED, OrganizationMember.MembershipStatus.BANNED]
+        )
+
+    def active_only(self) -> t.Self:
+        """Return only ACTIVE memberships (for eligibility checks)."""
+        return self.filter(status=OrganizationMember.MembershipStatus.ACTIVE)
+
+    def banned_only(self) -> t.Self:
+        """Return only BANNED memberships."""
+        return self.filter(status=OrganizationMember.MembershipStatus.BANNED)
+
+
+class OrganizationMemberManager(models.Manager["OrganizationMember"]):
+    """Manager for OrganizationMember with custom queryset."""
+
+    def get_queryset(self) -> OrganizationMemberQuerySet:
+        """Return custom queryset."""
+        return OrganizationMemberQuerySet(self.model, using=self._db)
+
+    def for_visibility(self) -> OrganizationMemberQuerySet:
+        """Return memberships that grant visibility access."""
+        return self.get_queryset().for_visibility()
+
+    def active_only(self) -> OrganizationMemberQuerySet:
+        """Return only ACTIVE memberships."""
+        return self.get_queryset().active_only()
+
+    def banned_only(self) -> OrganizationMemberQuerySet:
+        """Return only BANNED memberships."""
+        return self.get_queryset().banned_only()
+
+
+class OrganizationMember(TimeStampedModel):
+    class MembershipStatus(models.TextChoices):
+        ACTIVE = "active"
+        PAUSED = "paused"
+        CANCELLED = "cancelled"
+        BANNED = "banned"
+
+    QR_PREFIX: t.ClassVar[str] = "member:"
+
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="memberships",
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="organization_memberships",
+    )
+    status = models.CharField(
+        default=MembershipStatus.ACTIVE, choices=MembershipStatus.choices, max_length=255, db_index=True
+    )
+    tier = models.ForeignKey(
+        MembershipTier,
+        on_delete=models.SET_NULL,
+        related_name="members",
+        null=True,
+        blank=True,
+    )
+
+    objects = OrganizationMemberManager()
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user", "status"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["organization", "user"], name="unique_organization_member_user"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id} @ {self.organization_id} ({self.status})"
+
+    def clean(self) -> None:
+        """Validate that tier belongs to the same organization."""
+        super().clean()
+        if self.tier and self.tier.organization_id != self.organization_id:
+            raise DjangoValidationError({"tier": _("The tier must belong to the same organization as the membership.")})
+
+    @property
+    def qr_payload(self) -> str:
+        """QR/barcode payload for this membership card.
+
+        Check-in/verification contract: scanners submit this string verbatim, and the
+        resolvers strip ``QR_PREFIX`` back off to get the member id — so this is the
+        single source of truth every generator (PDF, Apple Wallet, Google Wallet) must use.
+        The member row is unique per (organization, user) and reused across
+        cancel/rejoin, so the payload is stable for the lifetime of the relationship.
+        """
+        return f"{self.QR_PREFIX}{self.id}"
+
+    @property
+    def _can_hold_card(self) -> bool:
+        """Whether this member's status allows holding a membership card.
+
+        Mirrors ``for_visibility()`` / ``MembershipWalletController.get_member``:
+        CANCELLED and BANNED members get a 404 from every card download endpoint,
+        so availability flags must not advertise a button that would fail.
+        """
+        return self.status not in (self.MembershipStatus.CANCELLED, self.MembershipStatus.BANNED)
+
+    @property
+    def apple_pass_available(self) -> bool:
+        """Whether an Apple Wallet membership card is available for this member."""
+        from events.utils import apple_wallet_configured
+
+        return apple_wallet_configured() and self._can_hold_card
+
+    @property
+    def google_pass_available(self) -> bool:
+        """Whether a Google Wallet membership card is available for this member."""
+        from events.utils import google_wallet_configured
+
+        return google_wallet_configured() and self._can_hold_card
+
+
+class OrganizationToken(TokenMixin):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="tokens")
+    grants_membership = models.BooleanField(default=True)
+    grants_staff_status = models.BooleanField(default=False)
+    membership_tier = models.ForeignKey(
+        MembershipTier,
+        on_delete=models.CASCADE,
+        related_name="tokens",
+        null=True,
+        blank=True,
+        help_text="Membership tier to assign when claiming this token",
+    )
+
+    class Meta:
+        indexes = [
+            # For listing active tokens by organization
+            models.Index(fields=["organization", "expires_at"], name="orgtoken_org_expires"),
+            # For listing tokens by organization ordered by creation
+            models.Index(fields=["organization", "-created_at"], name="orgtoken_org_created"),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Token {self.id} for {self.organization_id}"
+
+    def clean(self) -> None:
+        """Validate membership tier configuration."""
+        super().clean()
+
+        # If grants_membership is True, membership_tier must be set
+        if self.grants_membership and not self.membership_tier:
+            raise DjangoValidationError({"membership_tier": _("Membership tier is required when granting membership.")})
+
+        # If membership_tier is set, verify it belongs to the same organization
+        if self.membership_tier and self.membership_tier.organization_id != self.organization_id:
+            raise DjangoValidationError(
+                {"membership_tier": _("Membership tier must belong to the same organization as the token.")}
+            )
+
+
+class MembershipRequestStatus(models.TextChoices):
+    """Application state machine for :class:`OrganizationMembershipRequest`.
+
+    Module-level with a distinct class name (not nested as ``Status``):
+    django-ninja dedupes OpenAPI ``components.schemas`` by bare class name with
+    last-writer-wins, so a nested ``Status`` clobbered the 3-value
+    ``UserRequestMixin.Status`` that ``WhitelistRequestSchema`` infers (#782).
+    Code keeps using the ``OrganizationMembershipRequest.Status`` idiom via the
+    class-level alias.
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+
+
+class OrganizationMembershipRequest(UserRequestMixin):
+    # Alias so callers keep the ``Model.Status`` idiom; the class lives at
+    # module level under a collision-free name (see its docstring, #782).
+    # The subclass deliberately widens the mixin's 3-value Status enum, so the
+    # attribute type genuinely differs from the base — hence the ignore.
+    Status = MembershipRequestStatus  # type: ignore[assignment]
+
+    # Override the inherited status field to use the expanded choices.
+    status = models.CharField(
+        max_length=10,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="membership_requests")
+    tier = models.ForeignKey(
+        "events.MembershipTier",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="membership_applications",
+        help_text=_("Target tier. NULL = tier-less legacy application; staff picks at approval."),
+    )
+    plan = models.ForeignKey(
+        "events.MembershipSubscriptionPlan",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="membership_applications",
+        help_text=_("Target plan for the paid path. NULL = free join."),
+    )
+    subscription = models.ForeignKey(
+        "events.MembershipSubscription",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="originating_application",
+    )
+    questionnaire_submission = models.ForeignKey(
+        "questionnaires.QuestionnaireSubmission",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        help_text=_("Submission that satisfied the questionnaire gate, if applicable."),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "user", "tier"],
+                condition=models.Q(status="pending"),
+                nulls_distinct=False,
+                name="unique_pending_application_per_user_org_tier",
+            ),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"Membership application: {self.user_id} -> {self.organization_id} ({self.status})"
+
+
+class OrganizationContactMessage(TimeStampedModel):
+    """A message sent to an organization via the public contact form."""
+
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="contact_messages",
+    )
+    sender = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="sent_contact_messages",
+    )
+    sender_email_snapshot = models.EmailField()
+    subject = models.CharField(max_length=200, blank=True, default="")
+    message = models.TextField()
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["organization", "-created_at"])]
+
+    def __str__(self) -> str:
+        return f"Contact message {self.pk} for {self.organization_id}"

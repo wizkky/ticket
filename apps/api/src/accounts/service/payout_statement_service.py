@@ -1,0 +1,209 @@
+"""Referral payout statement generation service.
+
+Generates self-billing invoices (Gutschrift) for B2B referrers or payout
+statements for B2C/individual referrers, with correct Austrian VAT treatment.
+"""
+
+from decimal import Decimal
+
+import structlog
+from django.core.exceptions import ValidationError
+from django.core.files.base import ContentFile
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+
+from accounts.models import ReferralPayout, ReferralPayoutStatement, UserBillingProfile
+from common.models import SiteSettings
+from common.service.invoice_utils import get_next_sequential_number, render_pdf
+from common.service.vat_utils import B2BFeeVATBreakdown, calculate_b2b_fee_vat
+
+logger = structlog.get_logger(__name__)
+
+DOCUMENT_NUMBER_PREFIX = "RVL-RP-"
+
+
+def _get_next_statement_number(year: int) -> str:
+    """Generate the next sequential statement number.
+
+    Must be called inside ``transaction.atomic()``.
+    """
+    return get_next_sequential_number(ReferralPayoutStatement, DOCUMENT_NUMBER_PREFIX, year, "document_number")
+
+
+def _determine_vat_treatment(
+    payout: ReferralPayout,
+    billing_profile: UserBillingProfile,
+    site: SiteSettings,
+) -> tuple[ReferralPayoutStatement.DocumentType, B2BFeeVATBreakdown]:
+    """Determine document type and VAT breakdown for a payout.
+
+    B2B (validated VAT ID) → self-billing invoice with VAT math.
+    B2C (no validated VAT ID) → payout statement, no VAT.
+    """
+    is_b2b = bool(billing_profile.vat_id and billing_profile.vat_id_validated)
+
+    if is_b2b:
+        vat_breakdown = calculate_b2b_fee_vat(
+            net_fee=payout.payout_amount,
+            entity=billing_profile,
+            platform_vat_country=site.platform_vat_country,
+            platform_vat_rate=site.platform_vat_rate,
+        )
+        return ReferralPayoutStatement.DocumentType.SELF_BILLING_INVOICE, vat_breakdown
+
+    # B2C / individual: no VAT applicable
+    return ReferralPayoutStatement.DocumentType.PAYOUT_STATEMENT, B2BFeeVATBreakdown(
+        fee_gross=payout.payout_amount,
+        fee_net=payout.payout_amount,
+        fee_vat=Decimal("0.00"),
+        fee_vat_rate=Decimal("0.00"),
+        reverse_charge=False,
+    )
+
+
+def generate_payout_statement(payout: ReferralPayout) -> ReferralPayoutStatement:
+    """Generate a payout statement (or self-billing invoice) for a single payout.
+
+    Idempotent *and* concurrency-safe: returns the existing statement if one
+    already exists, and returns the winner's row if a concurrent caller creates
+    it between the check and the insert. Determines B2B vs B2C from the
+    referrer's billing profile, calculates VAT, renders a PDF, and persists the
+    statement.
+
+    Args:
+        payout: The ``ReferralPayout`` to create a statement for.
+
+    Returns:
+        The created (or existing) ``ReferralPayoutStatement``.
+
+    Raises:
+        UserBillingProfile.DoesNotExist: If the referrer has no billing profile.
+    """
+    # Idempotency: return existing statement if already generated
+    existing = ReferralPayoutStatement.objects.filter(payout=payout).first()
+    if existing:
+        return existing
+
+    referral = payout.referral
+    if referral is None:
+        # The referrer deleted their account (#796) — statements for their PAID
+        # payouts are backfilled *before* the user row goes, so a detached payout
+        # reaching here means the caller lost that ordering.
+        raise ValueError(f"Cannot generate a statement for payout {payout.id}: its referral is detached.")
+    referrer = referral.referrer
+    billing_profile = referrer.billing_profile
+    site = SiteSettings.get_solo()
+    now = timezone.now()
+    year = payout.period_start.year
+
+    doc_type, vat = _determine_vat_treatment(payout, billing_profile, site)
+
+    try:
+        with transaction.atomic():
+            document_number = _get_next_statement_number(year)
+            statement = ReferralPayoutStatement.objects.create(
+                payout=payout,
+                document_type=doc_type,
+                document_number=document_number,
+                # Fee breakdown
+                amount_gross=vat.fee_gross,
+                amount_net=vat.fee_net,
+                amount_vat=vat.fee_vat,
+                vat_rate=vat.fee_vat_rate,
+                currency=payout.currency,
+                reverse_charge=vat.reverse_charge,
+                # Referrer snapshot
+                referrer_name=billing_profile.billing_name or referrer.get_display_name(),
+                referrer_address=billing_profile.billing_address,
+                referrer_vat_id=billing_profile.vat_id,
+                referrer_country=billing_profile.vat_country_code,
+                # Platform snapshot
+                platform_business_name=site.platform_business_name,
+                platform_business_address=site.platform_business_address,
+                platform_vat_id=site.platform_vat_id,
+                # Delivery
+                issued_at=now,
+            )
+    except IntegrityError, ValidationError:
+        # Lost the race for this payout's statement. Two callers legitimately
+        # target the same PAID-without-statement row: the 5-minute
+        # ``_redispatch_missing_statements`` backstop and the account-deletion
+        # backfill (#796). ``payout`` is a unique OneToOne, so the loser must
+        # return the winner's row — letting the error escape would abort a GDPR
+        # erasure with no retry. Surfaces as ``IntegrityError`` (concurrent
+        # INSERT) or ``ValidationError`` (``TimeStampedModel.save`` runs
+        # ``full_clean``, so an already-committed row fails ``validate_unique``).
+        existing = ReferralPayoutStatement.objects.filter(payout=payout).first()
+        if existing is None:
+            raise  # not a uniqueness race — a real failure
+        logger.info(
+            "payout_statement_race_lost",
+            payout_id=str(payout.id),
+            document_number=existing.document_number,
+        )
+        return existing
+
+    # Generate PDF outside transaction (WeasyPrint is slow)
+    _render_and_save_statement_pdf(statement)
+
+    logger.info(
+        "payout_statement_generated",
+        document_number=document_number,
+        document_type=doc_type,
+        referrer_id=str(referrer.id),
+        amount_gross=str(vat.fee_gross),
+        currency=payout.currency,
+    )
+    return statement
+
+
+def _render_and_save_statement_pdf(statement: ReferralPayoutStatement) -> None:
+    """Render the statement PDF from the persisted snapshot and attach it.
+
+    Sourced entirely from the statement row (+ its payout) so it can both finish
+    initial generation and self-heal a statement whose PDF was lost to a crash
+    between the row commit and the out-of-transaction save here.
+    """
+    payout = statement.payout
+    is_b2b = statement.document_type == ReferralPayoutStatement.DocumentType.SELF_BILLING_INVOICE
+    document_title = "GUTSCHRIFT" if is_b2b else "PAYOUT STATEMENT"
+    pdf_bytes = render_pdf(
+        "invoices/referral_payout_statement.html",
+        {
+            "document_title": document_title,
+            "document_number": statement.document_number,
+            "issued_date": statement.issued_at.strftime("%Y-%m-%d") if statement.issued_at else "",
+            "period_start": payout.period_start.isoformat(),
+            "period_end": payout.period_end.isoformat(),
+            "period_label": payout.period_start.strftime("%B %Y"),
+            "currency": statement.currency,
+            # Platform
+            "platform_business_name": statement.platform_business_name,
+            "platform_business_address": statement.platform_business_address,
+            "platform_vat_id": statement.platform_vat_id,
+            # Referrer
+            "referrer_name": statement.referrer_name,
+            "referrer_address": statement.referrer_address,
+            "referrer_vat_id": statement.referrer_vat_id,
+            # Amounts
+            "amount_net": statement.amount_net,
+            "amount_vat": statement.amount_vat,
+            "amount_gross": statement.amount_gross,
+            "vat_rate": statement.vat_rate,
+            "reverse_charge": statement.reverse_charge,
+            "is_b2b": is_b2b,
+        },
+    )
+    statement.pdf_file.save(f"{statement.document_number}.pdf", ContentFile(pdf_bytes), save=True)
+
+
+def ensure_payout_statement_pdf_exists(statement: ReferralPayoutStatement) -> None:
+    """Regenerate the statement PDF if it's missing (on-demand self-heal).
+
+    ``generate_payout_statement`` saves the PDF outside its creating transaction,
+    so a worker crash can leave an existing statement without one. The delivery
+    path calls this before sending so a lost document self-heals instead of being
+    emailed with no attachment (issue #616).
+    """
+    if not statement.pdf_file:
+        _render_and_save_statement_pdf(statement)

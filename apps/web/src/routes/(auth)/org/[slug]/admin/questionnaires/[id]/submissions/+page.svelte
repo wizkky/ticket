@@ -1,0 +1,394 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import type { PageData } from './$types';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import { page } from '$app/stores';
+	import { Button } from '$lib/components/ui/button';
+	import { Card } from '$lib/components/ui/card';
+	import SubmissionStats from '$lib/components/questionnaires/SubmissionStats.svelte';
+	import SubmissionStatusBadge from '$lib/components/questionnaires/SubmissionStatusBadge.svelte';
+	import PageHeader from '$lib/components/common/PageHeader.svelte';
+	import EmptyState from '$lib/components/common/EmptyState.svelte';
+	import {
+		ArrowLeft,
+		ChevronLeft,
+		ChevronRight,
+		ChevronsLeft,
+		ChevronsRight,
+		ArrowUpDown,
+		FileText
+	} from '@lucide/svelte';
+	import { resolveSubmissionBadgeStatus } from '$lib/utils/resolve-submission-badge-status';
+	import { formatDateTime } from '$lib/utils/date';
+
+	interface Props {
+		data: PageData;
+	}
+
+	const { data }: Props = $props();
+
+	// Current filter values
+	const currentEvaluationStatus = $derived(data.filters.evaluationStatus || '');
+	const currentOrderBy = $derived(data.filters.orderBy || '-submitted_at');
+
+	function setEvaluationStatusFilter(status: string) {
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- not reactive state: local URL builder, mutated synchronously then discarded via goto()
+		const params = new URLSearchParams($page.url.searchParams);
+
+		if (status) {
+			params.set('evaluation_status', status);
+		} else {
+			params.delete('evaluation_status');
+		}
+
+		params.delete('page'); // Reset to first page when filters change
+		// eslint-disable-next-line svelte/no-navigation-without-resolve -- same-route query-only update; the relative "?"+params string preserves the current pathname (resolve() cannot express search params)
+		goto(`?${params.toString()}`, { replaceState: true });
+	}
+
+	function setOrderBy(orderBy: string) {
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- not reactive state: local URL builder, mutated synchronously then discarded via goto()
+		const params = new URLSearchParams($page.url.searchParams);
+
+		if (orderBy !== '-submitted_at') {
+			params.set('order_by', orderBy);
+		} else {
+			params.delete('order_by');
+		}
+
+		params.delete('page'); // Reset to first page when ordering changes
+		// eslint-disable-next-line svelte/no-navigation-without-resolve -- same-route query-only update; the relative "?"+params string preserves the current pathname (resolve() cannot express search params)
+		goto(`?${params.toString()}`, { replaceState: true });
+	}
+
+	function goToPage(pageNum: number) {
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- not reactive state: local URL builder, mutated synchronously then discarded via goto()
+		const params = new URLSearchParams($page.url.searchParams);
+		params.set('page', pageNum.toString());
+		// eslint-disable-next-line svelte/no-navigation-without-resolve -- same-route query-only update; the relative "?"+params string preserves the current pathname (resolve() cannot express search params)
+		goto(`?${params.toString()}`);
+	}
+
+	function formatDate(dateString: string | null | undefined): string {
+		if (!dateString) return m['questionnaireSubmissionsPage.notSubmitted']();
+		return formatDateTime(dateString);
+	}
+
+	function formatScore(score: string | number | null | undefined): string {
+		if (score === null || score === undefined) return m['questionnaireSubmissionsPage.scoreNA']();
+		const numScore = typeof score === 'string' ? parseFloat(score) : score;
+		return `${numScore}/100`;
+	}
+</script>
+
+<svelte:head>
+	<title>{m['questionnaireSubmissionsPage.pageTitle']()} - {data.organizationSlug}</title>
+</svelte:head>
+
+<div class="container mx-auto max-w-7xl px-4 py-8">
+	<!-- Header -->
+	<div class="mb-8">
+		<a
+			href={resolve('/(auth)/org/[slug]/admin/questionnaires', { slug: data.organizationSlug })}
+			class="mb-4 inline-flex items-center gap-2 text-sm text-muted-foreground hover:text-foreground"
+		>
+			<ArrowLeft class="h-4 w-4" />
+			{m['questionnaireSubmissionsPage.backToQuestionnaires']()}
+		</a>
+		<PageHeader
+			title={m['questionnaireSubmissionsPage.title']()}
+			subtitle={m['questionnaireSubmissionsPage.subtitle']()}
+			kicker={data.organization.name}
+		>
+			{#snippet actions()}
+				<Button
+					href="/org/{data.organizationSlug}/admin/questionnaires/{data.questionnaireId}/summary"
+					variant="outline"
+					size="sm"
+				>
+					{m['questionnaireSubmissionsPage.viewSummary']()}
+				</Button>
+			{/snippet}
+		</PageHeader>
+	</div>
+
+	<!-- Stats -->
+	<div class="mb-8">
+		{#if data.requiresEvaluation}
+			<SubmissionStats
+				pendingCount={data.stats.pendingCount}
+				approvedCount={data.stats.approvedCount}
+				rejectedCount={data.stats.rejectedCount}
+			/>
+		{:else}
+			<Card class="p-6">
+				<div class="text-center">
+					<p class="text-2xl font-bold">
+						{data.stats.pendingCount + data.stats.approvedCount + data.stats.rejectedCount}
+					</p>
+					<p class="text-sm text-muted-foreground">
+						{m['questionnaireSubmissionsPage.totalSubmissions']()}
+					</p>
+				</div>
+			</Card>
+		{/if}
+	</div>
+
+	<!-- Filters and Sorting -->
+	<Card class="mb-6 p-6">
+		{#if data.requiresEvaluation}
+			<!-- Evaluation Status Filter -->
+			<div class="mb-6">
+				<h3 class="mb-3 text-sm font-medium">
+					{m['questionnaireSubmissionsPage.filterByStatus']()}
+				</h3>
+				<div class="flex flex-wrap gap-2">
+					<Button
+						variant={currentEvaluationStatus === '' ? 'default' : 'outline'}
+						size="sm"
+						onclick={() => setEvaluationStatusFilter('')}
+					>
+						{m['questionnaireSubmissionsPage.filter_all']()}
+					</Button>
+					<Button
+						variant={currentEvaluationStatus === 'pending review' ? 'secondary' : 'outline'}
+						size="sm"
+						onclick={() => setEvaluationStatusFilter('pending review')}
+					>
+						{m['questionnaireSubmissionsPage.filter_pendingReview']()}
+					</Button>
+					<Button
+						variant={currentEvaluationStatus === 'approved' ? 'default' : 'outline'}
+						size="sm"
+						onclick={() => setEvaluationStatusFilter('approved')}
+					>
+						{m['questionnaireSubmissionsPage.filter_approved']()}
+					</Button>
+					<Button
+						variant={currentEvaluationStatus === 'rejected' ? 'destructive' : 'outline'}
+						size="sm"
+						onclick={() => setEvaluationStatusFilter('rejected')}
+					>
+						{m['questionnaireSubmissionsPage.filter_rejected']()}
+					</Button>
+				</div>
+			</div>
+		{/if}
+
+		<!-- Sort Order -->
+		<div>
+			<h3 class="mb-3 text-sm font-medium">{m['questionnaireSubmissionsPage.sortBy']()}</h3>
+			<div class="flex flex-wrap gap-2">
+				<Button
+					variant={currentOrderBy === '-submitted_at' ? 'default' : 'outline'}
+					size="sm"
+					onclick={() => setOrderBy('-submitted_at')}
+				>
+					<ArrowUpDown class="mr-2 h-4 w-4" />
+					{m['questionnaireSubmissionsPage.sort_newestFirst']()}
+				</Button>
+				<Button
+					variant={currentOrderBy === 'submitted_at' ? 'default' : 'outline'}
+					size="sm"
+					onclick={() => setOrderBy('submitted_at')}
+				>
+					<ArrowUpDown class="mr-2 h-4 w-4" />
+					{m['questionnaireSubmissionsPage.sort_oldestFirst']()}
+				</Button>
+			</div>
+		</div>
+	</Card>
+
+	<!-- Submissions List -->
+	{#if data.submissions.length === 0}
+		<EmptyState
+			icon={FileText}
+			tone="neutral"
+			title={m['questionnaireSubmissionsPage.noSubmissionsFound']()}
+			body={data.filters.search || data.filters.evaluationStatus
+				? m['questionnaireSubmissionsPage.adjustFilters']()
+				: m['questionnaireSubmissionsPage.noSubmissionsYet']()}
+		/>
+	{:else}
+		<!-- Desktop Table View -->
+		<div class="hidden overflow-x-auto md:block">
+			<Card>
+				<table class="w-full">
+					<thead class="border-b bg-muted/50">
+						<tr>
+							<th
+								class="px-6 py-4 text-left text-xs font-extrabold uppercase tracking-[0.12em] text-muted-foreground"
+								>{m['questionnaireSubmissionsPage.header_respondent']()}</th
+							>
+							<th
+								class="px-6 py-4 text-left text-xs font-extrabold uppercase tracking-[0.12em] text-muted-foreground"
+								>{m['questionnaireSubmissionsPage.header_submitted']()}</th
+							>
+							<th
+								class="px-6 py-4 text-left text-xs font-extrabold uppercase tracking-[0.12em] text-muted-foreground"
+								>{m['questionnaireSubmissionsPage.header_evaluationStatus']()}</th
+							>
+							{#if data.requiresEvaluation}
+								<th
+									class="px-6 py-4 text-left text-xs font-extrabold uppercase tracking-[0.12em] text-muted-foreground"
+									>{m['questionnaireSubmissionsPage.header_score']()}</th
+								>
+							{/if}
+							<th
+								class="px-6 py-4 text-right text-xs font-extrabold uppercase tracking-[0.12em] text-muted-foreground"
+								>{m['questionnaireSubmissionsPage.header_actions']()}</th
+							>
+						</tr>
+					</thead>
+					<tbody>
+						{#each data.submissions as submission (submission.id)}
+							<tr class="border-b transition-colors hover:bg-muted/50">
+								<td class="px-6 py-4">
+									<div class="flex flex-col">
+										<span class="font-medium">{submission.user.display_name}</span>
+										<span class="text-sm text-muted-foreground">{submission.user.email}</span>
+									</div>
+								</td>
+								<td class="px-6 py-4 text-sm">{formatDate(submission.submitted_at)}</td>
+								<td class="px-6 py-4">
+									<SubmissionStatusBadge
+										status={resolveSubmissionBadgeStatus(
+											data.requiresEvaluation,
+											submission.evaluation_status
+										)}
+									/>
+								</td>
+								{#if data.requiresEvaluation}
+									<td class="px-6 py-4 text-sm">{formatScore(submission.evaluation_score)}</td>
+								{/if}
+								<td class="px-6 py-4 text-right">
+									<Button
+										href="/org/{data.organizationSlug}/admin/questionnaires/{data.questionnaireId}/submissions/{submission.id}{$page
+											.url.search}"
+										variant="outline"
+										size="sm"
+									>
+										{data.requiresEvaluation
+											? m['questionnaireSubmissionsPage.reviewButton']()
+											: m['questionnaireSubmissionsPage.viewButton']()}
+									</Button>
+								</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</Card>
+		</div>
+
+		<!-- Mobile Card View -->
+		<div class="space-y-4 md:hidden">
+			{#each data.submissions as submission (submission.id)}
+				<Card class="p-4">
+					<div class="mb-3 flex items-start justify-between">
+						<div class="flex-1">
+							<h3 class="font-semibold">{submission.user.display_name}</h3>
+							<p class="text-sm text-muted-foreground">{submission.user.email}</p>
+						</div>
+						<SubmissionStatusBadge
+							status={resolveSubmissionBadgeStatus(
+								data.requiresEvaluation,
+								submission.evaluation_status
+							)}
+						/>
+					</div>
+
+					<div class="space-y-2 text-sm">
+						<div class="flex justify-between">
+							<span class="text-muted-foreground"
+								>{m['questionnaireSubmissionsPage.submittedLabel']()}</span
+							>
+							<span>{formatDate(submission.submitted_at)}</span>
+						</div>
+						{#if data.requiresEvaluation}
+							<div class="flex justify-between">
+								<span class="text-muted-foreground"
+									>{m['questionnaireSubmissionsPage.scoreLabel']()}</span
+								>
+								<span>{formatScore(submission.evaluation_score)}</span>
+							</div>
+						{/if}
+					</div>
+
+					<Button
+						href="/org/{data.organizationSlug}/admin/questionnaires/{data.questionnaireId}/submissions/{submission.id}{$page
+							.url.search}"
+						variant="outline"
+						size="sm"
+						class="mt-4 w-full"
+					>
+						{data.requiresEvaluation
+							? m['questionnaireSubmissionsPage.reviewButton']()
+							: m['questionnaireSubmissionsPage.viewButton']()}
+					</Button>
+				</Card>
+			{/each}
+		</div>
+
+		<!-- Pagination -->
+		<div class="mt-6 flex items-center justify-between">
+			<p class="text-sm text-muted-foreground">
+				{m['questionnaireSubmissionsPage.paginationShowing']({
+					from: (data.pagination.currentPage - 1) * data.pagination.pageSize + 1,
+					to: Math.min(
+						data.pagination.currentPage * data.pagination.pageSize,
+						data.pagination.count
+					),
+					total: data.pagination.count
+				})}
+			</p>
+
+			<div class="flex items-center gap-2">
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => goToPage(1)}
+					disabled={data.pagination.currentPage === 1}
+					aria-label={m['questionnaireSubmissionsPage.gotoFirstPage']()}
+				>
+					<ChevronsLeft class="h-4 w-4" />
+				</Button>
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => goToPage(data.pagination.currentPage - 1)}
+					disabled={!data.pagination.previous}
+					aria-label={m['questionnaireSubmissionsPage.gotoPreviousPage']()}
+				>
+					<ChevronLeft class="h-4 w-4" />
+				</Button>
+
+				<span class="text-sm">
+					{m['questionnaireSubmissionsPage.pageOf']({
+						current: data.pagination.currentPage,
+						total: data.pagination.totalPages
+					})}
+				</span>
+
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => goToPage(data.pagination.currentPage + 1)}
+					disabled={!data.pagination.next}
+					aria-label={m['questionnaireSubmissionsPage.gotoNextPage']()}
+				>
+					<ChevronRight class="h-4 w-4" />
+				</Button>
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => goToPage(data.pagination.totalPages)}
+					disabled={data.pagination.currentPage === data.pagination.totalPages}
+					aria-label={m['questionnaireSubmissionsPage.gotoLastPage']()}
+				>
+					<ChevronsRight class="h-4 w-4" />
+				</Button>
+			</div>
+		</div>
+	{/if}
+</div>

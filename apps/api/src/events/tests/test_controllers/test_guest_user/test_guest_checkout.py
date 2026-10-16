@@ -1,0 +1,410 @@
+"""Tests for guest ticket checkout endpoints.
+
+- Fixed-price: POST /events/{event_id}/tickets/{tier_id}/checkout/public
+- PWYC: POST /events/{event_id}/tickets/{tier_id}/checkout/pwyc/public
+"""
+
+from decimal import Decimal
+from unittest import mock
+from unittest.mock import Mock, patch
+from uuid import UUID
+
+import pytest
+from django.test.client import Client
+from django.urls import reverse
+
+from accounts.models import RevelUser
+from events.models import Event, Ticket, TicketTier
+
+pytestmark = pytest.mark.django_db
+
+
+def _fake_session(session_id: str = "cs_test123") -> mock.Mock:
+    """A minimal stand-in for a ``stripe.checkout.Session``."""
+    return mock.Mock(id=session_id, url=f"https://checkout.stripe.com/c/{session_id}")
+
+
+@pytest.mark.django_db(transaction=True)
+class TestGuestTicketCheckout:
+    """Test guest ticket checkout endpoint for fixed-price tiers.
+
+    Uses ``transaction=True`` because the non-online checkout flow schedules
+    ``send_guest_ticket_confirmation`` via ``transaction.on_commit``. In default
+    pytest-django mode the wrapping transaction is rolled back and the callback
+    never fires, breaking the ``mock_send_email`` assertions.
+    """
+
+    @patch("events.tasks.send_guest_ticket_confirmation.delay")
+    def test_guest_checkout_free_ticket_sends_confirmation(
+        self, mock_send_email: Mock, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test guest checkout for free ticket sends email confirmation."""
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": free_tier.pk},
+        )
+        payload = {
+            "email": "freeticket@example.com",
+            "first_name": "Free",
+            "last_name": "Ticket",
+            "tickets": [{"guest_name": "Free Ticket"}],
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 200
+        data = response.json()
+        assert "email" in data["message"].lower()
+
+        # Check guest user was created
+        guest_user = RevelUser.objects.get(email="freeticket@example.com")
+        assert guest_user.guest is True
+
+        # Check email was sent
+        mock_send_email.assert_called_once()
+        call_args = mock_send_email.call_args[0]
+        assert call_args[0] == "freeticket@example.com"
+        assert call_args[2] == guest_event_with_tickets.name
+        assert call_args[3] == free_tier.name
+
+        # Verify ticket was NOT created yet
+        assert not Ticket.objects.filter(user=guest_user, event=guest_event_with_tickets).exists()
+
+    def test_guest_checkout_online_payment_returns_stripe_url(
+        self,
+        guest_event_with_tickets: Event,
+        online_tier: TicketTier,
+    ) -> None:
+        """Test guest checkout for online payment: reserve (no Stripe call), then session (#632)."""
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": online_tier.pk},
+        )
+        payload = {
+            "email": "onlineguest@example.com",
+            "first_name": "Online",
+            "last_name": "Guest",
+            "tickets": [{"guest_name": "Online Guest"}],
+        }
+
+        # Act: reserve
+        with mock.patch("stripe.checkout.Session.create") as mock_create:
+            response = client.post(url, data=payload, content_type="application/json")
+            mock_create.assert_not_called()
+
+        # Assert: reserved, no Stripe call yet
+        assert response.status_code == 200
+        data = response.json()
+        assert data["checkout_url"] is None
+        assert data["requires_payment"] is True
+        reservation_id = data["reservation_id"]
+        assert UUID(reservation_id)
+
+        # Check guest user was created at reserve time
+        guest_user = RevelUser.objects.get(email="onlineguest@example.com")
+        assert guest_user.guest is True
+
+        # Act: create the Stripe session
+        fake = _fake_session()
+        session_url = reverse("api:guest_checkout_session", kwargs={"reservation_id": reservation_id})
+        with mock.patch("stripe.checkout.Session.create", return_value=fake) as mock_create:
+            session_response = client.post(session_url, content_type="application/json")
+            mock_create.assert_called_once()
+
+        # Assert: got the Stripe URL
+        assert session_response.status_code == 200
+        assert session_response.json()["checkout_url"] == fake.url
+
+    def test_guest_checkout_rejects_authenticated_user(
+        self, member_client: Client, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test that authenticated users cannot use guest checkout."""
+        # Arrange
+        url = reverse(
+            "api:guest_ticket_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": free_tier.pk},
+        )
+        payload = {
+            "email": "auth@example.com",
+            "first_name": "Auth",
+            "last_name": "User",
+            "tickets": [{"guest_name": "Auth User"}],
+        }
+
+        # Act
+        response = member_client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "authenticated" in data["detail"].lower()
+
+    def test_guest_checkout_rejects_login_required_event(self, login_required_event: Event) -> None:
+        """Test that guest checkout is rejected if event requires login."""
+        # Create a tier for login-required event
+        tier = TicketTier.objects.create(
+            event=login_required_event,
+            name="Test Tier",
+            price=Decimal("0.00"),
+            payment_method=TicketTier.PaymentMethod.FREE,
+        )
+
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_checkout",
+            kwargs={"event_id": login_required_event.pk, "tier_id": tier.pk},
+        )
+        payload = {
+            "email": "guest@example.com",
+            "first_name": "Guest",
+            "last_name": "User",
+            "tickets": [{"guest_name": "Guest User"}],
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "login" in data["detail"].lower()
+
+    def test_guest_checkout_rejects_existing_non_guest_email(
+        self, guest_event_with_tickets: Event, free_tier: TicketTier, existing_regular_user: RevelUser
+    ) -> None:
+        """Test that guest checkout is rejected if non-guest account exists."""
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": free_tier.pk},
+        )
+        payload = {
+            "email": existing_regular_user.email,
+            "first_name": "Different",
+            "last_name": "Name",
+            "tickets": [{"guest_name": "Different Name"}],
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "already exists" in data["detail"].lower()
+
+    def test_guest_checkout_rejects_pwyc_tier(self, guest_event_with_tickets: Event, pwyc_tier: TicketTier) -> None:
+        """Test that PWYC tiers must use the /pwyc endpoint."""
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": pwyc_tier.pk},
+        )
+        payload = {
+            "email": "guest@example.com",
+            "first_name": "Guest",
+            "last_name": "User",
+            "tickets": [{"guest_name": "Guest User"}],
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "pwyc" in data["detail"].lower()
+
+
+@pytest.mark.django_db(transaction=True)
+class TestGuestPWYCCheckout:
+    """Test guest PWYC ticket checkout endpoint.
+
+    Uses ``transaction=True`` because the non-online PWYC checkout flow schedules
+    ``send_guest_ticket_confirmation`` via ``transaction.on_commit``. In default
+    pytest-django mode the wrapping transaction is rolled back and the callback
+    never fires, breaking the ``mock_send_email`` assertions.
+    """
+
+    @patch("events.tasks.send_guest_ticket_confirmation.delay")
+    def test_guest_pwyc_checkout_offline_success(
+        self, mock_send_email: Mock, guest_event_with_tickets: Event, pwyc_tier: TicketTier
+    ) -> None:
+        """Test successful guest PWYC checkout with offline payment."""
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_pwyc_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": pwyc_tier.pk},
+        )
+        payload = {
+            "email": "pwycguest@example.com",
+            "first_name": "PWYC",
+            "last_name": "Guest",
+            "tickets": [{"guest_name": "PWYC Guest"}],
+            "price_per_ticket": "15.00",
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 200
+        data = response.json()
+        assert "message" in data
+
+        mock_send_email.assert_called_once()
+
+    def test_guest_pwyc_checkout_online_success(
+        self,
+        guest_event_with_tickets: Event,
+        pwyc_online_tier: TicketTier,
+    ) -> None:
+        """Test successful guest PWYC checkout with online payment: reserve, then session (#632)."""
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_pwyc_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": pwyc_online_tier.pk},
+        )
+        payload = {
+            "email": "pwycstripe@example.com",
+            "first_name": "PWYC",
+            "last_name": "Stripe",
+            "tickets": [{"guest_name": "PWYC Stripe"}],
+            "price_per_ticket": "25.00",
+        }
+
+        # Act: reserve
+        with mock.patch("stripe.checkout.Session.create") as mock_create:
+            response = client.post(url, data=payload, content_type="application/json")
+            mock_create.assert_not_called()
+
+        # Assert: reserved, no Stripe call yet
+        assert response.status_code == 200
+        data = response.json()
+        assert data["checkout_url"] is None
+        assert data["requires_payment"] is True
+        reservation_id = data["reservation_id"]
+        assert UUID(reservation_id)
+
+        # Act: create the Stripe session
+        fake = _fake_session()
+        session_url = reverse("api:guest_checkout_session", kwargs={"reservation_id": reservation_id})
+        with mock.patch("stripe.checkout.Session.create", return_value=fake) as mock_create:
+            session_response = client.post(session_url, content_type="application/json")
+            mock_create.assert_called_once()
+
+        # Assert: got the Stripe URL
+        assert session_response.status_code == 200
+        assert session_response.json()["checkout_url"] == fake.url
+
+    def test_guest_pwyc_checkout_rejects_amount_below_min(
+        self, guest_event_with_tickets: Event, pwyc_tier: TicketTier
+    ) -> None:
+        """Test that PWYC amount below minimum is rejected."""
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_pwyc_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": pwyc_tier.pk},
+        )
+        payload = {
+            "email": "lowpwyc@example.com",
+            "first_name": "Low",
+            "last_name": "PWYC",
+            "tickets": [{"guest_name": "Low PWYC"}],
+            "price_per_ticket": "2.00",  # Below pwyc_min of 5.00
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "at least" in data["detail"].lower() or "minimum" in data["detail"].lower()
+
+    def test_guest_pwyc_checkout_rejects_amount_above_max(
+        self, guest_event_with_tickets: Event, pwyc_tier: TicketTier
+    ) -> None:
+        """Test that PWYC amount above maximum is rejected."""
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_pwyc_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": pwyc_tier.pk},
+        )
+        payload = {
+            "email": "highpwyc@example.com",
+            "first_name": "High",
+            "last_name": "PWYC",
+            "tickets": [{"guest_name": "High PWYC"}],
+            "price_per_ticket": "100.00",  # Above pwyc_max of 50.00
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "at most" in data["detail"].lower() or "maximum" in data["detail"].lower()
+
+    def test_guest_pwyc_checkout_rejects_non_pwyc_tier(
+        self, guest_event_with_tickets: Event, free_tier: TicketTier
+    ) -> None:
+        """Test that non-PWYC tiers are rejected."""
+        # Arrange
+        client = Client()
+        url = reverse(
+            "api:guest_ticket_pwyc_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": free_tier.pk},
+        )
+        payload = {
+            "email": "guest@example.com",
+            "first_name": "Guest",
+            "last_name": "User",
+            "tickets": [{"guest_name": "Guest User"}],
+            "price_per_ticket": "10.00",
+        }
+
+        # Act
+        response = client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "pay-what-you-can" in data["detail"].lower()
+
+    def test_guest_pwyc_checkout_rejects_authenticated_user(
+        self, member_client: Client, guest_event_with_tickets: Event, pwyc_tier: TicketTier
+    ) -> None:
+        """Test that authenticated users cannot use guest PWYC checkout."""
+        # Arrange
+        url = reverse(
+            "api:guest_ticket_pwyc_checkout",
+            kwargs={"event_id": guest_event_with_tickets.pk, "tier_id": pwyc_tier.pk},
+        )
+        payload = {
+            "email": "auth@example.com",
+            "first_name": "Auth",
+            "last_name": "User",
+            "tickets": [{"guest_name": "Auth User"}],
+            "price_per_ticket": "15.00",
+        }
+
+        # Act
+        response = member_client.post(url, data=payload, content_type="application/json")
+
+        # Assert
+        assert response.status_code == 400
+        data = response.json()
+        assert "authenticated" in data["detail"].lower()

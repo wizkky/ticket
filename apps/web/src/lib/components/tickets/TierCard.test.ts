@@ -1,0 +1,227 @@
+import { render, screen } from '@testing-library/svelte';
+import { describe, it, expect, vi } from 'vitest';
+import TierCard from './TierCard.svelte';
+import type { TierSchemaWithId } from '$lib/types/tickets';
+import { formatMoney, formatMoneyRange } from '$lib/utils/format';
+
+function makeTier(overrides: Partial<TierSchemaWithId> = {}): TierSchemaWithId {
+	return {
+		id: 'tier-1',
+		event_id: 'event-1',
+		name: 'General Admission',
+		description: null,
+		price: '0',
+		currency: 'EUR',
+		payment_method: 'free',
+		price_type: 'fixed',
+		total_available: null,
+		can_purchase: true,
+		...overrides
+	} as TierSchemaWithId;
+}
+
+function renderCard(tier: TierSchemaWithId, capacityDisclosed?: boolean) {
+	render(TierCard, {
+		props: { tier, isAuthenticated: true, capacityDisclosed, onSelectTier: vi.fn() }
+	});
+}
+
+// #690 / backend #825: `total_available === null` means "unlimited" when the
+// event discloses capacity and "withheld" when it does not. Only the event-level
+// `show_capacity` distinguishes them.
+describe('TierCard — inventory disclosure', () => {
+	it('says "Unlimited" for a null quantity when capacity is disclosed', () => {
+		renderCard(makeTier({ total_available: null }), true);
+		expect(screen.getByText(/unlimited/i)).toBeInTheDocument();
+	});
+
+	it('defaults to disclosed when the caller cannot say', () => {
+		renderCard(makeTier({ total_available: null }));
+		expect(screen.getByText(/unlimited/i)).toBeInTheDocument();
+	});
+
+	it('says nothing about inventory for a null quantity when capacity is withheld', () => {
+		renderCard(makeTier({ total_available: null }), false);
+		expect(screen.queryByText(/unlimited/i)).not.toBeInTheDocument();
+		expect(screen.queryByText(/remaining/i)).not.toBeInTheDocument();
+	});
+
+	it('still reports a concrete remaining count regardless of the flag', () => {
+		renderCard(makeTier({ total_available: 7 }), false);
+		expect(screen.getByText(/7 remaining/i)).toBeInTheDocument();
+	});
+
+	it('still reports sold out regardless of the flag', () => {
+		// Two nodes: the inventory row and the disabled CTA.
+		renderCard(makeTier({ total_available: 0 }), false);
+		expect(screen.getAllByText(/sold out/i).length).toBeGreaterThan(0);
+	});
+
+	// Organizer kill switch (integrations #894): the tier stays visible so a
+	// buyer sees it exists, with the badge and the disabled CTA both saying why.
+	it('reports paused sales instead of inventory, with a disabled action', () => {
+		renderCard(makeTier({ total_available: 25, sales_paused: true, can_purchase: false }), true);
+		expect(screen.getByTestId('status-badge')).toHaveTextContent(/sales paused/i);
+		expect(screen.queryByText(/remaining/i)).toBeNull();
+		expect(screen.getByRole('button', { name: /sales paused/i })).toBeDisabled();
+	});
+});
+
+// Prod incident 2026-09-04 ("Kitts Meets"): the tier listing returns
+// `can_purchase: false` for anonymous visitors on any non-public tier, but
+// `effectiveEligible` only consulted it when `tierRemainingInfo` (authenticated
+// my-status data) existed. A logged-out guest on a can_attend_without_login
+// event therefore saw an ENABLED CTA on an invited-only tier and hit a dead
+// confirmation link / 403 at checkout.
+describe('TierCard — can_purchase=false for anonymous guests', () => {
+	function renderAnonymousGuestCard(tier: TierSchemaWithId): void {
+		render(TierCard, {
+			props: {
+				tier,
+				isAuthenticated: false,
+				canAttendWithoutLogin: true,
+				isEligible: true,
+				tierRemainingInfo: undefined,
+				onSelectTier: vi.fn()
+			}
+		});
+	}
+
+	it('never renders an enabled claim/buy/reserve action on a free tier', () => {
+		renderAnonymousGuestCard(makeTier({ can_purchase: false, payment_method: 'free' }));
+		expect(screen.queryByRole('button', { name: /claim free ticket/i })).not.toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: /buy ticket/i })).not.toBeInTheDocument();
+		expect(screen.queryByRole('button', { name: /reserve ticket/i })).not.toBeInTheDocument();
+	});
+
+	it('never renders an enabled buy action on a paid tier', () => {
+		renderAnonymousGuestCard(
+			makeTier({ can_purchase: false, payment_method: 'online', price: '10.00' })
+		);
+		expect(screen.queryByRole('button', { name: /buy ticket/i })).not.toBeInTheDocument();
+	});
+
+	it('shows a disabled action with a visible reason instead of "Coming soon"', () => {
+		renderAnonymousGuestCard(makeTier({ can_purchase: false, payment_method: 'free' }));
+		const disabledCta = screen.getByRole('button', { name: /not eligible/i });
+		expect(disabledCta).toBeDisabled();
+		expect(screen.getByText(/not available/i)).toBeInTheDocument();
+		expect(screen.queryByText(/coming soon/i)).not.toBeInTheDocument();
+	});
+
+	it('still renders the enabled CTA when can_purchase is true', () => {
+		renderAnonymousGuestCard(makeTier({ can_purchase: true, payment_method: 'free' }));
+		expect(screen.getByRole('button', { name: /claim free ticket/i })).toBeEnabled();
+	});
+});
+
+// Screenshot bug: the PWYC headline rendered "Pay What You Can (€8.00 –
+// €30.00)" at price size and wrapped 2-3 lines. The headline is now just the
+// range; the qualifier moves to the smaller priceNote caption.
+describe('TierCard — PWYC headline', () => {
+	it('shows the compact range as the headline and the qualifier as a caption', () => {
+		renderCard(
+			makeTier({
+				payment_method: 'online',
+				price_type: 'pwyc',
+				price: '8.00',
+				pwyc_min: '8.00',
+				pwyc_max: '30.00'
+			})
+		);
+		expect(screen.getByText(formatMoneyRange(8, 30, 'EUR'))).toBeInTheDocument();
+		expect(screen.getByText('Pay What You Can')).toBeInTheDocument();
+		expect(screen.queryByText(/Pay What You Can \(/)).toBeNull();
+	});
+
+	it('has no PWYC caption on a fixed-price tier', () => {
+		renderCard(makeTier({ payment_method: 'online', price: '18.00' }));
+		expect(screen.getByText(formatMoney(18, 'EUR'))).toBeInTheDocument();
+		// #949: locale-aware money, not the hand-rolled "EUR 18.00" template.
+		expect(screen.queryByText('EUR 18.00')).toBeNull();
+		expect(screen.queryByText('Pay What You Can')).toBeNull();
+	});
+});
+
+// #945: a tier with its own check-in offsets shows the backend-resolved entry
+// window; a tier that follows the event's window shows nothing extra.
+describe('TierCard — per-tier entry window', () => {
+	const resolved = {
+		effective_check_in_opens_at: '2026-10-11T08:00:00Z',
+		effective_check_in_closes_at: '2026-10-11T20:00:00Z'
+	};
+
+	it('shows the entry window when the tier sets an offset', () => {
+		renderCard(makeTier({ ...resolved, check_in_opens_offset: 'P0DT12H00M00S' }));
+		expect(screen.getByText(/^Entry: /)).toBeInTheDocument();
+	});
+
+	it('shows nothing when the tier follows the event window', () => {
+		renderCard(makeTier({ ...resolved }));
+		expect(screen.queryByText(/^Entry: /)).toBeNull();
+	});
+});
+
+// EU compliance (#1001): event-level country rules.
+describe('TierCard — country rules', () => {
+	function renderWithRules(
+		tier: TierSchemaWithId,
+		rules: { onlineBlocked?: boolean; reservationOnly?: boolean }
+	) {
+		render(TierCard, {
+			props: { tier, isAuthenticated: true, onSelectTier: vi.fn(), ...rules }
+		});
+	}
+
+	it('offers no checkout for an online tier when card payment is blocked, and says why', () => {
+		renderWithRules(makeTier({ payment_method: 'online', price: '20.00' }), {
+			onlineBlocked: true
+		});
+		const button = screen.getByRole('button', { name: 'Not available online' });
+		expect(button).toBeDisabled();
+		expect(button).toHaveAccessibleDescription(
+			"This ticket can't be bought online. Contact the organizer to find out how to pay."
+		);
+		expect(screen.queryByRole('button', { name: /buy ticket/i })).toBeNull();
+	});
+
+	it('leaves offline tiers purchasable when card payment is blocked', () => {
+		renderWithRules(makeTier({ payment_method: 'offline', price: '15.00' }), {
+			onlineBlocked: true
+		});
+		expect(screen.queryByRole('button', { name: 'Not available online' })).toBeNull();
+		expect(screen.getByRole('button', { name: /reserve ticket/i })).toBeEnabled();
+	});
+
+	it('marks priced direct-payment tiers as reservations, as a static note', () => {
+		renderWithRules(makeTier({ payment_method: 'at_the_door', price: '10.00' }), {
+			reservationOnly: true
+		});
+		const note = screen.getByTestId('tier-reservation-note');
+		expect(note).toHaveAttribute('role', 'note');
+		expect(note).toHaveTextContent(/Your Revel ticket is a reservation/);
+	});
+
+	it('gives free-priced offline tiers and free tiers no reservation note', () => {
+		renderWithRules(makeTier({ payment_method: 'offline', price: '0.00' }), {
+			reservationOnly: true
+		});
+		expect(screen.queryByTestId('tier-reservation-note')).toBeNull();
+	});
+});
+
+describe('TierCard — country rules precede sign-in', () => {
+	it('tells a logged-out visitor a blocked card tier is not available online', () => {
+		render(TierCard, {
+			props: {
+				tier: makeTier({ payment_method: 'online', price: '20.00' }),
+				isAuthenticated: false,
+				canAttendWithoutLogin: false,
+				onSelectTier: vi.fn(),
+				onlineBlocked: true
+			}
+		});
+		expect(screen.getByRole('button', { name: 'Not available online' })).toBeDisabled();
+		expect(screen.queryByRole('link', { name: /sign in/i })).toBeNull();
+	});
+});

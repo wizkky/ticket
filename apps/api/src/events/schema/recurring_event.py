@@ -1,0 +1,185 @@
+"""Schemas for recurring event operations."""
+
+from uuid import UUID
+
+from ninja import Schema
+from pydantic import AwareDatetime, ConfigDict, Field, field_validator
+
+from common.schema import OneToOneFiftyString, StrippedString
+from events.models import Event
+from events.models.event_series import MAX_GENERATION_WINDOW_WEEKS
+
+from .event import EventCreateSchema, EventVisibilitySettingsSchema, MinimalEventSchema
+from .recurrence_rule import RecurrenceRuleCreateSchema, RecurrenceRuleSchema, RecurrenceRuleUpdateSchema
+
+
+class RecurringEventCreateSchema(Schema):
+    """Schema for creating a recurring event (series + template + rule)."""
+
+    event: EventCreateSchema
+    series_name: OneToOneFiftyString
+    series_description: StrippedString | None = None
+    recurrence: RecurrenceRuleCreateSchema
+    auto_publish: bool = False
+    generation_window_weeks: int = Field(default=8, ge=1, le=MAX_GENERATION_WINDOW_WEEKS)
+
+    @field_validator("event")
+    @classmethod
+    def _template_must_be_draft(cls, value: EventCreateSchema) -> EventCreateSchema:
+        """Reject any template ``status`` other than the default ``DRAFT``.
+
+        The server forces the template to DRAFT on creation regardless of
+        what the client sends (templates are blueprints — whether each
+        occurrence is auto-published is governed by ``auto_publish``, not by
+        the template's status). Instead of silently overriding the client's
+        value we reject it explicitly so an API consumer sending ``OPEN``
+        gets a clear 422 rather than a confusing no-op.
+        """
+        if value.status != Event.EventStatus.DRAFT:
+            raise ValueError(
+                "Template events must have status='draft'. Use auto_publish=true to automatically open new occurrences."
+            )
+        return value
+
+    @field_validator("event")
+    @classmethod
+    def _template_series_pass_links_unsupported(cls, value: EventCreateSchema) -> EventCreateSchema:
+        """Reject inline ``series_pass_links`` on a recurring template.
+
+        The controller silently excludes ``series_pass_links`` from the template's
+        ``event_data`` before calling ``create_recurring_event_series`` — series passes
+        are meaningless on a template, since the coverage gate
+        (``validate_events_coverable``) already rejects series passes on recurring
+        series. Silently dropping a client-supplied field would look like a no-op
+        success when the client's intent was ignored, so we reject it explicitly.
+        """
+        if value.series_pass_links:
+            raise ValueError("Series passes are not supported on recurring series.")
+        return value
+
+
+class TemplateEditSchema(Schema):
+    """Schema for editing a recurring series template event.
+
+    Deliberately excludes fields that are per-occurrence state (start, end,
+    slug), series binding (event_series_id), or that must not be set on a
+    template (status — templates stay DRAFT). ``venue_id`` is also omitted
+    because venue re-binding belongs on a dedicated endpoint that can enforce
+    organization scope, not on the template patch.
+
+    ``location`` (PostGIS PointField) is intentionally **not** exposed here.
+    The ``address`` text field can be updated, and the coupled-field logic in
+    ``propagate_template_changes`` will pull both ``address`` and ``location``
+    from the template when propagating. However, updating ``address`` via this
+    schema does **not** geocode or update ``location`` — coordinates must be
+    set separately (e.g. via the standard event edit endpoint or a future
+    geocoding integration). If coordinates matter, update the template's
+    ``location`` directly before propagating.
+
+    ``rsvp_before`` and ``apply_before`` are intentionally NOT editable here:
+    they are per-occurrence offsets anchored to the event's start and are
+    shifted at materialization time by the delta between the template start
+    and the occurrence start. Changing the offset after creation would require
+    recomputing every future occurrence's deadline, which is out of scope for
+    Phase 1/2. Edit these per-occurrence via the standard event edit endpoint
+    (the occurrence will be marked ``is_modified=True``).
+
+    ``visibility_settings`` is the one nested object here, and it is **merged**
+    rather than replaced: sending ``{"show_capacity": false}`` leaves the other
+    toggles at their stored values instead of resetting them to the schema
+    defaults. Omitting a toggle therefore means "no change", matching what
+    omitting any other field on this schema does.
+
+    ``extra="forbid"`` ensures that unknown fields (e.g. ``event_series_id``,
+    ``venue_id``, ``status``) are rejected with 422 rather than silently
+    ignored, giving API consumers a clear contract and protecting against
+    accidental introduction of editable fields by a future schema change.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: OneToOneFiftyString | None = None
+    description: StrippedString | None = None
+    event_type: Event.EventType | None = None
+    visibility: Event.Visibility | None = None
+    invitation_message: StrippedString | None = Field(default=None, description="Invitation message")
+    max_attendees: int | None = None
+    max_tickets_per_user: int | None = Field(default=None, description="Max tickets per user (null = unlimited)")
+    waitlist_open: bool | None = None
+    requires_full_profile: bool | None = None
+    potluck_open: bool | None = None
+    accept_invitation_requests: bool | None = None
+    accept_rsvp_notes: bool | None = None
+    can_attend_without_login: bool | None = None
+    require_ticket_names: bool | None = None
+    requires_ticket: bool | None = None
+    is_open_ended: bool | None = None
+    visibility_settings: EventVisibilitySettingsSchema | None = None
+    address: StrippedString | None = Field(default=None, max_length=255)
+
+
+class CancelOccurrenceSchema(Schema):
+    """Schema for cancelling a single occurrence."""
+
+    occurrence_date: AwareDatetime
+
+
+class GenerateSeriesEventsSchema(Schema):
+    """Schema for manual event generation."""
+
+    until: AwareDatetime | None = None
+
+
+class EventSeriesRecurrenceUpdateSchema(Schema):
+    """Schema for updating series recurrence settings."""
+
+    recurrence: RecurrenceRuleUpdateSchema | None = None
+    auto_publish: bool | None = None
+    generation_window_weeks: int | None = Field(default=None, ge=1, le=MAX_GENERATION_WINDOW_WEEKS)
+
+
+class EventSeriesRecurrenceDetailSchema(Schema):
+    """Full series detail including recurrence rule and template.
+
+    ``exdates`` is documented as a list of ISO 8601 datetime strings (this is
+    how the model stores them in JSON). Clients should ``Date.parse()`` each
+    entry. Switching to ``list[AwareDatetime]`` would require a custom
+    field_validator that interferes with Ninja's response-schema generation
+    when the schema is re-used inside other controllers' import graphs, so we
+    keep the wire type as a list of strings and document the format here.
+    """
+
+    id: UUID
+    name: str
+    slug: str
+    description: str | None = None
+    is_active: bool
+    auto_publish: bool
+    generation_window_weeks: int
+    exdates: list[str] = Field(
+        default_factory=list,
+        description="List of cancelled occurrence instants as ISO 8601 datetime strings (UTC).",
+    )
+    last_generated_until: AwareDatetime | None = None
+    recurrence_rule: RecurrenceRuleSchema | None = None
+    template_event: MinimalEventSchema | None = None
+
+
+class EventSeriesDriftSchema(Schema):
+    """Response for the cadence-drift detection endpoint.
+
+    After an organiser changes a series' recurrence rule, already-materialized
+    future occurrences keep their old dates. This schema carries the IDs of
+    those "stale" occurrences so the admin UI can highlight them and offer a
+    bulk-cancel action. Manually-modified occurrences (``is_modified=True``)
+    and already-cancelled events are excluded: the former were deliberately
+    shifted off the cadence, the latter are already in their terminal state.
+    """
+
+    stale_occurrences: list[UUID] = Field(
+        default_factory=list,
+        description=(
+            "IDs of future, non-cancelled, non-manually-modified occurrences whose "
+            "start datetime does not match the current recurrence rule."
+        ),
+    )

@@ -1,0 +1,515 @@
+"""Membership subscription models.
+
+Phase 1 introduced staff-managed (OFFLINE) subscriptions. Phase 2 adds
+Stripe-backed ONLINE subscriptions via additive fields and a per-(user, org)
+:class:`CustomerProfile`. #832 adds FREE — a zero-price, member-self-serve
+plan with no Stripe object — together with the ``LIFETIME`` period unit, a
+non-renewing term that leaves ``current_period_end`` NULL forever (which is
+what keeps the renewal/lapse/expiry beats from ever selecting it).
+"""
+
+import typing as t
+from decimal import Decimal
+
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import MinValueValidator
+from django.db import models
+from django.utils.translation import gettext_lazy as _
+from simple_history.models import HistoricalRecords
+
+from common.fields import MarkdownField
+from common.models import TimeStampedModel
+
+from .organization import MembershipTier, Organization
+
+# Single source of truth for the subscription statuses that are terminal
+# (no further transitions possible). Lives at module scope so it can be
+# referenced both from ``MembershipSubscription.Meta.constraints`` and from
+# runtime callers via ``MembershipSubscription.TERMINAL_STATUSES``.
+_TERMINAL_STATUS_VALUES: tuple[str, ...] = ("cancelled", "expired")
+
+
+def _stripe_mode() -> str:
+    """Return "test" or "live", inferred from the configured secret key.
+
+    Mirrors ``events.models.ticket.Payment.stripe_mode`` — used to build
+    organizer-facing Stripe Dashboard URLs.
+    """
+    key: str = settings.STRIPE_SECRET_KEY
+    return "test" if key.startswith("sk_test_") else "live"
+
+
+class SubscriptionPaymentMethod(models.TextChoices):
+    """Payment method for a subscription plan.
+
+    Module-level with a distinct class name (not nested as ``PaymentMethod``):
+    django-ninja dedupes OpenAPI ``components.schemas`` by bare class name with
+    last-writer-wins, so a nested ``PaymentMethod`` silently clobbered
+    ``TicketTier.PaymentMethod`` in the generated spec (#782). Code keeps using
+    the ``MembershipSubscriptionPlan.PaymentMethod`` idiom via the class-level
+    alias.
+    """
+
+    ONLINE = "online", _("Online (Stripe)")
+    OFFLINE = "offline", _("Offline (staff-managed)")
+    FREE = "free", _("Free (member self-serve)")
+
+
+class MembershipSubscriptionPlanQuerySet(models.QuerySet["MembershipSubscriptionPlan"]):
+    """QuerySet exposing the plan-list annotation helper."""
+
+    def with_active_subscription_count(self) -> "MembershipSubscriptionPlanQuerySet":
+        """Annotate each plan with its count of occupied/reserved cap slots.
+
+        Read by ``PlanSchema.resolve_active_subscription_count`` and
+        ``PublicPlanSchema.resolve_sold_out`` — annotating in the queryset
+        avoids one COUNT query per serialized row (N+1). Counts non-terminal
+        subscriptions on the plan PLUS non-terminal subscriptions scheduled to
+        downgrade into it (``pending_plan``) — see
+        :meth:`MembershipSubscriptionPlan.occupied_slot_count`.
+        """
+        return self.annotate(
+            active_subscription_count=models.Count(
+                "subscriptions",
+                filter=~models.Q(subscriptions__status__in=_TERMINAL_STATUS_VALUES),
+                distinct=True,
+            )
+            + models.Count(
+                "pending_subscriptions",
+                filter=~models.Q(pending_subscriptions__status__in=_TERMINAL_STATUS_VALUES),
+                distinct=True,
+            )
+        )
+
+
+class MembershipSubscriptionPlanManager(models.Manager["MembershipSubscriptionPlan"]):
+    def get_queryset(self) -> MembershipSubscriptionPlanQuerySet:
+        """Get base queryset."""
+        return MembershipSubscriptionPlanQuerySet(self.model, using=self._db)
+
+    def with_active_subscription_count(self) -> MembershipSubscriptionPlanQuerySet:
+        """Queryset annotated with each plan's non-terminal subscription count."""
+        return self.get_queryset().with_active_subscription_count()
+
+
+class MembershipSubscriptionPlan(TimeStampedModel):
+    """A paid plan attached to a :class:`MembershipTier`.
+
+    Multiple plans can target the same tier (e.g. "Monthly" + "Annual"). The
+    billing cadence is rolling — ``period_count`` units of ``period_unit`` from
+    each renewal — except for ``LIFETIME``, which never renews at all.
+    """
+
+    class PeriodUnit(models.TextChoices):
+        MONTH = "month", _("Month")
+        YEAR = "year", _("Year")
+        # Non-renewing term: ``current_period_end`` stays NULL forever, so no
+        # lapse/reminder/expiry beat ever selects the subscription and nothing
+        # is ever billed again. ``period_count`` is meaningless here.
+        LIFETIME = "lifetime", _("Lifetime")
+
+    # Alias so callers keep the ``Model.PaymentMethod`` idiom; the class lives
+    # at module level under a collision-free name (see its docstring, #782).
+    PaymentMethod = SubscriptionPaymentMethod
+
+    class SalesStatus(models.TextChoices):
+        OPEN = "open", _("Open")
+        PAUSED = "paused", _("Paused")
+
+    tier = models.ForeignKey(
+        MembershipTier,
+        on_delete=models.CASCADE,
+        related_name="subscription_plans",
+    )
+    name = models.CharField(max_length=255, help_text=_('e.g. "Monthly", "Annual"'))
+    description = MarkdownField(blank=True, default="")
+    price = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0)],
+    )
+    currency = models.CharField(max_length=3, help_text=_("ISO 4217 currency code"))
+    period_unit = models.CharField(
+        max_length=10,
+        choices=PeriodUnit.choices,
+        default=PeriodUnit.MONTH,
+    )
+    period_count = models.PositiveSmallIntegerField(
+        default=1,
+        validators=[MinValueValidator(1)],
+    )
+    is_active = models.BooleanField(default=True, db_index=True)
+    sales_status = models.CharField(
+        max_length=10,
+        choices=SalesStatus.choices,
+        default=SalesStatus.OPEN,
+        help_text=_(
+            "PAUSED stops member self-service sales (subscribe, revive, plan switches "
+            "into this plan) while leaving existing subscribers untouched. Orthogonal "
+            "to archiving: an archived plan is retired, a paused one is temporarily closed."
+        ),
+    )
+    max_subscriptions = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_(
+            "Cap on concurrent non-terminal subscriptions (the venue's card stock). "
+            "Cancelled/expired subscriptions free their slot automatically. NULL = unlimited."
+        ),
+    )
+    payment_method = models.CharField(
+        max_length=10,
+        choices=PaymentMethod.choices,
+        default=PaymentMethod.OFFLINE,
+        help_text=_(
+            "ONLINE plans are billed via Stripe; OFFLINE plans are tracked manually by staff; "
+            "FREE plans cost nothing, are self-serve, and never renew (price 0 + LIFETIME period)."
+        ),
+    )
+    stripe_product_id = models.CharField(max_length=255, blank=True, default="")
+    stripe_price_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
+
+    history = HistoricalRecords()
+
+    objects = MembershipSubscriptionPlanManager()
+
+    class Meta:
+        ordering = ["tier__name", "name"]
+        constraints = [
+            models.UniqueConstraint(fields=["tier", "name"], name="unique_plan_name_per_tier"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.tier} - {self.name}"
+
+    def clean(self) -> None:
+        """Enforce the (payment method, price, cadence) shape rules.
+
+        Defense-in-depth behind the API validators: ``TimeStampedModel.save()``
+        runs ``full_clean()``, so this closes every non-bulk ORM write path —
+        Django admin, management commands, ad-hoc shell writes — without
+        needing a ``CheckConstraint`` migration. The API layer already refuses
+        these shapes earlier with better messages.
+        """
+        super().clean()
+        # lazy: subscription_plan_rules imports from events.models, so a
+        # top-level import here would cycle.
+        from events.utils.subscription_plan_rules import validate_plan_shape
+
+        message = validate_plan_shape(
+            payment_method=self.payment_method,
+            price=self.price,
+            period_unit=self.period_unit,
+        )
+        if message:
+            raise DjangoValidationError({"payment_method": message})
+
+    @property
+    def organization_id(self) -> t.Any:
+        """Convenience proxy for permission / scoping helpers."""
+        return self.tier.organization_id
+
+    def occupied_slot_count(self) -> int:
+        """Count subscriptions occupying (or reserving) one of this plan's cap slots.
+
+        A slot is held by every non-terminal subscription on the plan, plus
+        every non-terminal subscription scheduled to downgrade INTO it
+        (``pending_plan``): the Stripe schedule rollover re-points ``plan``
+        with no capacity re-check, so the slot must be reserved at scheduling
+        time or the swap could push the plan over its hard cap. Cancelling the
+        subscription (or the pending change) clears ``pending_plan`` and frees
+        the reservation. Single source of truth for
+        ``ensure_plan_sales_capacity`` and the schema resolvers' fallbacks.
+        """
+        return (
+            MembershipSubscription.objects.filter(models.Q(plan=self) | models.Q(pending_plan=self))
+            .exclude(status__in=_TERMINAL_STATUS_VALUES)
+            .count()
+        )
+
+
+class MembershipSubscription(TimeStampedModel):
+    """A user's subscription to a :class:`MembershipSubscriptionPlan`.
+
+    ``organization`` is denormalized for query/permission simplicity and kept
+    consistent with the plan's tier via ``clean()``.
+    """
+
+    class SubscriptionStatus(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        ACTIVE = "active", _("Active")
+        PAUSED = "paused", _("Paused")
+        PAST_DUE = "past_due", _("Past Due")
+        CANCELLED = "cancelled", _("Cancelled")
+        EXPIRED = "expired", _("Expired")
+
+    TERMINAL_STATUSES: t.ClassVar[frozenset[str]] = frozenset(_TERMINAL_STATUS_VALUES)
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="membership_subscriptions",
+    )
+    plan = models.ForeignKey(
+        MembershipSubscriptionPlan,
+        on_delete=models.PROTECT,
+        related_name="subscriptions",
+    )
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="membership_subscriptions",
+    )
+    status = models.CharField(
+        max_length=16,
+        choices=SubscriptionStatus.choices,
+        default=SubscriptionStatus.PENDING,
+        db_index=True,
+    )
+    current_period_start = models.DateTimeField(null=True, blank=True)
+    current_period_end = models.DateTimeField(null=True, blank=True, db_index=True)
+    cancel_at_period_end = models.BooleanField(default=False)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    stripe_subscription_id = models.CharField(max_length=255, null=True, blank=True, unique=True)
+    stripe_checkout_session_id = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        db_index=True,
+        help_text=_("Hosted Checkout Session that will (or did) create the Stripe Subscription."),
+    )
+    pending_plan = models.ForeignKey(
+        MembershipSubscriptionPlan,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="pending_subscriptions",
+        help_text=_("Plan that will replace ``plan`` at the next renewal (downgrade flow)."),
+    )
+    stripe_schedule_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
+    expired_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=_("Set when status transitions to EXPIRED. Used for the revival window check."),
+    )
+
+    history = HistoricalRecords()
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "organization"],
+                condition=~models.Q(status__in=list(_TERMINAL_STATUS_VALUES)),
+                name="one_active_subscription_per_user_org",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["organization", "status"]),
+            models.Index(fields=["user", "status"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id} @ {self.organization_id} ({self.status})"
+
+    def clean(self) -> None:
+        """Enforce subscription/plan-tier organization integrity."""
+        super().clean()
+        if self.plan_id and self.organization_id and self.plan.tier.organization_id != self.organization_id:
+            raise DjangoValidationError(
+                {"organization": _("Subscription organization must match the plan's tier organization.")}
+            )
+        if self.pending_plan and self.pending_plan.tier.organization_id != self.organization_id:
+            raise DjangoValidationError(
+                {"pending_plan": _("Pending plan must belong to the same organization as the subscription.")}
+            )
+
+    @property
+    def is_terminal(self) -> bool:
+        """True if the subscription is in a terminal state."""
+        return self.status in self.TERMINAL_STATUSES
+
+    def stripe_dashboard_url(self) -> str | None:
+        """Stripe Dashboard URL for this subscription (None when OFFLINE/unlinked).
+
+        Mirrors the ticket ``Payment`` helper: once the Stripe Subscription exists we
+        link straight to it, but a PENDING row that only has a Checkout Session falls
+        back to the session page — that is exactly the "member says they paid but it
+        still shows PENDING" case an organizer needs to inspect.
+
+        Like the ticket helper, the URL carries no connected-account segment:
+        memberships are direct charges on the org's own Stripe account, so the
+        organizer opening it is already in the right dashboard.
+        """
+        if self.stripe_subscription_id:
+            return f"https://dashboard.stripe.com/{_stripe_mode()}/subscriptions/{self.stripe_subscription_id}"
+        if self.stripe_checkout_session_id:
+            return f"https://dashboard.stripe.com/{_stripe_mode()}/checkout/sessions/{self.stripe_checkout_session_id}"
+        return None
+
+
+class MembershipPayment(TimeStampedModel):
+    """A single payment recorded against a :class:`MembershipSubscription`.
+
+    In Phase 1 these are recorded manually by staff. ``raw_response`` is
+    reserved for Phase 2 Stripe payloads (invoice / payment_intent JSON).
+    """
+
+    class PaymentStatus(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        SUCCEEDED = "succeeded", _("Succeeded")
+        FAILED = "failed", _("Failed")
+        REFUNDED = "refunded", _("Refunded")
+
+    subscription = models.ForeignKey(
+        MembershipSubscription,
+        on_delete=models.CASCADE,
+        related_name="payments",
+    )
+    amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0)],
+    )
+    currency = models.CharField(max_length=3)
+    status = models.CharField(
+        max_length=16,
+        choices=PaymentStatus.choices,
+        default=PaymentStatus.SUCCEEDED,
+        db_index=True,
+    )
+    period_start = models.DateTimeField()
+    period_end = models.DateTimeField()
+    occurred_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="When the payment actually changed hands (for backfilled records). Null = use created_at.",
+    )
+    recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="recorded_membership_payments",
+    )
+    notes = models.TextField(blank=True, default="")
+    raw_response = models.JSONField(default=dict, blank=True)
+    stripe_invoice_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
+    stripe_payment_intent_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
+
+    # Platform fee VAT breakdown (mirrors events.models.ticket.Payment). The
+    # decomposition fields are nullable for OFFLINE / historical payments, which
+    # collect no fee; ``platform_fee`` and ``platform_fee_reverse_charge`` are not.
+    platform_fee = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Gross platform fee taken on this payment (0 for offline/failed payments).",
+    )
+    platform_fee_net = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, help_text="Platform fee excluding VAT."
+    )
+    platform_fee_vat = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True, help_text="VAT portion of the platform fee."
+    )
+    platform_fee_vat_rate = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True, help_text="Platform fee VAT rate snapshot."
+    )
+    platform_fee_reverse_charge = models.BooleanField(
+        default=False, help_text="Whether reverse charge applies to the platform fee (EU B2B cross-border)."
+    )
+
+    # Refund audit trail (mirrors events.models.ticket.Payment). A FULL refund
+    # flips ``status`` to REFUNDED; a partial one leaves the row SUCCEEDED — the
+    # member keeps the period they partly paid for — and is recorded only here.
+    # Without these fields a partial refund left no trace at all, so the ledger
+    # silently disagreed with Stripe and the org kept being billed the full fee.
+    refund_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        help_text="Amount refunded so far (cumulative, as reported by Stripe). Null when never refunded.",
+    )
+    refunded_at = models.DateTimeField(
+        null=True, blank=True, help_text="When the most recent refund for this payment was observed."
+    )
+    stripe_refund_id = models.CharField(
+        max_length=255, blank=True, default="", help_text="Most recent Stripe Refund id, when known."
+    )
+
+    # ``cascade_delete_history`` is the GDPR leg: a payment reaches its data
+    # subject only through ``subscription``, so a user erasure would otherwise
+    # leave history rows carrying Stripe ids, amounts and ``notes`` behind a
+    # dangling FK — invisible to a purge that follows user FKs. Dropping the
+    # mirror with the live row keeps it reachable. Nothing deletes payments
+    # directly, so this only ever fires on a cascade (user/subscription/org).
+    history = HistoricalRecords(cascade_delete_history=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["subscription", "-created_at"]),
+        ]
+        constraints = [
+            # A Stripe invoice maps to at most one ledger row. The webhook path
+            # already serializes concurrent invoice events per subscription via
+            # select_for_update; this is the DB-level idempotency token backing
+            # the update_or_create keyed on stripe_invoice_id (house pattern,
+            # #483/#491).
+            models.UniqueConstraint(
+                fields=["stripe_invoice_id"],
+                condition=~models.Q(stripe_invoice_id=""),
+                name="unique_membership_payment_stripe_invoice",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"Payment {self.id} for sub {self.subscription_id} ({self.status})"
+
+    def stripe_dashboard_url(self) -> str | None:
+        """Stripe Dashboard URL for this payment (None for OFFLINE/manual rows)."""
+        if self.stripe_payment_intent_id:
+            return f"https://dashboard.stripe.com/{_stripe_mode()}/payments/{self.stripe_payment_intent_id}"
+        if self.stripe_invoice_id:
+            return f"https://dashboard.stripe.com/{_stripe_mode()}/invoices/{self.stripe_invoice_id}"
+        return None
+
+
+class CustomerProfile(TimeStampedModel):
+    """Per-(user, organization) Stripe Customer reference.
+
+    Stripe Connect uses one Customer namespace per connected account, so a
+    single platform-wide Customer doesn't work — each org's Stripe account
+    needs its own Customer for the user. This model is the join.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="customer_profiles",
+    )
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.CASCADE,
+        related_name="customer_profiles",
+    )
+    stripe_customer_id = models.CharField(max_length=255, db_index=True)
+
+    history = HistoricalRecords()
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["user", "organization"], name="unique_customer_per_user_org"),
+            models.UniqueConstraint(
+                fields=["organization", "stripe_customer_id"],
+                name="unique_stripe_customer_per_org",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.user_id} @ {self.organization_id} ({self.stripe_customer_id})"

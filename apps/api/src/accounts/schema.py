@@ -1,0 +1,559 @@
+"""Schema for accounts module."""
+
+import datetime
+import typing as t
+from decimal import Decimal
+from uuid import uuid4
+
+from django.conf import settings
+from ninja import ModelSchema, Schema
+from ninja_jwt.schema import TokenObtainPairOutputSchema
+from pydantic import UUID4, AwareDatetime, EmailStr, Field, field_serializer, field_validator, model_validator
+
+from accounts.password_validation import validate_password
+from common.schema import (
+    BillingInfoSchemaMixin,
+    EmailSchema,
+    ProfilePictureSchemaMixin,
+    StrippedString,
+    VATCountryCode,
+    VATIdUpdateBaseSchema,
+    validate_country_code,
+)
+
+from .models import (
+    DietaryPreference,
+    DietaryRestriction,
+    FoodItem,
+    ReferralCode,
+    ReferralPayout,
+    ReferralPayoutStatement,
+    RevelUser,
+    UserBillingProfile,
+    UserDietaryPreference,
+)
+
+
+class ReferralCodeSchema(ModelSchema):
+    class Meta:
+        model = ReferralCode
+        fields = ["code", "is_active"]
+
+
+class ReferralApplicationSchema(Schema):
+    """Public application to the referral program."""
+
+    email: EmailStr
+    code: str = Field(..., pattern=r"^[A-Za-z0-9_-]{3,20}$")
+    note: StrippedString = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("email")
+    @classmethod
+    def lowercase_email(cls, v: str) -> str:
+        """Normalize email to lowercase."""
+        return v.lower()
+
+
+class ReferralApplicationErrorSchema(Schema):
+    """404/409 body of the referral application endpoints: translated ``detail`` + stable ``code``.
+
+    ``code`` is one of ``referral_applications_disabled`` (404), ``pending_application``,
+    ``code_taken`` (409).
+    """
+
+    detail: str
+    code: str
+
+
+class ReferralInvitationSchema(Schema):
+    """What the register page needs to prefill an invite: nothing more."""
+
+    email: str
+    code: str
+
+
+class RevelUserSchema(ProfilePictureSchemaMixin, ModelSchema):
+    id: UUID4
+    email: str
+    email_verified: bool
+    preferred_name: str
+    pronouns: str
+    is_active: bool
+    first_name: str
+    last_name: str
+    totp_active: bool
+    language: str
+    display_name: str
+    bio: str
+    referral_code: ReferralCodeSchema | None = None
+
+    class Meta:
+        model = RevelUser
+        fields = ["email", "email_verified", "is_active", "first_name", "last_name", "totp_active", "language"]
+
+
+class MinimalRevelUserSchema(ProfilePictureSchemaMixin, ModelSchema):
+    preferred_name: str | None
+    pronouns: str | None
+    first_name: str
+    last_name: str
+    email: str
+    display_name: str
+    bio: str
+
+    class Meta:
+        model = RevelUser
+        fields = ["id", "preferred_name", "pronouns", "first_name", "last_name", "email"]
+
+
+class MemberUserSchema(ProfilePictureSchemaMixin, ModelSchema):
+    display_name: str
+    bio: str
+
+    class Meta:
+        model = RevelUser
+        fields = ["id", "email", "phone_number", "preferred_name", "pronouns", "first_name", "last_name"]
+
+
+class TOTPProvisioningUriSchema(Schema):
+    uri: str = Field(..., description="The provisioning URI for the TOTP app, to be rendered in a QR code.")
+
+
+class OTPVerifySchema(Schema):
+    otp: str = Field(..., description="The one-time password to verify.", max_length=6)
+
+
+class TempToken(Schema):
+    token: str = Field(..., description="The temporary token to be used with OTP.")
+    type: t.Literal["otp"] = "otp"
+
+
+class TempTokenWithTOTP(Schema):
+    token: str
+    otp: str = Field(..., description="The one-time password to verify.", max_length=6)
+
+
+class OIDCExchangeRequestSchema(Schema):
+    token: str = Field(..., max_length=4096, description="One-time login token from the OIDC callback redirect.")
+
+
+class OIDCExchangeResponseSchema(Schema):
+    username: str
+    access: str
+    refresh: str
+    return_url: str = Field(..., description="Relative path to send the user to after setting cookies.")
+
+
+class ExternalIdentitySchema(Schema):
+    provider: str
+    provider_name: str
+    email: str
+    created_at: AwareDatetime
+
+
+class PasswordMixin(Schema):
+    password1: str = Field(..., description="Password", min_length=8, max_length=150)
+    password2: str = Field(..., description="Password confirmation", min_length=8, max_length=150)
+
+    @model_validator(mode="after")
+    def password_match(self) -> t.Self:
+        """Validate that the passwords match."""
+        if self.password1 != self.password2:
+            raise ValueError("Passwords do not match")
+        return self
+
+
+# Relative path only: one leading slash, not followed by "/" or "\" (protocol-relative /
+# backslash host smuggling), and no whitespace or C0/C1 control characters anywhere. Shared by the
+# registration and verify-resend payloads so the two can't drift apart.
+VerificationReturnUrl = t.Annotated[
+    str | None,
+    Field(
+        max_length=2048,
+        pattern=r"^/(?:[^/\\\s\x00-\x1f\x7f-\x9f][^\s\x00-\x1f\x7f-\x9f]*)?$",
+        description="Relative path the verification link sends the user back to after verifying.",
+    ),
+]
+
+
+class RegisterUserSchema(PasswordMixin):
+    email: EmailStr
+    first_name: StrippedString = ""
+    last_name: StrippedString = ""
+    referral_code: StrippedString | None = None
+    accept_toc_and_privacy: bool = Field(..., description="Must accept terms of service and privacy policy")
+    return_url: VerificationReturnUrl = None
+    turnstile_token: str | None = Field(default=None, max_length=2048)
+
+    @field_validator("email")
+    @classmethod
+    def lowercase_email(cls, v: str) -> str:
+        """Normalize email to lowercase."""
+        return v.lower()
+
+    @field_validator("accept_toc_and_privacy")
+    @classmethod
+    def validate_accept_toc_and_privacy(cls, v: bool) -> bool:
+        """Validate that the user has accepted the ToC and Privacy Policy."""
+        if v is not True:
+            raise ValueError("You must accept the terms of service and privacy policy")
+        return v
+
+    @model_validator(mode="after")
+    def validate_password(self) -> t.Self:
+        """Validate the password."""
+        tmp_user = RevelUser(
+            email=self.email, username=self.email, first_name=self.first_name, last_name=self.last_name
+        )
+        validate_password(self.password1, user=tmp_user)
+        return self
+
+
+class VerifyEmailSchema(Schema):
+    token: str
+
+
+class ResendVerificationSchema(EmailSchema):
+    return_url: VerificationReturnUrl = None
+
+
+class BaseEmailJWTPayloadSchema(Schema):
+    user_id: UUID4
+    email: EmailStr
+    exp: datetime.datetime
+    jti: str = Field(default_factory=lambda: str(uuid4()))
+    aud: str = Field(default_factory=lambda: settings.JWT_AUDIENCE)
+
+    @field_serializer("exp")
+    def serialize_exp(self, value: datetime.datetime) -> int:
+        """Serialize the expiry datetime to a Unix timestamp."""
+        return int(value.timestamp())
+
+
+class VerifyEmailJWTPayloadSchema(BaseEmailJWTPayloadSchema):
+    type: t.Literal["email_verification"] = "email_verification"
+
+
+class PasswordResetJWTPayloadSchema(BaseEmailJWTPayloadSchema):
+    type: t.Literal["password_reset"] = "password_reset"
+
+
+class DeleteAccountJWTPayloadSchema(BaseEmailJWTPayloadSchema):
+    type: t.Literal["delete_account"] = "delete_account"
+
+
+class UnsubscribeJWTPayloadSchema(BaseEmailJWTPayloadSchema):
+    type: t.Literal["unsubscribe"] = "unsubscribe"
+
+
+class EmailChangeJWTPayloadSchema(BaseEmailJWTPayloadSchema):
+    new_email: EmailStr
+    # Required (no default): checked against ``RevelUser.credentials_changed_at`` at confirm.
+    iat: AwareDatetime
+    type: t.Literal["email_change"] = "email_change"
+
+    @field_serializer("iat")
+    def serialize_iat(self, value: datetime.datetime) -> int:
+        """Serialize the issue time to a Unix timestamp (floored, so a same-second race rejects)."""
+        return int(value.timestamp())
+
+
+class DeleteAccountSchema(Schema):
+    password: str
+
+
+class DeleteAccountConfirmSchema(Schema):
+    token: str
+    force: bool = Field(
+        default=False,
+        description=(
+            "Acknowledge the consequences reported by a previous 409 "
+            "(e.g. forfeiting unpaid referral payouts) and delete anyway."
+        ),
+    )
+
+
+class ReferralForfeitureSchema(Schema):
+    """409 body returned when account deletion would forfeit unpaid referral payouts."""
+
+    detail: str
+    code: str
+    unpaid_count: int
+    unpaid_total: Decimal
+    failed_total: Decimal
+    currency: str
+
+
+class PasswordResetSchema(PasswordMixin):
+    token: str
+
+
+class ChangePasswordSchema(PasswordMixin):
+    old_password: str
+
+
+SupportedLanguage = t.Literal["en", "de", "it", "fr", "es", "pt"]
+
+
+class ProfileUpdateSchema(Schema):
+    """Schema for updating user profile information."""
+
+    preferred_name: StrippedString = Field(..., max_length=255, description="User's preferred name")
+    pronouns: StrippedString = Field(..., max_length=100, description="User's pronouns")
+    first_name: StrippedString = Field(..., max_length=30, description="User's first name")
+    last_name: StrippedString = Field(..., max_length=150, description="User's last name")
+    language: SupportedLanguage = Field(
+        "en", max_length=7, description="User's preferred language (en, de, it, fr, es, pt)"
+    )
+    bio: str = Field("", max_length=500, description="User's bio (publicly visible)")
+
+    @model_validator(mode="after")
+    def validate_language(self) -> t.Self:
+        """Validate language code is supported."""
+        from django.conf import settings
+
+        supported_languages = [lang[0] for lang in settings.LANGUAGES]
+        if self.language not in supported_languages:
+            raise ValueError(f"Language must be one of: {', '.join(supported_languages)}")
+        return self
+
+
+class LanguageUpdateSchema(Schema):
+    """Schema for updating user's preferred language."""
+
+    language: SupportedLanguage = Field(..., description="User's preferred language (en, de, it, fr, es, pt)")
+
+
+class VerifyEmailResponseSchema(Schema):
+    user: RevelUserSchema
+    token: TokenObtainPairOutputSchema
+
+
+class EmailChangeRequestSchema(Schema):
+    new_email: EmailStr
+    password: str
+
+    @field_validator("new_email")
+    @classmethod
+    def lowercase_email(cls, v: str) -> str:
+        """Normalize email to lowercase."""
+        return v.lower()
+
+
+class EmailChangeConfirmSchema(Schema):
+    token: str
+
+
+class EmailChangeResponseSchema(Schema):
+    user: RevelUserSchema
+    token: TokenObtainPairOutputSchema
+
+
+# Dietary Models Schemas
+
+
+class FoodItemSchema(ModelSchema):
+    """Schema for FoodItem model."""
+
+    class Meta:
+        model = FoodItem
+        fields = ["id", "name"]
+
+
+class FoodItemCreateSchema(Schema):
+    """Schema for creating a FoodItem."""
+
+    name: StrippedString = Field(..., min_length=1, max_length=255, description="Food or ingredient name")
+
+
+class DietaryRestrictionSchema(ModelSchema):
+    """Schema for DietaryRestriction model."""
+
+    food_item: FoodItemSchema
+    restriction_type: DietaryRestriction.RestrictionType
+
+    class Meta:
+        model = DietaryRestriction
+        fields = ["id", "food_item", "restriction_type", "notes", "is_public"]
+
+
+class DietaryRestrictionCreateSchema(Schema):
+    """Schema for creating a DietaryRestriction."""
+
+    food_item_name: StrippedString = Field(
+        ..., min_length=1, max_length=255, description="Food item name (creates if doesn't exist)"
+    )
+    restriction_type: DietaryRestriction.RestrictionType = Field(
+        ..., description="Type of restriction (dislike, intolerant, allergy, severe_allergy)"
+    )
+    notes: str = Field(default="", description="Optional additional context")
+    is_public: bool = Field(default=False, description="Visible to all event attendees if True")
+
+
+class DietaryRestrictionUpdateSchema(Schema):
+    """Schema for updating a DietaryRestriction."""
+
+    restriction_type: DietaryRestriction.RestrictionType | None = Field(
+        None, description="Type of restriction (dislike, intolerant, allergy, severe_allergy)"
+    )
+    notes: str | None = Field(None, description="Optional additional context")
+    is_public: bool | None = Field(None, description="Visible to all event attendees if True")
+
+
+class DietaryPreferenceSchema(ModelSchema):
+    """Schema for DietaryPreference model (system-managed)."""
+
+    class Meta:
+        model = DietaryPreference
+        fields = ["id", "name"]
+
+
+class UserDietaryPreferenceSchema(ModelSchema):
+    """Schema for UserDietaryPreference model."""
+
+    preference: DietaryPreferenceSchema
+
+    class Meta:
+        model = UserDietaryPreference
+        fields = ["id", "preference", "comment", "is_public"]
+
+
+class UserDietaryPreferenceCreateSchema(Schema):
+    """Schema for creating a UserDietaryPreference."""
+
+    preference_id: UUID4 = Field(..., description="ID of the dietary preference to add")
+    comment: str = Field(default="", description="Optional context about this preference")
+    is_public: bool = Field(default=False, description="Visible to all event attendees if True")
+
+
+class UserDietaryPreferenceUpdateSchema(Schema):
+    """Schema for updating a UserDietaryPreference."""
+
+    comment: str | None = Field(None, description="Optional context about this preference")
+    is_public: bool | None = Field(None, description="Visible to all event attendees if True")
+
+
+# Impersonation Schemas
+
+
+class ImpersonationTokenRequestSchema(Schema):
+    """Schema for requesting an impersonation access token."""
+
+    token: str = Field(..., description="The impersonation request token from admin panel")
+
+
+class ImpersonatedUserSchema(Schema):
+    """Schema for the impersonated user info returned with access token."""
+
+    id: UUID4
+    email: str
+    display_name: str
+    first_name: str
+    last_name: str
+
+
+class ImpersonationTokenResponseSchema(Schema):
+    """Schema for the impersonation access token response."""
+
+    access_token: str = Field(..., description="JWT access token for impersonated session (15 min)")
+    expires_in: int = Field(..., description="Token lifetime in seconds")
+    user: ImpersonatedUserSchema = Field(..., description="Info about the impersonated user")
+    impersonated_by: str = Field(..., description="Email of the admin performing impersonation")
+
+
+# Billing Profile Schemas
+
+
+class UserBillingProfileSchema(ModelSchema):
+    """Read-only schema for user billing profile."""
+
+    class Meta:
+        model = UserBillingProfile
+        fields = [
+            "id",
+            "billing_name",
+            "vat_id",
+            "vat_country_code",
+            "vat_id_validated",
+            "vat_id_validated_at",
+            "billing_address",
+            "billing_email",
+            "self_billing_agreed",
+        ]
+
+
+class UserBillingProfileCreateSchema(Schema):
+    """Schema for creating a user billing profile."""
+
+    billing_name: StrippedString = Field(..., min_length=1, max_length=255, description="Legal name for invoicing")
+    vat_country_code: VATCountryCode = Field(default="", description="ISO 3166-1 alpha-2 country code")
+    billing_address: str = Field(default="", description="Billing address")
+    billing_email: EmailStr | None = Field(default=None, description="Billing email; omit to use the account email")
+    self_billing_agreed: bool = Field(default=False, description="Agreement to self-billing (Gutschrift)")
+
+    @field_validator("vat_country_code")
+    @classmethod
+    def validate_vat_country_code(cls, v: str) -> str:
+        """Validate vat_country_code is a valid ISO 3166-1 alpha-2 code (or empty)."""
+        return validate_country_code(v) or ""
+
+
+class UserBillingProfileUpdateSchema(BillingInfoSchemaMixin):
+    """Schema for updating user billing info.
+
+    Conflict check between vat_country_code and vat_id prefix
+    is done at the service level.
+    """
+
+    self_billing_agreed: bool | None = Field(
+        default=None, description="Agreement to self-billing (Gutschrift); omit to leave it unchanged"
+    )
+
+
+class UserVATIdUpdateSchema(VATIdUpdateBaseSchema):
+    """Schema for setting/updating a user's VAT ID."""
+
+
+# Referral Payout Schemas
+
+
+class ReferralPayoutSchema(Schema):
+    """Schema for referral payout list responses."""
+
+    id: UUID4
+    period_start: datetime.date
+    period_end: datetime.date
+    net_platform_fees: Decimal
+    payout_amount: Decimal
+    rolled_over_amount: Decimal
+    currency: str
+    status: ReferralPayout.ReferralPayoutStatus
+    has_statement: bool
+    created_at: AwareDatetime
+
+    @staticmethod
+    def resolve_has_statement(obj: ReferralPayout) -> bool:
+        """Check whether this payout has a generated statement."""
+        return hasattr(obj, "statement")
+
+
+class ReferralPayoutStatementSchema(Schema):
+    """Schema for referral payout statement responses."""
+
+    id: UUID4
+    document_type: ReferralPayoutStatement.DocumentType
+    document_number: str
+    amount_gross: Decimal
+    amount_net: Decimal
+    amount_vat: Decimal
+    vat_rate: Decimal
+    currency: str
+    reverse_charge: bool
+    issued_at: AwareDatetime | None = None
+    created_at: AwareDatetime
+
+
+class StatementDownloadURLSchema(Schema):
+    """Schema for payout statement PDF download URL response."""
+
+    download_url: str

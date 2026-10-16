@@ -1,0 +1,453 @@
+"""Which seats does this cart get? — the three seat assignment modes.
+
+Owns the seat-lock protocol for checkout: locks are always taken in PK order
+(matching holds/overrides), every optimistic pick is re-verified under its lock
+inside a savepoint, and the buyer's own holds are consumed on success.
+"""
+
+from uuid import UUID
+
+from django.db import OperationalError, transaction
+from django.utils.translation import gettext_lazy as _
+from ninja.errors import HttpError
+
+from events.models import EventSeatOverride, SeatHold, Ticket, TicketTier, VenueSeat
+from events.schema import TicketPurchaseItem
+from events.service.batch_ticket_service.context import BatchTicketContext, CartGroup
+from events.service.seating import holds as holds_service
+from events.service.seating.pick import resolve_requested_zone
+
+_DEADLOCK_SQLSTATE = "40P01"
+
+
+class _SeatConflictError(Exception):
+    """Internal retry signal: an optimistically picked seat block was invalidated after locking.
+
+    Raised inside the per-attempt savepoint in ``_resolve_seats_best_available`` so the
+    savepoint rollback releases that attempt's row locks; never escapes the retry loop.
+    Deliberately not an HttpError — it must be caught locally, not rendered.
+    """
+
+
+class SeatResolutionMixin(BatchTicketContext):
+    """Resolve the cart's seats, per group, according to each group's ``seat_assignment_mode``.
+
+    Entry point is ``resolve_cart_seats``, which locks every USER_CHOICE seat across
+    ALL groups in a single PK-ordered query before validating each group's picks —
+    two tiers sharing a sector, locked per-group instead, would lock-order-invert
+    against a concurrent cart naming the same two tiers in the opposite order.
+
+    A mixed USER_CHOICE + BEST_AVAILABLE cart still widens the documented BA deadlock
+    window (final-review I4): the UC lock is held for the rest of the transaction
+    while each BA group runs its own pick/lock rounds, so a concurrent cart taking
+    those same seats in the other order can still deadlock. Postgres picks a victim
+    and raises SQLSTATE ``40P01``; ``resolve_cart_seats`` maps that to a retryable
+    409 ("please try again") instead of letting it surface as a 500.
+    """
+
+    def _resolve_seats_none(self, count: int) -> list[VenueSeat | None]:
+        """No seat assignment (GA/standing)."""
+        return [None] * count
+
+    def _resolve_seats_user_choice(
+        self, items: list[TicketPurchaseItem], tier: TicketTier, locked: dict[UUID, VenueSeat]
+    ) -> list[VenueSeat]:
+        """Validate this group's selected seats against the cart-wide locked seat map.
+
+        The lock itself already happened — PK-ordered, across every USER_CHOICE seat
+        in the whole cart — in ``resolve_cart_seats`` (the cross-group deadlock fix,
+        see the class docstring); this only validates THIS group's ids against that
+        shared, already-locked map.
+
+        Args:
+            items: This group's ticket purchase items with seat_id. The caller
+                (``resolve_cart_seats``) has already rejected a missing seat_id for
+                any USER_CHOICE group before building the shared lock, so ``None``
+                is not expected here in practice.
+            tier: This group's tier — the sector its seats must belong to.
+            locked: Every USER_CHOICE seat in the cart, keyed by id, already locked
+                by ``resolve_cart_seats``'s single cross-group query.
+
+        Returns:
+            List of VenueSeat objects in the same order as items.
+
+        Raises:
+            HttpError: If any seat is invalid, in the wrong sector, or unavailable.
+        """
+        seat_ids = [item.seat_id for item in items]
+
+        # Every requested id must be in the shared lock AND belong to this group's
+        # sector. Matched off the DISTINCT ids, so a duplicate id within one group
+        # still fails the count check below — exactly like the old id__in query,
+        # which returned one DB row per distinct id, not one per request.
+        distinct_ids = {sid for sid in seat_ids if sid is not None}
+        matched = {
+            sid: locked[sid] for sid in distinct_ids if sid in locked and locked[sid].sector_id == tier.sector_id
+        }
+
+        if len(matched) != len(seat_ids):
+            raise HttpError(
+                400,
+                str(_("One or more selected seats are invalid or not in the correct sector.")),
+            )
+
+        # Check none are already taken or under a box-office override (held/killed).
+        # Occupancy matches the unique_ticket_event_seat constraint predicate:
+        # any non-cancelled ticket (incl. CHECKED_IN) occupies the seat.
+        taken = (
+            Ticket.objects.filter(event=self.event, seat_id__in=seat_ids)
+            .exclude(status=Ticket.TicketStatus.CANCELLED)
+            .exists()
+        )
+        overridden = EventSeatOverride.objects.filter(event=self.event, seat_id__in=seat_ids).exists()
+
+        if taken or overridden:
+            raise HttpError(
+                400,
+                str(_("One or more selected seats are no longer available.")),
+            )
+
+        # Holds are advisory: reject seats live-held by ANOTHER identity, consume our own
+        try:
+            self._verify_and_consume_holds(list(matched.keys()))
+        except holds_service.SeatHoldConflictError:
+            raise HttpError(409, str(_("One or more selected seats are held by another buyer."))) from None
+
+        # Return seats in the same order as requested
+        return [matched[sid] for sid in seat_ids if sid is not None]
+
+    def _verify_and_consume_holds(self, seat_ids: list[UUID]) -> None:
+        """Reject seats live-held by another identity; delete the buyer's own holds.
+
+        Guest checkout runs as a guest RevelUser, but the browser held its seats
+        under the guest session — when one is present it IS the hold identity
+        (a RevelUser instance always reads as authenticated to owner_q).
+
+        Raises:
+            holds_service.SeatHoldConflictError: If a seat is live-held by another identity.
+        """
+        holds_service.verify_and_consume_holds(
+            self.event,
+            seat_ids,
+            user=None if self.guest_session else self.user,
+            guest_session=self.guest_session,
+        )
+
+    def _lock_and_verify_block(self, picked_ids: list[UUID]) -> list[VenueSeat]:
+        """Lock a picked seat block PK-ordered and re-verify it under the lock.
+
+        Must run inside a savepoint (nested ``transaction.atomic()``): raises
+        ``_SeatConflictError`` when a seat vanished/deactivated, got ticketed,
+        was box-office overridden, or is live-held by another identity — the
+        caller's savepoint rollback then releases this attempt's row locks.
+        On success the buyer's own holds on the block are consumed.
+
+        Args:
+            picked_ids: Seat ids to secure, in desired assignment order.
+
+        Returns:
+            The locked VenueSeat rows in ``picked_ids`` order.
+
+        Raises:
+            _SeatConflictError: If any seat can no longer be assigned.
+        """
+        # Locked in PK order per the global seat-lock protocol (holds/overrides).
+        # is_active is re-evaluated against the locked row version (EvalPlanQual),
+        # so a just-deactivated seat drops out here as a length mismatch.
+        seats = list(VenueSeat.objects.filter(id__in=picked_ids, is_active=True).order_by("pk").select_for_update())
+        if len(seats) != len(picked_ids):  # a picked seat vanished/deactivated — re-pick
+            raise _SeatConflictError
+        # Non-cancelled = occupied, matching unique_ticket_event_seat.
+        taken = (
+            Ticket.objects.filter(event=self.event, seat_id__in=picked_ids)
+            .exclude(status=Ticket.TicketStatus.CANCELLED)
+            .exists()
+        )
+        if taken:
+            raise _SeatConflictError
+        # Post-lock override re-check: the pick/hold read overrides unlocked, so a
+        # seat killed/held by box office in between must be caught here (mirrors
+        # _resolve_seats_user_choice).
+        if EventSeatOverride.objects.filter(event=self.event, seat_id__in=picked_ids).exists():
+            raise _SeatConflictError
+        try:
+            self._verify_and_consume_holds(picked_ids)
+        except holds_service.SeatHoldConflictError:
+            raise _SeatConflictError from None
+        id_order = {sid: i for i, sid in enumerate(picked_ids)}
+        return sorted(seats, key=lambda s: id_order[s.id])
+
+    def _try_consume_held_block(
+        self, count: int, zone_id: UUID | None, tier: TicketTier, cart_assigned: set[UUID]
+    ) -> list[VenueSeat] | None:
+        """Consume the buyer's own held seats directly instead of re-running the picker.
+
+        A buyer who pre-held a block (e.g. via POST /seating/holds/best-available)
+        must get EXACTLY the seats they were shown: re-running the picker could
+        settle on a different equally-scored block (seeded tiebreak), stranding
+        the original holds until TTL, and an accessible held block would be
+        skipped entirely when checkout doesn't set ``accessible_required``.
+
+        The buyer's ACTIVE holds on seats in this tier's sector (same identity rule
+        as ``_verify_and_consume_holds``) are taken in deterministic adjacency order —
+        (sector display_order, row_order, adjacency_index) — first ``count`` of them.
+        Contiguity is deliberately NOT enforced: the buyer explicitly holds these exact
+        seats (a best-available hold block is already adjacent) and gets exactly what
+        they held. Accessible held seats are likewise consumed without
+        ``accessible_required`` at checkout.
+
+        When the request selected a zone, the buyer's holds are FILTERED to it before
+        anything else: the hold endpoint only ever adds, so a buyer who browses zone A
+        and then switches to zone B still owns the zone-A holds until they expire, and
+        those must not speak for a checkout that explicitly named zone B. The "what you
+        saw held is what you buy" promise is preserved by the filter — only seats in the
+        requested zone can be consumed, and they are consumed exactly. Holds outside the
+        zone are simply invisible here (they expire on their own TTL).
+
+        With no matching block the request falls through to the picker, which is what a
+        buyer with no holds at all already gets. Deliberately NOT a refusal: the rule
+        "holds elsewhere block you" would be non-monotonic (holding one seat in the
+        requested zone would *fix* the error), and for guest checkout the refusal would
+        only surface at email-confirm time, on another device, with no hold-release UI.
+
+        Args:
+            count: Number of seats the cart needs.
+            zone_id: The resolved request zone, or None for the whole sector.
+            tier: The group's tier — the sector its held seat pool is drawn from.
+            cart_assigned: Seats already claimed by other groups of THIS cart —
+                never consumable here, whatever the buyer holds (see
+                ``_resolve_cart_seats``).
+
+        Returns:
+            The seats to assign, or None to fall through to the normal picker:
+            when the buyer holds fewer than ``count`` matching seats, or a held
+            seat conflicts post-lock (ticketed/overridden/deactivated/sniped) —
+            the savepoint rollback releases the locks and restores the holds.
+        """
+        if not tier.sector_id:
+            return None
+        owner_q = SeatHold.owner_q(None if self.guest_session else self.user, self.guest_session)
+        qs = SeatHold.objects.active().filter(owner_q, event=self.event, seat__sector_id=tier.sector_id)
+        if zone_id is not None:
+            qs = qs.filter(seat__default_price_category_id=zone_id)
+        held_ids = [
+            sid
+            for sid in qs.order_by(
+                "seat__sector__display_order", "seat__row_order", "seat__adjacency_index"
+            ).values_list("seat_id", flat=True)
+            if sid not in cart_assigned
+        ]
+        if len(held_ids) < count:
+            return None
+        try:
+            with transaction.atomic():  # savepoint: rollback releases locks + restores holds
+                return self._lock_and_verify_block(held_ids[:count])
+        except _SeatConflictError:
+            return None
+
+    def _resolve_seats_best_available(
+        self, count: int, zone_id: UUID | None, tier: TicketTier, accessible_required: bool, cart_assigned: set[UUID]
+    ) -> list[VenueSeat]:
+        """Adjacency-aware assignment: optimistic pick, then lock + verify the chosen seats only.
+
+        When the buyer already holds enough seats in the requested zone, the exact
+        held block is consumed instead of re-running the picker (see
+        ``_try_consume_held_block``); the picker below only runs when there is no
+        (sufficient, still-valid) own hold.
+
+        Retries with a fresh read when a picked seat got ticketed, overridden,
+        deactivated, or foreign-held between the unlocked pick and the lock.
+        Each attempt's lock + re-check runs inside its own savepoint (a nested
+        ``transaction.atomic()`` under the request transaction): a conflicted
+        attempt raises ``_SeatConflictError`` inside the block, and the savepoint
+        rollback releases that attempt's seat locks before the next attempt locks
+        a possibly different block. Without this, locks from a failed attempt
+        persist to end of transaction, breaking the global PK lock-ordering
+        protocol and deadlocking against concurrent purchases. A successful
+        attempt exits the block normally (savepoint released, not rolled back),
+        so the outer create_batch transaction keeps the locks and consumed holds.
+
+        Args:
+            count: Number of seats to assign.
+            zone_id: The resolved request zone, or None for the tier's whole sector.
+            tier: The group's tier — sector and candidate pool.
+            accessible_required: Whether the whole batch must draw from the
+                accessible seat pool (relaxed contiguity, #726).
+            cart_assigned: Seats already claimed by other groups of THIS cart.
+                Excluded from the candidate pool and from hold consumption: an
+                earlier group's seats are not yet sold or held, and this
+                transaction's own row locks don't conflict with themselves, so
+                without the exclusion two groups sharing a sector/zone would
+                deterministically pick the same block (same candidates, same
+                seeded tiebreak) and violate ``unique_ticket_event_seat`` at
+                ticket creation.
+
+        Returns:
+            List of assigned VenueSeat objects in picked (adjacent) order.
+
+        Raises:
+            HttpError: 409 when no adjacent block of `count` seats can be secured.
+        """
+        from events.service.seating.best_available import pick_best_available
+        from events.service.seating.pick import load_candidates
+
+        if (held := self._try_consume_held_block(count, zone_id, tier, cart_assigned)) is not None:
+            return held
+
+        for _attempt in range(3):
+            # Same identity rule as _verify_and_consume_holds: a guest session, when
+            # present, IS the hold identity — the buyer's own holds stay candidates.
+            candidates = load_candidates(
+                self.event,
+                tier,
+                exclude=cart_assigned,
+                zone_id=zone_id,
+                hold_owner_user=None if self.guest_session else self.user,
+                hold_owner_guest_session=self.guest_session,
+            )
+            picked_ids = pick_best_available(candidates, count, accessible_required=accessible_required)
+            if not picked_ids:
+                if accessible_required:
+                    raise HttpError(
+                        409, str(_("Not enough accessible seats available — please contact the organizer."))
+                    )
+                raise HttpError(409, str(_("Not enough adjacent seats available for this tier.")))
+            try:
+                with transaction.atomic():  # savepoint per attempt (see docstring)
+                    return self._lock_and_verify_block(picked_ids)
+            except _SeatConflictError:
+                continue
+        raise HttpError(409, str(_("Could not secure adjacent seats — please try again.")))
+
+    def resolve_cart_seats(self, groups: list[CartGroup]) -> list[list[VenueSeat | None]]:
+        """Resolve the cart's seats, mapping a Postgres deadlock to a retryable 409.
+
+        Thin wrapper over :meth:`_resolve_cart_seats` (which does the actual work and
+        documents it): a mixed UC+BA cart can still deadlock against a concurrent cart
+        (class docstring), and the losing transaction's SQLSTATE ``40P01`` must reach
+        the buyer as the documented retryable 409, not a 500. Any other
+        ``OperationalError`` propagates untouched.
+
+        Args:
+            groups: The cart's per-tier groups, in cart order.
+
+        Returns:
+            Per-group seat lists, positionally aligned with ``groups[i].items``.
+
+        Raises:
+            HttpError: 409 on deadlock; otherwise whatever ``_resolve_cart_seats`` raises.
+        """
+        try:
+            return self._resolve_cart_seats(groups)
+        except OperationalError as exc:
+            # psycopg3 exposes the SQLSTATE as ``sqlstate``; psycopg2 called it ``pgcode``.
+            cause = exc.__cause__
+            if _DEADLOCK_SQLSTATE not in {getattr(cause, "sqlstate", None), getattr(cause, "pgcode", None)}:
+                raise
+            raise HttpError(409, str(_("Could not secure adjacent seats — please try again."))) from exc
+
+    def _resolve_cart_seats(self, groups: list[CartGroup]) -> list[list[VenueSeat | None]]:
+        """Resolve every group's seats in one cross-group pass — the cart entry point.
+
+        USER_CHOICE seats across every group are locked PK-ordered in a SINGLE query
+        (see the class docstring for why: two tiers sharing a sector, locked
+        per-group instead, would lock-order-invert against a concurrent cart naming
+        the same two tiers in the opposite order). BEST_AVAILABLE groups resolve
+        sequentially through the existing pick/lock/retry machinery. NONE groups
+        need no locking at all.
+
+        Args:
+            groups: The cart's per-tier groups, in cart order.
+
+        Returns:
+            Per-group seat lists (or None entries for NONE-mode groups), positionally
+            aligned with ``groups[i].items``.
+
+        Raises:
+            HttpError: Seat resolution failure for any group — missing/invalid/taken
+                seats or a seat named by two groups of this cart (USER_CHOICE), or no
+                adjacent block available (BEST_AVAILABLE).
+            InvalidZoneSelectionError: 400 if a group's requested zone is unusable on
+                its tier — validated for EVERY group/mode, so a zone silently ignored
+                by a non-best-available tier is impossible.
+        """
+        zone_ids = [resolve_requested_zone(group.tier, group.price_category_id) for group in groups]
+
+        # Collect every USER_CHOICE seat id across ALL groups before locking anything,
+        # so the lock below is the cart's only FOR UPDATE query for these seats —
+        # the deadlock fix (class docstring). A group missing a seat_id is rejected
+        # here, before any lock is taken, same as the old single-group order.
+        uc_indices = [
+            i
+            for i, group in enumerate(groups)
+            if group.tier.seat_assignment_mode == TicketTier.SeatAssignmentMode.USER_CHOICE
+        ]
+        all_seat_ids: list[UUID] = []
+        for i in uc_indices:
+            seat_ids = [item.seat_id for item in groups[i].items]
+            if None in seat_ids:
+                raise HttpError(
+                    400,
+                    str(_("Seat selection is required for this ticket tier.")),
+                )
+            all_seat_ids.extend(sid for sid in seat_ids if sid is not None)
+        # Cart-wide, not per-group: the per-group count-match check only catches a seat
+        # named twice within ONE group. The same seat in two different groups passes both
+        # groups' validation (not sold, not held, lockable) and only explodes at ticket
+        # creation on unique_ticket_event_seat. validate_cart_shape already rejects this
+        # cart-wide on every current path; kept as defense-in-depth (same message) for
+        # any future caller that reaches seat resolution without the cart-shape gate.
+        if len(all_seat_ids) != len(set(all_seat_ids)):
+            raise HttpError(400, str(_("The same seat cannot be purchased twice.")))
+        uc_sector_ids = {groups[i].tier.sector_id for i in uc_indices if groups[i].tier.sector_id is not None}
+
+        # Single PK-ordered lock over every USER_CHOICE seat in the cart, matching
+        # the global seat-lock protocol (holds/overrides). Scoped to the UNION of
+        # this cart's USER_CHOICE sectors (not any one group's sector alone) — a
+        # client-supplied seat_id from an unrelated event/venue must never be
+        # select_for_update()-locked at all, only rejected; without this filter a
+        # foreign id widens the lock surface into a cross-event contention
+        # (griefing) vector. Per-group sector validation still happens below,
+        # against this shared map — a seat from ANOTHER group's sector in this
+        # same cart passes this filter (it's in the union) but is correctly
+        # rejected there. An empty id__in/sector_id__in is a no-op query (no
+        # USER_CHOICE groups).
+        locked = {
+            seat.id: seat
+            for seat in VenueSeat.objects.filter(id__in=all_seat_ids, sector_id__in=uc_sector_ids, is_active=True)
+            .order_by("pk")
+            .select_for_update()
+        }
+
+        # Seats already claimed by THIS cart: every USER_CHOICE seat up front (they are
+        # committed to their groups regardless of processing order — a BA group resolved
+        # earlier must not pick a seat a later UC group named), plus each BA group's
+        # assignment as it lands. Within one transaction those seats are not yet sold,
+        # not held, and our own row locks don't conflict, so this set is the only thing
+        # keeping groups that share a pool off each other's seats.
+        cart_assigned: set[UUID] = set(all_seat_ids)
+
+        results: list[list[VenueSeat | None]] = []
+        for i, group in enumerate(groups):
+            mode = group.tier.seat_assignment_mode
+
+            if mode == TicketTier.SeatAssignmentMode.NONE:
+                results.append(self._resolve_seats_none(len(group.items)))
+            elif mode == TicketTier.SeatAssignmentMode.BEST_AVAILABLE:
+                best: list[VenueSeat | None] = list(
+                    self._resolve_seats_best_available(
+                        len(group.items), zone_ids[i], group.tier, group.accessible_required, cart_assigned
+                    )
+                )
+                cart_assigned |= {seat.id for seat in best if seat is not None}
+                results.append(best)
+            elif mode == TicketTier.SeatAssignmentMode.USER_CHOICE:
+                # Cast to satisfy mypy - USER_CHOICE returns list[VenueSeat], which is a subtype
+                user_seats: list[VenueSeat | None] = list(
+                    self._resolve_seats_user_choice(group.items, group.tier, locked)
+                )
+                results.append(user_seats)
+            else:
+                raise HttpError(400, str(_("Unknown seat assignment mode.")))
+
+        return results

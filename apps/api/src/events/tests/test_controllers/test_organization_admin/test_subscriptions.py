@@ -1,0 +1,697 @@
+"""Tests for the staff subscription admin controller."""
+
+import datetime
+from decimal import Decimal
+from unittest import mock
+from uuid import uuid4
+
+import orjson
+import pytest
+from django.test.client import Client
+from django.urls import reverse
+from django.utils import timezone
+from freezegun import freeze_time
+
+from accounts.models import RevelUser
+from events.models import (
+    MembershipPayment,
+    MembershipSubscription,
+    MembershipSubscriptionPlan,
+    MembershipTier,
+    Organization,
+    OrganizationStaff,
+    PermissionMap,
+    PermissionsSchema,
+)
+from events.service.subscription import lifecycle as subscription_lifecycle
+from events.service.subscription import plans as subscription_plans
+
+pytestmark = pytest.mark.django_db
+
+
+# ---- Fixtures ----
+
+
+@pytest.fixture
+def tier(organization: Organization) -> MembershipTier:
+    return MembershipTier.objects.get(organization=organization, name="General membership")
+
+
+@pytest.fixture
+def plan(tier: MembershipTier) -> MembershipSubscriptionPlan:
+    return subscription_plans.create_plan(
+        tier, name="Monthly", price=Decimal("10.00"), currency="EUR", period_unit="month"
+    )
+
+
+@pytest.fixture
+def subscriber(django_user_model: type[RevelUser]) -> RevelUser:
+    return django_user_model.objects.create_user(
+        username="ctrl_subscriber", email="ctrl-sub@example.com", password="pass"
+    )
+
+
+def _set_staff_permission(staff_member: OrganizationStaff, *, manage_subscriptions: bool) -> None:
+    """Reset staff permission map with manage_subscriptions toggled explicitly."""
+    perm_map = PermissionMap(manage_subscriptions=manage_subscriptions)
+    staff_member.permissions = PermissionsSchema(default=perm_map).model_dump(mode="json")
+    staff_member.save(update_fields=["permissions"])
+
+
+# ---- Subscription endpoints ----
+
+
+class TestSubscriptionEndpoints:
+    def test_list_subscriptions(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        subscription_lifecycle.create_subscription(plan, subscriber)
+        url = reverse("api:list_subscriptions", kwargs={"slug": organization.slug})
+        response = organization_owner_client.get(url)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 1
+
+    def test_list_subscriptions_status_filter(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        # Two PAST_DUE subs and one ACTIVE sub across distinct users.
+        for i in range(2):
+            user = django_user_model.objects.create_user(
+                username=f"pastdue_{i}", email=f"pastdue-{i}@example.com", password="pass"
+            )
+            sub = subscription_lifecycle.create_subscription(plan, user)
+            sub.status = MembershipSubscription.SubscriptionStatus.PAST_DUE
+            sub.save(update_fields=["status"])
+        active_user = django_user_model.objects.create_user(
+            username="active_user", email="active@example.com", password="pass"
+        )
+        active_sub = subscription_lifecycle.create_subscription(plan, active_user)
+        active_sub.status = MembershipSubscription.SubscriptionStatus.ACTIVE
+        active_sub.save(update_fields=["status"])
+
+        url = reverse("api:list_subscriptions", kwargs={"slug": organization.slug})
+
+        filtered = organization_owner_client.get(url, {"status": "past_due"})
+        assert filtered.status_code == 200
+        filtered_data = filtered.json()
+        assert filtered_data["count"] == 2
+        assert all(item["status"] == "past_due" for item in filtered_data["results"])
+
+        # Pagination stays within the filtered set.
+        paged = organization_owner_client.get(url, {"status": "past_due", "page_size": "1"})
+        paged_data = paged.json()
+        assert paged_data["count"] == 2
+        assert len(paged_data["results"]) == 1
+
+    def test_list_subscriptions_no_status_returns_all(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        for i in range(2):
+            user = django_user_model.objects.create_user(
+                username=f"anysub_{i}", email=f"anysub-{i}@example.com", password="pass"
+            )
+            sub = subscription_lifecycle.create_subscription(plan, user)
+            sub.status = (
+                MembershipSubscription.SubscriptionStatus.PAST_DUE
+                if i == 0
+                else MembershipSubscription.SubscriptionStatus.ACTIVE
+            )
+            sub.save(update_fields=["status"])
+
+        url = reverse("api:list_subscriptions", kwargs={"slug": organization.slug})
+        response = organization_owner_client.get(url)
+        assert response.status_code == 200
+        assert response.json()["count"] == 2
+
+    def test_get_subscription(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        url = reverse("api:get_subscription", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_owner_client.get(url)
+        assert response.status_code == 200
+        assert response.json()["id"] == str(sub.id)
+
+    def test_expired_subscription_exposes_revival_deadline(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        """The staff SubscriptionSchema surfaces expired_at + computed revival_deadline (issue #778)."""
+        organization.membership_subscription_revival_window_days = 30
+        organization.save(update_fields=["membership_subscription_revival_window_days"])
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        sub.status = MembershipSubscription.SubscriptionStatus.EXPIRED
+        sub.expired_at = timezone.now() - datetime.timedelta(days=1)
+        sub.save(update_fields=["status", "expired_at"])
+
+        url = reverse("api:get_subscription", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_owner_client.get(url)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["expired_at"] is not None
+        assert data["revival_deadline"] is not None
+
+    def test_create_subscription_with_initial_payment(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        url = reverse("api:create_subscription", kwargs={"slug": organization.slug})
+        payload = {
+            "plan_id": str(plan.id),
+            "user_id": str(subscriber.id),
+            "initial_payment_amount": "10.00",
+            "initial_payment_currency": "EUR",
+            "initial_payment_notes": "manual cash",
+        }
+        response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+        assert response.status_code == 201
+        sub = MembershipSubscription.objects.get(user=subscriber)
+        assert sub.payments.count() == 1
+
+    def test_record_payment(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        url = reverse("api:record_subscription_payment", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        payload = {"amount": "10.00", "currency": "EUR"}
+        response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+        assert response.status_code == 201
+        sub.refresh_from_db()
+        assert sub.status == MembershipSubscription.SubscriptionStatus.ACTIVE
+
+    def test_record_payment_with_occurred_at_backfill(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        # Subscription must predate the backfilled payment, so create it 30 days ago.
+        with freeze_time(timezone.now() - datetime.timedelta(days=30)):
+            sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        backfill = (timezone.now() - datetime.timedelta(days=10)).isoformat()
+        url = reverse("api:record_subscription_payment", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        payload = {"amount": "10.00", "currency": "EUR", "occurred_at": backfill}
+        response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+        assert response.status_code == 201
+        body = response.json()
+        assert body["occurred_at"] is not None
+        assert body["occurred_at"].startswith(backfill[:19])
+
+    def test_record_payment_with_future_occurred_at_rejected(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        future = (timezone.now() + datetime.timedelta(days=1)).isoformat()
+        url = reverse("api:record_subscription_payment", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        payload = {"amount": "10.00", "currency": "EUR", "occurred_at": future}
+        response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+        assert response.status_code == 400
+
+    def test_cancel_pause_resume(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+
+        pause_url = reverse("api:pause_subscription", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        assert organization_owner_client.post(pause_url).status_code == 200
+        sub.refresh_from_db()
+        assert sub.status == MembershipSubscription.SubscriptionStatus.PAUSED
+
+        resume_url = reverse("api:resume_subscription", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        assert organization_owner_client.post(resume_url).status_code == 200
+        sub.refresh_from_db()
+        assert sub.status == MembershipSubscription.SubscriptionStatus.ACTIVE
+
+        cancel_url = reverse("api:cancel_subscription", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_owner_client.post(
+            cancel_url, data=orjson.dumps({"immediate": True}), content_type="application/json"
+        )
+        assert response.status_code == 200
+        sub.refresh_from_db()
+        assert sub.status == MembershipSubscription.SubscriptionStatus.CANCELLED
+
+    def test_cancel_at_period_end_schedules_cancellation(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        """The default (``immediate=False``) path flips ``cancel_at_period_end`` and leaves status alone."""
+        # The initial payment gives the row a period boundary to cancel at;
+        # without one the scheduled cancel is upgraded to an immediate one.
+        sub = subscription_lifecycle.create_subscription(
+            plan,
+            subscriber,
+            initial_payment=subscription_lifecycle.InitialPayment(
+                amount=plan.price, currency=plan.currency, recorded_by=organization.owner
+            ),
+        )
+        url = reverse("api:cancel_subscription", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_owner_client.post(
+            url, data=orjson.dumps({"immediate": False}), content_type="application/json"
+        )
+        assert response.status_code == 200
+        sub.refresh_from_db()
+        assert sub.cancel_at_period_end is True
+        assert sub.status != MembershipSubscription.SubscriptionStatus.CANCELLED
+
+    def test_create_subscription_with_amount_missing_currency_rejected(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        """The schema's ``@model_validator`` returns 422 when amount lacks currency."""
+        url = reverse("api:create_subscription", kwargs={"slug": organization.slug})
+        payload = {
+            "plan_id": str(plan.id),
+            "user_id": str(subscriber.id),
+            "initial_payment_amount": "10.00",
+        }
+        response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+        # Pydantic validation errors surface as 422.
+        assert response.status_code == 422
+
+    def test_refund_payment(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+        organization_owner_user: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(
+            plan,
+            subscriber,
+            initial_payment=subscription_lifecycle.InitialPayment(
+                amount=Decimal("10.00"), currency="EUR", recorded_by=organization_owner_user
+            ),
+        )
+        payment = sub.payments.first()
+        assert payment is not None
+        url = reverse(
+            "api:refund_subscription_payment",
+            kwargs={"slug": organization.slug, "payment_id": payment.id},
+        )
+        response = organization_owner_client.post(
+            url, data=orjson.dumps({"notes": "refund test"}), content_type="application/json"
+        )
+        assert response.status_code == 200
+        payment.refresh_from_db()
+        assert payment.status == MembershipPayment.PaymentStatus.REFUNDED
+
+    def test_member_cannot_create_subscription(
+        self,
+        member_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        url = reverse("api:create_subscription", kwargs={"slug": organization.slug})
+        payload = {"plan_id": str(plan.id), "user_id": str(subscriber.id)}
+        response = member_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+        assert response.status_code == 403
+
+
+class TestListSubscriptionPayments:
+    def test_owner_lists_payments_newest_first(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+        organization_owner_user: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        first = subscription_lifecycle.record_payment(
+            sub, amount=Decimal("10.00"), currency="EUR", recorded_by=organization_owner_user
+        )
+        second = subscription_lifecycle.record_payment(
+            sub, amount=Decimal("10.00"), currency="EUR", recorded_by=organization_owner_user
+        )
+
+        url = reverse("api:list_subscription_payments", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_owner_client.get(url)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 2
+        assert [item["id"] for item in data["results"]] == [str(second.id), str(first.id)]
+
+    def test_staff_with_permission_can_list_payments(
+        self,
+        organization_staff_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+        staff_member: OrganizationStaff,
+        organization_owner_user: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        subscription_lifecycle.record_payment(
+            sub, amount=Decimal("10.00"), currency="EUR", recorded_by=organization_owner_user
+        )
+        _set_staff_permission(staff_member, manage_subscriptions=True)
+
+        url = reverse("api:list_subscription_payments", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_staff_client.get(url)
+        assert response.status_code == 200
+        assert response.json()["count"] == 1
+
+    def test_staff_without_permission_blocked(
+        self,
+        organization_staff_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+        staff_member: OrganizationStaff,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        _set_staff_permission(staff_member, manage_subscriptions=False)
+        url = reverse("api:list_subscription_payments", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_staff_client.get(url)
+        assert response.status_code == 403
+
+    def test_member_cannot_list_payments(
+        self,
+        member_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        url = reverse("api:list_subscription_payments", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = member_client.get(url)
+        assert response.status_code == 403
+
+    def test_other_org_subscription_returns_404(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+    ) -> None:
+        other_owner = RevelUser.objects.create_user(
+            username="payments_other_owner", email="payments-other@example.com", password="pass"
+        )
+        other_org = Organization.objects.create(name="Other Payments Org", slug="other-payments", owner=other_owner)
+        other_tier = MembershipTier.objects.get(organization=other_org, name="General membership")
+        other_plan = subscription_plans.create_plan(
+            other_tier, name="Monthly", price=Decimal("5.00"), currency="EUR", period_unit="month"
+        )
+        other_subscriber = RevelUser.objects.create_user(
+            username="payments_other_sub", email="payments-other-sub@example.com", password="pass"
+        )
+        other_sub = subscription_lifecycle.create_subscription(other_plan, other_subscriber)
+
+        url = reverse("api:list_subscription_payments", kwargs={"slug": organization.slug, "sub_id": other_sub.id})
+        response = organization_owner_client.get(url)
+        assert response.status_code == 404
+
+    def test_pagination_respects_page_size(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+        organization_owner_user: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        for _ in range(3):
+            subscription_lifecycle.record_payment(
+                sub, amount=Decimal("1.00"), currency="EUR", recorded_by=organization_owner_user
+            )
+        url = reverse("api:list_subscription_payments", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_owner_client.get(url, {"page_size": 2})
+        assert response.status_code == 200
+        data = response.json()
+        assert data["count"] == 3
+        assert len(data["results"]) == 2
+
+
+class TestOnlinePlanGuards:
+    """Phase 2 — staff endpoints refuse ONLINE flows that must go through Stripe."""
+
+    @pytest.fixture
+    def online_plan(self, tier: MembershipTier, organization: Organization) -> MembershipSubscriptionPlan:
+        organization.stripe_account_id = "acct_test_org"
+        organization.stripe_charges_enabled = True
+        organization.stripe_details_submitted = True
+        organization.save(update_fields=["stripe_account_id", "stripe_charges_enabled", "stripe_details_submitted"])
+        return MembershipSubscriptionPlan.objects.create(
+            tier=tier,
+            name="Monthly Online",
+            price=Decimal("10.00"),
+            currency="EUR",
+            period_unit="month",
+            payment_method=MembershipSubscriptionPlan.PaymentMethod.ONLINE,
+            stripe_product_id="prod_test",
+            stripe_price_id="price_test",
+        )
+
+    def test_create_subscription_refuses_online_plan(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        online_plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        url = reverse("api:create_subscription", kwargs={"slug": organization.slug})
+        payload = {"plan_id": str(online_plan.id), "user_id": str(subscriber.id)}
+        response = organization_owner_client.post(url, data=orjson.dumps(payload), content_type="application/json")
+        assert response.status_code == 400
+
+    def test_record_payment_refuses_online_subscription(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        online_plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+    ) -> None:
+        sub = MembershipSubscription.objects.create(
+            user=subscriber,
+            plan=online_plan,
+            organization=organization,
+            status=MembershipSubscription.SubscriptionStatus.ACTIVE,
+            stripe_subscription_id="sub_stripe",
+        )
+        url = reverse("api:record_subscription_payment", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        response = organization_owner_client.post(
+            url,
+            data=orjson.dumps({"amount": "10.00", "currency": "EUR"}),
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+
+    @pytest.fixture
+    def online_subscription(
+        self,
+        online_plan: MembershipSubscriptionPlan,
+        organization: Organization,
+        subscriber: RevelUser,
+    ) -> MembershipSubscription:
+        return MembershipSubscription.objects.create(
+            user=subscriber,
+            plan=online_plan,
+            organization=organization,
+            status=MembershipSubscription.SubscriptionStatus.ACTIVE,
+            stripe_subscription_id="sub_stripe_admin",
+        )
+
+    def test_pause_online_routes_to_stripe(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        online_subscription: MembershipSubscription,
+    ) -> None:
+
+        with mock.patch("events.service.subscription.stripe.checkout.stripe.Subscription.modify") as mock_modify:
+            url = reverse(
+                "api:pause_subscription",
+                kwargs={"slug": organization.slug, "sub_id": online_subscription.id},
+            )
+            response = organization_owner_client.post(url)
+
+        assert response.status_code == 200, response.content
+        mock_modify.assert_called_once()
+        assert mock_modify.call_args.kwargs["pause_collection"] == {"behavior": "void"}
+        online_subscription.refresh_from_db()
+        assert online_subscription.status == MembershipSubscription.SubscriptionStatus.PAUSED
+
+    def test_resume_online_routes_to_stripe(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        online_subscription: MembershipSubscription,
+    ) -> None:
+
+        online_subscription.status = MembershipSubscription.SubscriptionStatus.PAUSED
+        online_subscription.save(update_fields=["status"])
+
+        with mock.patch("events.service.subscription.stripe.checkout.stripe.Subscription.modify") as mock_modify:
+            url = reverse(
+                "api:resume_subscription",
+                kwargs={"slug": organization.slug, "sub_id": online_subscription.id},
+            )
+            response = organization_owner_client.post(url)
+
+        assert response.status_code == 200, response.content
+        mock_modify.assert_called_once()
+        assert mock_modify.call_args.kwargs["pause_collection"] == ""
+        online_subscription.refresh_from_db()
+        assert online_subscription.status == MembershipSubscription.SubscriptionStatus.ACTIVE
+
+    def test_admin_surface_exposes_stripe_handles(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        online_subscription: MembershipSubscription,
+    ) -> None:
+        """Organizers get the Stripe ids + a Dashboard link (parity with the ticket admin)."""
+        payment = MembershipPayment.objects.create(
+            subscription=online_subscription,
+            amount=Decimal("10.00"),
+            currency="EUR",
+            status=MembershipPayment.PaymentStatus.SUCCEEDED,
+            period_start=timezone.now(),
+            period_end=timezone.now() + datetime.timedelta(days=30),
+            stripe_invoice_id="in_surface",
+            stripe_payment_intent_id="pi_surface",
+        )
+
+        sub_url = reverse(
+            "api:get_subscription",
+            kwargs={"slug": organization.slug, "sub_id": online_subscription.id},
+        )
+        sub_data = organization_owner_client.get(sub_url).json()
+        assert sub_data["stripe_subscription_id"] == "sub_stripe_admin"
+        assert sub_data["stripe_dashboard_url"].endswith("/subscriptions/sub_stripe_admin")
+        assert sub_data["plan"]["stripe_product_id"] == "prod_test"
+        assert sub_data["plan"]["stripe_price_id"] == "price_test"
+
+        payments_url = reverse(
+            "api:list_subscription_payments",
+            kwargs={"slug": organization.slug, "sub_id": online_subscription.id},
+        )
+        row = organization_owner_client.get(payments_url).json()["results"][0]
+        assert row["id"] == str(payment.id)
+        assert row["stripe_invoice_id"] == "in_surface"
+        assert row["stripe_payment_intent_id"] == "pi_surface"
+        assert row["stripe_dashboard_url"].endswith("/payments/pi_surface")
+
+    def test_offline_payment_has_no_dashboard_url(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        plan: MembershipSubscriptionPlan,
+        subscriber: RevelUser,
+        organization_owner_user: RevelUser,
+    ) -> None:
+        sub = subscription_lifecycle.create_subscription(plan, subscriber)
+        subscription_lifecycle.record_payment(
+            sub, amount=Decimal("10.00"), currency="EUR", recorded_by=organization_owner_user
+        )
+        url = reverse("api:list_subscription_payments", kwargs={"slug": organization.slug, "sub_id": sub.id})
+        row = organization_owner_client.get(url).json()["results"][0]
+        assert row["stripe_dashboard_url"] is None
+        assert row["stripe_invoice_id"] == ""
+        assert row["stripe_payment_intent_id"] == ""
+
+    def test_refund_payment_refuses_online_payment(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+        online_subscription: MembershipSubscription,
+    ) -> None:
+        """The record-only refund endpoint never moves money — ONLINE refunds go through Stripe."""
+        payment = MembershipPayment.objects.create(
+            subscription=online_subscription,
+            amount=Decimal("10.00"),
+            currency="EUR",
+            status=MembershipPayment.PaymentStatus.SUCCEEDED,
+            period_start=timezone.now(),
+            period_end=timezone.now() + datetime.timedelta(days=30),
+            stripe_invoice_id="in_guard",
+            stripe_payment_intent_id="pi_guard",
+        )
+        url = reverse(
+            "api:refund_subscription_payment",
+            kwargs={"slug": organization.slug, "payment_id": payment.id},
+        )
+        response = organization_owner_client.post(
+            url, data=orjson.dumps({"notes": "should be refused"}), content_type="application/json"
+        )
+        assert response.status_code == 400
+        payment.refresh_from_db()
+        assert payment.status == MembershipPayment.PaymentStatus.SUCCEEDED
+        online_subscription.refresh_from_db()
+        assert online_subscription.status == MembershipSubscription.SubscriptionStatus.ACTIVE
+
+
+class TestCrossOrgIsolation:
+    def test_cannot_act_on_other_org_plan(
+        self,
+        organization_owner_client: Client,
+        organization: Organization,
+    ) -> None:
+        other_owner = RevelUser.objects.create_user(username="cross_owner", email="cross@example.com", password="pass")
+        other_org = Organization.objects.create(name="Other Org", slug="other", owner=other_owner)
+        other_tier = MembershipTier.objects.get(organization=other_org, name="General membership")
+        other_plan = subscription_plans.create_plan(
+            other_tier, name="Monthly", price=Decimal("5.00"), currency="EUR", period_unit="month"
+        )
+
+        url = reverse(
+            "api:update_subscription_plan",
+            kwargs={"slug": organization.slug, "plan_id": other_plan.id},
+        )
+        response = organization_owner_client.patch(
+            url, data=orjson.dumps({"price": "1.00"}), content_type="application/json"
+        )
+        assert response.status_code == 404
+
+    def test_missing_plan_returns_404(self, organization_owner_client: Client, organization: Organization) -> None:
+        url = reverse(
+            "api:update_subscription_plan",
+            kwargs={"slug": organization.slug, "plan_id": uuid4()},
+        )
+        response = organization_owner_client.patch(
+            url, data=orjson.dumps({"price": "1.00"}), content_type="application/json"
+        )
+        assert response.status_code == 404

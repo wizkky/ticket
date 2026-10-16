@@ -1,0 +1,106 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import type { AdditionalResourceSchema } from '$lib/api/generated/types.gen';
+	import { FileText, Link as LinkIcon, AlignLeft, ExternalLink, Download } from '@lucide/svelte';
+	import { getBackendUrl } from '$lib/config/api';
+	import MarkdownContent from '$lib/components/common/MarkdownContent.svelte';
+	import SectionHeader from '$lib/components/common/SectionHeader.svelte';
+	import ToneTile from '$lib/components/common/ToneTile.svelte';
+
+	interface Props {
+		resources: AdditionalResourceSchema[];
+	}
+
+	const { resources = [] }: Props = $props();
+
+	function getIcon(type: string) {
+		switch (type) {
+			case 'file':
+				return FileText;
+			case 'link':
+				return LinkIcon;
+			case 'text':
+				return AlignLeft;
+			default:
+				return FileText;
+		}
+	}
+
+	function openResource(resource: AdditionalResourceSchema) {
+		if (resource.resource_type === 'file' && resource.file_url) {
+			// file_url may be a relative path from the backend, so we need to prepend the API base URL
+			window.open(getBackendUrl(resource.file_url), '_blank');
+		} else if (resource.resource_type === 'link' && resource.link) {
+			window.open(resource.link, '_blank');
+		}
+	}
+
+	// Only show the section if there are resources
+	const hasResources = $derived(resources.length > 0);
+</script>
+
+{#if hasResources}
+	<section class="rounded-lg border bg-card p-6" aria-labelledby="event-resources-heading">
+		<SectionHeader
+			volume="celebration"
+			id="event-resources-heading"
+			title={m['eventResources.title']()}
+			class="mb-4"
+		/>
+		<p class="mb-6 text-sm text-muted-foreground">{m['eventResources.description']()}</p>
+
+		<div class="space-y-3">
+			{#each resources as resource (resource.id)}
+				{@const IconComponent = getIcon(resource.resource_type)}
+				<article
+					class="flex items-start gap-4 rounded-md border p-4 transition-all hover:bg-accent/50"
+				>
+					<!-- Icon -->
+					<ToneTile tone="brand" icon={IconComponent} />
+
+					<!-- Content -->
+					<div class="min-w-0 flex-1">
+						<h3 class="font-bold leading-tight">
+							{resource.name || 'Untitled Resource'}
+						</h3>
+						{#if resource.description}
+							<MarkdownContent
+								content={resource.description}
+								inline
+								class="!prose-sm mt-1 line-clamp-2 text-muted-foreground [&>*]:m-0"
+							/>
+						{/if}
+
+						{#if resource.resource_type === 'text' && resource.text}
+							<div class="mt-2 rounded-md bg-muted/50 p-3 text-sm">
+								<p class="line-clamp-3 text-muted-foreground">
+									{resource.text}
+								</p>
+							</div>
+						{/if}
+					</div>
+
+					<!-- Action Button -->
+					{#if resource.resource_type !== 'text'}
+						<button
+							type="button"
+							onclick={() => openResource(resource)}
+							class="shrink-0 rounded-md bg-primary px-4 py-2 text-sm font-bold text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+							aria-label={resource.resource_type === 'file' ? 'Download file' : 'Open link'}
+						>
+							<span class="flex items-center gap-2">
+								{#if resource.resource_type === 'file'}
+									<Download class="h-4 w-4" aria-hidden="true" />
+									<span class="hidden sm:inline">{m['eventResources.download']()}</span>
+								{:else}
+									<ExternalLink class="h-4 w-4" aria-hidden="true" />
+									<span class="hidden sm:inline">{m['eventResources.open']()}</span>
+								{/if}
+							</span>
+						</button>
+					{/if}
+				</article>
+			{/each}
+		</div>
+	</section>
+{/if}

@@ -1,0 +1,45 @@
+{
+	"name": "CaudalTickets",
+	"short_name": "CaudalTickets",
+	"description": "Eventos, entradas y comunidad creativa.",
+	"start_url": "/",
+	"display": "standalone",
+	"background_color": "#1a0b2e",
+	"theme_color": "#8b5cf6",
+	"orientation": "portrait-primary",
+	"icons": [
+		{
+			"src": "/caudal-mark.svg",
+			"sizes": "64x64",
+			"type": "image/svg+xml",
+			"purpose": "any"
+		}
+	],
+	"categories": ["social", "lifestyle", "entertainment"],
+	"shortcuts": [
+		{
+			"name": "Browse Events",
+			"short_name": "Events",
+			"description": "Discover upcoming events",
+			"url": "/events",
+			"icons": [
+				{
+					"src": "/caudal-mark.svg",
+					"sizes": "64x64"
+				}
+			]
+		},
+		{
+			"name": "My Dashboard",
+			"short_name": "Dashboard",
+			"description": "View your events and organizations",
+			"url": "/dashboard",
+			"icons": [
+				{
+					"src": "/caudal-mark.svg",
+					"sizes": "64x64"
+				}
+			]
+		}
+	]
+}

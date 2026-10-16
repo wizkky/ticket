@@ -1,0 +1,177 @@
+// src/lib/seo/build.test.ts
+import { describe, it, expect } from 'vitest';
+import { buildSeo } from '$lib/seo/build';
+import type { EventDetailSchema } from '$lib/api/generated/types.gen';
+
+const url = (path: string) => new URL(`https://letsrevel.io${path}`);
+
+const fakeEvent = {
+	id: 'e1',
+	name: 'My Event',
+	slug: 'my-event',
+	description: 'desc',
+	start: '2026-07-01T18:00:00Z',
+	end: '2026-07-01T23:00:00Z',
+	status: 'scheduled',
+	requires_ticket: false,
+	max_attendees: 0,
+	attendee_count: 0,
+	rsvp_before: null,
+	address: null,
+	city: null,
+	logo: null,
+	cover_art: null,
+	event_series: null,
+	organization: { id: 'o1', name: 'Acme', slug: 'acme', logo: null, cover_art: null }
+} as unknown as EventDetailSchema;
+
+describe('buildSeo', () => {
+	it('home: emits WebSite + Org JSON-LD and no hreflang (single-URL page)', () => {
+		const cfg = buildSeo({ kind: 'home', url: url('/'), lang: 'en' });
+		expect(cfg.canonical).toBe('https://letsrevel.io/');
+		expect(cfg.og.locale).toBe('en_US');
+		expect(cfg.og.localeAlternate).toEqual(['de_DE', 'it_IT', 'fr_FR', 'es_ES', 'pt_PT']);
+		expect(cfg.hreflang).toEqual([]);
+		expect(cfg.jsonLd.some((j) => (j as Record<string, unknown>)['@type'] === 'WebSite')).toBe(
+			true
+		);
+		expect(cfg.robots).toBeUndefined();
+	});
+
+	it('home: uses the versioned og-image and og:logo, and keeps og:description within budget', () => {
+		const cfg = buildSeo({ kind: 'home', url: url('/'), lang: 'en' });
+		// Versioned URLs: the assets are immutable-cached and scrapers key
+		// their caches by URL, so the path must change with the artwork (#623).
+		expect(cfg.og.image).toBe('https://letsrevel.io/og-image-v3.png');
+		expect(cfg.og.logo).toBe('https://letsrevel.io/og-logo-v2.png');
+		// Social previews truncate og:description around ~125 chars (#624).
+		expect(cfg.og.description.length).toBeLessThanOrEqual(125);
+	});
+
+	// #994: only landing pages have per-locale URLs. Pages served at ONE URL (UI chrome
+	// localized by cookie, content untranslated) must not claim language alternates.
+	it.each([
+		['events-listing', { kind: 'events-listing', url: url('/events'), lang: 'de' }],
+		['orgs-listing', { kind: 'orgs-listing', url: url('/organizations'), lang: 'it' }],
+		['legal', { kind: 'legal', url: url('/legal/privacy'), lang: 'fr', doc: 'privacy' }],
+		[
+			'event',
+			{
+				kind: 'event',
+				url: url('/events/acme/my-event'),
+				lang: 'es',
+				event: fakeEvent,
+				indexable: true
+			}
+		]
+	] as const)('%s: emits no hreflang', (_kind, input) => {
+		expect(buildSeo(input).hreflang).toEqual([]);
+	});
+
+	it('event indexable: includes Event + Breadcrumb JSON-LD; no robots tag', () => {
+		const cfg = buildSeo({
+			kind: 'event',
+			url: url('/events/acme/my-event'),
+			lang: 'en',
+			event: fakeEvent,
+			indexable: true
+		});
+		expect(cfg.title).toContain('My Event');
+		expect(cfg.canonical).toBe('https://letsrevel.io/events/acme/my-event');
+		expect(cfg.robots).toBeUndefined();
+		const types = cfg.jsonLd.map((j) => (j as Record<string, unknown>)['@type']);
+		expect(types).toContain('Event');
+		expect(types).toContain('BreadcrumbList');
+		expect(cfg.og.logo).toBe('https://letsrevel.io/og-logo-v2.png');
+	});
+
+	it('event: strips markdown from the description (meta, og and twitter)', () => {
+		const cfg = buildSeo({
+			kind: 'event',
+			url: url('/events/acme/my-event'),
+			lang: 'en',
+			event: {
+				...fakeEvent,
+				description: '# Big Party\n## *A night to remember*\nCome join **all of us**!'
+			} as typeof fakeEvent,
+			indexable: true
+		});
+		const clean = 'Big Party A night to remember Come join all of us!';
+		expect(cfg.description).toBe(clean);
+		expect(cfg.og.description).toBe(clean);
+		expect(cfg.twitter.description).toBe(clean);
+	});
+
+	it('event non-indexable: emits noindex,follow', () => {
+		const cfg = buildSeo({
+			kind: 'event',
+			url: url('/events/acme/my-event'),
+			lang: 'en',
+			event: fakeEvent,
+			indexable: false
+		});
+		expect(cfg.robots).toBe('noindex,follow');
+	});
+
+	it('landing: hreflang uses per-locale URLs, not same-URL', () => {
+		const cfg = buildSeo({
+			kind: 'landing',
+			url: url('/de/eventbrite-alternative'),
+			lang: 'de',
+			slug: 'eventbrite-alternative'
+		});
+		const map = Object.fromEntries(cfg.hreflang.map((h) => [h.lang, h.href]));
+		expect(map.en).toBe('https://letsrevel.io/eventbrite-alternative');
+		expect(map.de).toBe('https://letsrevel.io/de/eventbrite-alternative');
+		expect(map.it).toBe('https://letsrevel.io/it/eventbrite-alternative');
+		expect(map['x-default']).toBe('https://letsrevel.io/eventbrite-alternative');
+	});
+
+	it('auth pages emit noindex,follow', () => {
+		const cfg = buildSeo({
+			kind: 'auth',
+			url: url('/login'),
+			lang: 'en',
+			page: 'login'
+		});
+		expect(cfg.robots).toBe('noindex,follow');
+	});
+
+	it('referral-apply: emits noindex,follow, a matching canonical, a summary card, the default OG image and no JSON-LD', () => {
+		const cfg = buildSeo({
+			kind: 'referral-apply',
+			url: url('/referral/apply'),
+			lang: 'en'
+		});
+		expect(cfg.robots).toBe('noindex,follow');
+		expect(cfg.canonical).toBe('https://letsrevel.io/referral/apply');
+		expect(cfg.og.url).toBe(cfg.canonical);
+		expect(cfg.twitter.card).toBe('summary');
+		expect(cfg.og.image).toBe('https://letsrevel.io/og-image-v3.png');
+		expect(cfg.jsonLd).toEqual([]);
+	});
+
+	// Regression guard: `legal` and `auth`/`referral-apply` share the same
+	// `plainPageSeo` helper but must diverge on `robots` — `legal` pages are
+	// indexable and must carry NO `robots` key at all (not merely `undefined`),
+	// while `auth` and `referral-apply` are noindex,follow. The extraction that
+	// pulled `plainPageSeo` out of `build.ts` could easily have collapsed this
+	// distinction.
+	it('legal pages carry no robots key at all, unlike auth and referral-apply', () => {
+		const legalCfg = buildSeo({ kind: 'legal', url: url('/privacy'), lang: 'en', doc: 'privacy' });
+		expect('robots' in legalCfg).toBe(false);
+
+		const termsCfg = buildSeo({ kind: 'legal', url: url('/terms'), lang: 'en', doc: 'terms' });
+		expect('robots' in termsCfg).toBe(false);
+
+		const authCfg = buildSeo({ kind: 'auth', url: url('/login'), lang: 'en', page: 'login' });
+		expect(authCfg.robots).toBe('noindex,follow');
+
+		const referralCfg = buildSeo({
+			kind: 'referral-apply',
+			url: url('/referral/apply'),
+			lang: 'en'
+		});
+		expect(referralCfg.robots).toBe('noindex,follow');
+	});
+});

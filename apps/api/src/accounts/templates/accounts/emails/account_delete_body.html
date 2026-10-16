@@ -1,0 +1,14 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<h2>{% trans "Confirm Account Deletion" %}</h2>
+<p>{% blocktrans %}You have received this email because you have requested to delete your account at
+    <a href="{{ frontend_base_url }}">Revel</a>.{% endblocktrans %}
+</p>
+<p>{% blocktrans %}If you did not request this, please ignore this email.{% endblocktrans %}</p>
+<p>{% blocktrans %}To confirm the deletion of your account, click the link below:{% endblocktrans %}</p>
+<div class="card card--danger">
+  <a href="{{ action_link }}" class="button button--danger">{% trans "Confirm Account Deletion" %}</a>
+</div>
+<p>{% blocktrans %}Thank you,<br>The Revel Team{% endblocktrans %}</p>
+{% endblock %}

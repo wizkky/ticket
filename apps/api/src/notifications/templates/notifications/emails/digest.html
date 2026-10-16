@@ -1,0 +1,41 @@
+{% extends "emails/base.html" %}
+{% load i18n markdown_tags %}
+{% block extra_styles %}
+.group { margin: 0 0 28px; }
+.group-label { font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; color: #8C3CDD; font-weight: 700; margin: 0 0 12px; padding-bottom: 6px; border-bottom: 2px solid #eee; }
+.item { background: #f6f2fb; border-left: 4px solid #8C3CDD; padding: 14px 16px; margin: 0 0 12px; border-radius: 4px; }
+.item-title { font-weight: 600; font-size: 16px; margin: 0 0 4px; }
+.item-body { color: #444; font-size: 14px; margin: 0 0 8px; }
+.item-body p { margin: 0 0 6px; }
+.item-meta { font-size: 12px; color: #999; }
+.item-link { display: inline-block; margin-top: 6px; font-size: 13px; color: #8C3CDD; text-decoration: none; font-weight: 600; }
+.footer-cta { text-align: center; margin: 24px 0 8px; }
+{% endblock %}
+{% block content %}
+<p>{% trans "Hi" %} {{ user.get_display_name }},</p>
+<p>{% trans "Here's what you missed since your last digest:" %}</p>
+<p>{% blocktranslate count counter=total_count %}{{ counter }} new notification{% plural %}{{ counter }} new notifications{% endblocktranslate %}</p>
+
+{% for group in notification_groups %}
+<div class="group">
+    <div class="group-label">{{ group.label }}</div>
+    {% for item in group.notifications %}
+    <div class="item">
+        <div class="item-title">{{ item.title }}</div>
+        {% if item.body %}<div class="item-body">{{ item.body|markdown }}</div>{% endif %}
+        <div class="item-meta">{{ item.created_at|date:"M j, Y · g:i A" }}</div>
+        {% if item.url %}<a class="item-link" href="{{ item.url }}">{% trans "View details →" %}</a>{% endif %}
+    </div>
+    {% endfor %}
+</div>
+{% endfor %}
+
+<div class="footer-cta">
+    <a href="{{ frontend_url }}/notifications" class="button">{% trans "View all notifications" %}</a>
+</div>
+
+<p>
+    {% trans "Best regards," %}<br>
+    {% trans "The Revel Team" %}
+</p>
+{% endblock %}

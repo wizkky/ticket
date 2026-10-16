@@ -1,0 +1,184 @@
+import enum
+import typing as t
+
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.utils.translation import gettext_lazy as _
+
+if t.TYPE_CHECKING:
+    from django_stubs_ext import StrPromise
+
+
+class InvalidResourceStateError(DjangoValidationError):
+    """Raised when an EventResource has an invalid combination of fields for its type."""
+
+
+class AlreadyMemberError(Exception):
+    """Raised when a user is already a member of an organization."""
+
+
+class PendingMembershipRequestExistsError(Exception):
+    """Raised when a pending membership request already exists for a user and organization."""
+
+
+class TooManyItemsError(Exception):
+    """Raised when too many PotluckItems are created."""
+
+
+class OrganizationTokenStaffGrantForbidden(Exception):
+    """Raised when a non-owner attempts to manage a staff-granting organization token."""
+
+
+class OrganizationTokenGrantInvariantError(Exception):
+    """Raised when an organization-token update would leave both grants disabled."""
+
+
+class OrganizationTokenMembershipTierRequiredError(Exception):
+    """Raised when an organization-token update would leave ``grants_membership=True`` with no ``membership_tier``."""
+
+
+class RevenueReportCadenceOwnerOnlyError(Exception):
+    """Raised when a non-owner attempts to change an organization's ``revenue_report_cadence``."""
+
+
+class MembershipPolicyManageSubscriptionsOnlyError(Exception):
+    """Raised when a staffer lacking ``manage_subscriptions`` attempts to change membership subscription policy."""
+
+
+class TicketAlreadyCancelledError(Exception):
+    """Raised when attempting to cancel/refund a ticket that is already in CANCELLED state."""
+
+
+class StripeNotConnectedError(Exception):
+    """Raised when an online-payment tier cannot be created/updated because the org has no Stripe Connect."""
+
+
+class BillingInfoRequiredError(Exception):
+    """Raised when an online-payment tier with platform fees lacks the organization's billing info."""
+
+
+class InvalidStripeWebhookSignatureError(Exception):
+    """Raised when no configured webhook secret verifies the Stripe-Signature header."""
+
+
+class SessionTotalMismatchError(Exception):
+    """Raised when a Stripe checkout session's total disagrees with ``sum(Payment.amount)``.
+
+    A money invariant, not a warning: since a batch's Payment rows can carry
+    different amounts (#739), "what Stripe charges" and "what our books record" are
+    two independently-computed numbers. If they diverge, the books permanently
+    disagree with the charge and the platform fee lands on the wrong total, so both
+    the session-creation and the webhook-confirm path refuse to proceed.
+    """
+
+
+class DuplicateDiscountCodeError(Exception):
+    """Raised when creating a discount code whose ``(organization, code)`` pair already exists."""
+
+
+class InvalidPeriodError(Exception):
+    """Raised when month and quarter period filters are combined."""
+
+
+class SeriesPassCoverageError(Exception):
+    """Raised when a series/event cannot carry a series pass (enable-time gate)."""
+
+
+class SeriesPassNotPurchasableError(Exception):
+    """Raised when a series pass cannot be purchased right now."""
+
+
+class InvalidZoneSelectionError(Exception):
+    """Raised when the requested best-available zone (price category) is not selectable on this tier.
+
+    Carries a buyer-facing message naming the tier's sellable zones — see
+    :func:`events.service.seating.pick.resolve_requested_zone`, the single
+    authority for the rule.
+    """
+
+
+class SeriesPassHasHoldersError(Exception):
+    """Raised when deleting a SeriesPass or removing tier-link coverage would strand non-cancelled holders."""
+
+
+class MembershipTierInUseError(Exception):
+    """Raised when deleting a MembershipTier would drop protected membership applications or subscriptions."""
+
+
+class SubscriptionActivationPendingError(Exception):
+    """Raised when a subscribe attempt hits a PENDING row whose Checkout Session was already paid.
+
+    Distinct from a plain duplicate-subscription refusal: the money is already
+    taken and only the activation webhooks are outstanding, so the frontend
+    must show a "confirming your subscription" state rather than an error. The
+    handler renders a machine-readable ``code`` for exactly that reason — see
+    :class:`events.schema.SubscriptionActivationPendingSchema`.
+    """
+
+
+class StripeRefundFailed(Exception):
+    """Raised when a Stripe refund attempt fails after all internal retries.
+
+    Attributes:
+        detail: Human-readable description of the Stripe error.
+    """
+
+    def __init__(self, detail: str) -> None:
+        """Initialize with the Stripe error detail string."""
+        super().__init__(detail)
+        self.detail = detail
+
+
+class RefundInsufficientBalanceError(Exception):
+    """Raised when Stripe declines a refund because the connected account balance is too low."""
+
+
+class NothingToRefundError(Exception):
+    """Raised when a refund is requested on a payment with no refundable amount remaining."""
+
+
+class EventRefundsStartedError(Exception):
+    """Raised on an un-cancel attempt after the bulk refund sweep already started."""
+
+
+class CountryComplianceError(Exception):
+    """Raised when an action is not available in the organizer's country (EU layer 1, #1057-#1067).
+
+    Carries a translated, user-facing message — see :mod:`events.compliance`.
+    """
+
+
+class GuestActionErrorCode(str, enum.Enum):
+    """Stable discriminators for guest RSVP/checkout refusals (#905).
+
+    The frontend branches on these to render a CTA ("Log in", "split your
+    purchase") instead of echoing the translated ``detail``. Renaming a value is a
+    breaking change; rewording the message is always safe.
+    """
+
+    ACCOUNT_EXISTS = "guest_account_exists"
+    CART_TOO_LARGE = "guest_cart_too_large"
+
+
+class GuestActionError(Exception):
+    """Base for guest RSVP/checkout refusals rendered with a machine-readable ``code`` (#905).
+
+    Subclasses are bare-raised; the handler renders ``message`` (lazy, so it is
+    translated in the request's language) alongside ``code``.
+    """
+
+    code: t.ClassVar[GuestActionErrorCode]
+    message: t.ClassVar["StrPromise"]
+
+
+class GuestAccountExistsError(GuestActionError):
+    """Raised when a guest action names an email that belongs to a non-guest account."""
+
+    code = GuestActionErrorCode.ACCOUNT_EXISTS
+    message = _("An account with this email already exists. Please log in.")
+
+
+class GuestCartTooLargeError(GuestActionError):
+    """Raised when a cart's guest-confirmation JWT would blow past the emailed-link URL budget."""
+
+    code = GuestActionErrorCode.CART_TOO_LARGE
+    message = _("Your cart is too large for guest checkout. Please log in or split your purchase.")

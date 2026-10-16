@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Ticket - {{ event_name }}</title>
+    {% include "events/_pass_base_styles.html" %}
+    <style>
+        .banner-overlay .org { margin: 1.5mm 0 0; font-size: 10pt; opacity: 0.92; }
+
+        /* Pending-payment marker: unmistakable, brand crimson.
+           Deepened AA variant behind white copy (--poster-crimson-deep, see the
+           docs/brand-style-guide.md accessibility floor): raw #E6332A vs white is 4.3:1. */
+        .pending-banner {
+            background: #E4251B; color: #FFFFFF; text-align: center;
+            font-size: 8.5pt; font-weight: 600; letter-spacing: 1.6px;
+            text-transform: uppercase; padding: 2.2mm 0;
+        }
+
+        /* Body: main info + tear-off stub */
+        .body { flex: 1; display: flex; }
+        .main { flex: 1; padding: 8mm 8mm 6mm 9mm; }
+
+        .eyebrow {
+            font-size: 6.5pt; font-weight: 600; letter-spacing: 1.6px;
+            text-transform: uppercase; color: #8C3CDD; margin: 0 0 1.2mm;
+        }
+        .tier-name { font-size: 15pt; font-weight: 600; margin: 0 0 6mm; }
+
+        table.info { border-collapse: collapse; width: 100%; }
+        table.info td { padding: 1.8mm 0; vertical-align: top; font-size: 10pt; line-height: 1.45; }
+        table.info td.label {
+            width: 32mm; font-size: 8pt; font-weight: 600; color: #46405E;
+            text-transform: uppercase; letter-spacing: 0.8px; padding-right: 4mm; padding-top: 2.3mm;
+        }
+        table.info tr + tr td { border-top: 1px solid #EDE7F6; }
+
+        /* Perforation */
+        .perf { width: 0; border-left: 1.6px dashed #C9BCE0; }
+
+        /* Stub */
+        .stub {
+            width: 58mm; background: #F8F5FC;
+            padding: 8mm 6mm 6mm; box-sizing: content-box;
+            display: flex; flex-direction: column; align-items: center; text-align: center;
+        }
+        .stub .eyebrow { color: #E6332A; }
+        .qr-sticker { padding: 4mm; margin: 3mm 0 4mm; }
+        .qr-sticker img { display: block; width: 36mm; height: 36mm; }
+        .seat-big { font-size: 17pt; font-weight: 600; margin: 0; }
+        .seat-sub { font-size: 9pt; color: #46405E; margin: 1.2mm 0 0; }
+        .stub .instruction { font-size: 7.5pt; color: #46405E; margin-top: 4mm; line-height: 1.5; }
+        .stub .tid { font-family: monospace; font-size: 7pt; color: #8C3CDD; margin-top: 6mm; }
+    </style>
+</head>
+<body>
+<div class="page">
+    <div class="card">
+        <div class="banner">
+            {% if cover_art_url %}<img class="cover" src="{{ cover_art_url }}" alt="">{% endif %}
+            <div class="banner-overlay">
+                <h1>{{ event_name }}</h1>
+                <p class="org">{{ organization_name }}</p>
+            </div>
+        </div>
+
+        {% if is_pending %}<div class="pending-banner">Pending &mdash; Payment not confirmed</div>{% endif %}
+
+        <div class="body">
+            <div class="main">
+                <p class="eyebrow">Ticket</p>
+                <p class="tier-name">{{ tier_name }}</p>
+
+                <table class="info">
+                    {% if guest_name %}
+                    <tr><td class="label">Guest</td><td>{{ guest_name }}</td></tr>
+                    {% endif %}
+                    {% if guest_name != user_display_name %}
+                    <tr><td class="label">Purchased by</td><td>{{ user_display_name }}</td></tr>
+                    {% endif %}
+                    <tr><td class="label">Date &amp; time</td><td>{{ start_datetime }}</td></tr>
+                    {% if address %}
+                    <tr><td class="label">Location</td><td>{{ address }}</td></tr>
+                    {% endif %}
+                    {% if venue_name %}
+                    <tr><td class="label">Venue</td><td>{{ venue_name }}{% if sector_name %} &middot; {{ sector_name }}{% endif %}</td></tr>
+                    {% endif %}
+                    {% for field in compliance_fields %}
+                    <tr><td class="label">{{ field.label }}</td><td>{{ field.value }}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+
+            <div class="perf"></div>
+
+            <div class="stub">
+                <p class="eyebrow">Admit one</p>
+                <div class="qr-sticker">
+                    <img src="data:image/png;base64,{{ qr_code_base64 }}" alt="Ticket QR Code">
+                </div>
+                {% if seat_label %}
+                <p class="seat-big">Seat {{ seat_label }}</p>
+                <p class="seat-sub">{% if seat_row %}Row {{ seat_row }}{% endif %}{% if seat_row and sector_name %} &middot; {% endif %}{{ sector_name|default:"" }}</p>
+                {% elif sector_name %}
+                <p class="seat-big">{{ sector_name }}</p>
+                {% else %}
+                <p class="seat-big">{{ tier_name }}</p>
+                {% endif %}
+                <p class="instruction">Present this QR code at the event entrance.</p>
+                <p class="tid">{{ ticket_id_short }}</p>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p class="legal">Valid for one person only &middot; {{ ticket_id }}</p>
+            <div class="powered">
+                <img src="file://{{ brand_mark }}" alt="">
+                <span class="by">Powered by</span>
+                <span class="wordmark"><span style="color:#8C3CDD">r</span><span style="color:#A33AB0">e</span><span style="color:#B93884">v</span><span style="color:#D03557">e</span><span style="color:#E6332A">l</span><span class="dot">.</span></span>
+            </div>
+        </div>
+    </div>
+</div>
+</body>
+</html>

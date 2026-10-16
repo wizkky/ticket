@@ -1,0 +1,55 @@
+{% extends "emails/base.html" %}
+{% load i18n markdown_tags %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+
+    {% if context.ticket_status == "pending" %}
+        <p style="font-size: 18px;">{% blocktranslate with event=context.event_name %}Your ticket for <strong>{{ event }}</strong> is pending payment confirmation.{% endblocktranslate %}</p>
+
+        <div class="card">
+            <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+            <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+            {% if context.event_location %}<div class="info-row">📍 {% if context.address_url %}<a href="{{ context.address_url }}">{{ context.event_location }}</a>{% else %}{{ context.event_location }}{% endif %}</div>{% endif %}
+        </div>
+
+        <div class="card">
+            <h3 style="margin-top: 0;">{% trans "Ticket Information" %}</h3>
+            <div class="info-row"><span class="label">{% trans "Tier:" %}</span> {{ context.tier_name }}</div>
+            <div class="info-row"><span class="label">{% trans "Status:" %}</span> {% trans "Pending" %}</div>
+            <div class="info-row"><span class="label">{% trans "Ticket ID:" %}</span> <code>{{ context.ticket_id }}</code></div>
+        </div>
+
+        <div class="card card--warning">
+            <h3 style="margin-top: 0;">{% trans "Payment Instructions" %}</h3>
+            {% if context.manual_payment_instructions %}
+                <div style="border-left: 3px solid #ddd; padding-left: 15px; margin: 10px 0; color: #666;">{{ context.manual_payment_instructions|strip_leading_heading|markdown }}</div>
+            {% else %}
+                <p>{% trans "Please contact the organizer to complete the payment." %}</p>
+            {% endif %}
+        </div>
+
+        <p>{% trans "Your ticket will arrive by email as soon as your payment is confirmed." %}</p>
+    {% else %}
+        <p style="font-size: 18px;">{% blocktranslate with event=context.event_name %}Your ticket for <strong>{{ event }}</strong> is confirmed! 🎉{% endblocktranslate %}</p>
+
+        <div class="card">
+            <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+            <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+            {% if context.event_location %}<div class="info-row">📍 {% if context.address_url %}<a href="{{ context.address_url }}">{{ context.event_location }}</a>{% else %}{{ context.event_location }}{% endif %}</div>{% endif %}
+        </div>
+
+        <div class="card">
+            <h3 style="margin-top: 0;">{% trans "Ticket Information" %}</h3>
+            <div class="info-row"><span class="label">{% trans "Tier:" %}</span> {{ context.tier_name }}</div>
+            <div class="info-row"><span class="label">{% trans "Status:" %}</span> {% trans "Active" %}</div>
+            <div class="info-row"><span class="label">{% trans "Ticket ID:" %}</span> <code>{{ context.ticket_id }}</code></div>
+        </div>
+
+        {% include "notifications/email/_wallet_badges.html" %}
+    {% endif %}
+    {% include "notifications/email/_tax_notice.html" %}
+
+<center>
+    <a href="{{ context.event_url }}" class="button">{% trans "View Event Details" %}</a>
+</center>
+{% endblock %}

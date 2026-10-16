@@ -1,0 +1,309 @@
+"""Signal handlers for payment and refund notifications."""
+
+import typing as t
+from decimal import Decimal
+from urllib.parse import quote
+
+import structlog
+from django.db import transaction
+from django.db.models.signals import post_save, pre_save
+from django.dispatch import receiver
+
+from common.models import SiteSettings
+from events.models import Event, Payment, Ticket
+from notifications.context_schemas import EventRefundSummaryContext, RefundUnmatchedCandidate
+from notifications.enums import NotificationType
+from notifications.service.notification_helpers import format_event_datetime, notify_org_staff
+from notifications.signals import notification_requested
+
+logger = structlog.get_logger(__name__)
+
+
+@receiver(pre_save, sender=Payment)
+def capture_payment_old_status(sender: type[Payment], instance: Payment, **kwargs: t.Any) -> None:
+    """Capture the old status value before save for change detection."""
+    if instance.pk:
+        try:
+            old_instance = Payment.objects.get(pk=instance.pk)
+            if old_instance.status != instance.status:
+                instance._old_status = old_instance.status  # type: ignore[attr-defined]
+        except Payment.DoesNotExist:
+            logger.debug("payment_not_found_for_old_status", pk=instance.pk)
+
+
+@receiver(post_save, sender=Payment)
+def handle_payment_status_change(sender: type[Payment], instance: Payment, created: bool, **kwargs: t.Any) -> None:
+    """Handle payment status changes and send appropriate notifications.
+
+    - SUCCEEDED: Send PAYMENT_CONFIRMATION to ticket holder
+    - REFUNDED: Send TICKET_REFUNDED to ticket holder and STAFF_TICKET_REFUNDED to staff/owners
+    """
+    # Skip if no status change
+    if not hasattr(instance, "_old_status"):
+        return
+
+    old_status = instance._old_status
+
+    # Skip if status didn't actually change
+    if old_status == instance.status:
+        return
+
+    def send_notifications() -> None:
+        """Send notifications after transaction commits."""
+        if instance.status == Payment.PaymentStatus.SUCCEEDED:
+            _send_payment_confirmation(instance)
+        elif instance.status == Payment.PaymentStatus.REFUNDED:
+            _send_refund_notifications(instance)
+
+    transaction.on_commit(send_notifications)
+
+
+def _send_payment_confirmation(payment: Payment) -> None:
+    """Send payment confirmation notification to ticket holder.
+
+    Args:
+        payment: The successful payment instance
+    """
+    ticket = payment.ticket
+    if ticket.held_pass_id is not None:
+        return  # Series pass tickets get one pass-level notification (see notifications/signals/series_pass.py)
+
+    event = ticket.event
+
+    # Build frontend URL
+    frontend_base_url = SiteSettings.get_solo().frontend_base_url
+    frontend_url = f"{frontend_base_url}/events/{event.id}"
+
+    # Format event details in event's timezone
+    event_start_formatted = format_event_datetime(event.start, event)
+    event_location = event.full_address()
+
+    # Format payment date in event's timezone
+    payment_date = format_event_datetime(payment.created_at, event)
+
+    notification_requested.send(
+        sender=_send_payment_confirmation,
+        user=payment.user,
+        notification_type=NotificationType.PAYMENT_CONFIRMATION,
+        context={
+            "ticket_id": str(ticket.id),
+            "ticket_reference": str(ticket.id),
+            "event_id": str(event.id),
+            "event_name": event.name,
+            "event_start": event.start.isoformat() if event.start else "",
+            "event_start_formatted": event_start_formatted,
+            "event_location": event_location,
+            "event_url": frontend_url,
+            "tier_name": ticket.tier.name,
+            "payment_amount": str(payment.amount),
+            "payment_currency": payment.currency,
+            "payment_id": str(payment.id),
+            "payment_date": payment_date,
+            "payment_method": "card",  # Stripe payments are card-based
+        },
+    )
+
+    logger.info(
+        "payment_confirmation_sent",
+        payment_id=str(payment.id),
+        ticket_id=str(ticket.id),
+        user_id=str(payment.user_id),
+    )
+
+
+def _send_refund_notifications(payment: Payment) -> None:
+    """Send refund notifications to ticket holder and staff/owners.
+
+    Args:
+        payment: The refunded payment instance
+    """
+    ticket = payment.ticket
+    if ticket.held_pass_id is not None:
+        return  # Series pass tickets get one pass-level notification (see notifications/signals/series_pass.py)
+
+    event = ticket.event
+
+    actual_amount = payment.refund_amount if payment.refund_amount is not None else payment.amount
+    refund_amount = f"{actual_amount} {payment.currency}"
+
+    context = {
+        "ticket_id": str(ticket.id),
+        "ticket_reference": str(ticket.id),
+        "event_id": str(event.id),
+        "event_name": event.name,
+        "refund_amount": refund_amount,
+    }
+
+    # Notify ticket holder
+    notification_requested.send(
+        sender=_send_refund_notifications,
+        user=payment.user,
+        notification_type=NotificationType.TICKET_REFUNDED,
+        context=context,
+    )
+
+    # Notify staff/owners with additional context
+    staff_context = {
+        **context,
+        "ticket_holder_name": payment.user.get_display_name(),
+        "ticket_holder_email": payment.user.email,
+    }
+
+    notify_org_staff(
+        organization_id=event.organization_id,
+        notification_type=NotificationType.STAFF_TICKET_REFUNDED,
+        context=staff_context,
+        sender=_send_refund_notifications,
+    )
+
+    logger.info(
+        "refund_notifications_sent",
+        payment_id=str(payment.id),
+        ticket_id=str(ticket.id),
+        user_id=str(payment.user_id),
+    )
+
+
+def send_refund_unmatched(
+    *,
+    payment_intent_id: str,
+    refund_id: str,
+    refund_amount: Decimal,
+    currency: str,
+    reason: str,
+    candidates: list[Payment],
+) -> None:
+    """Notify org staff that an inbound refund could not be matched to a ticket.
+
+    Unlike the receivers above this is a plain function, called explicitly from
+    the ``charge.refunded`` webhook handler when the matcher declines to guess
+    (see ``StripeEventHandler._match_refund_to_payments``): nothing was
+    cancelled and no seat was freed, so the only trace would otherwise be a log
+    line. Refunds carrying ``metadata.ticket_id`` — every refund issued through
+    Revel — match exactly and never reach here.
+
+    Call from *inside* the webhook's atomic block: the Notification rows are
+    written in the same transaction (so a rolled-back webhook leaves no false
+    alarm) while the dispatcher defers the Celery ``.delay()`` to ``on_commit``.
+
+    Args:
+        payment_intent_id: The Stripe payment intent the refund arrived on.
+        refund_id: The Stripe refund object id.
+        refund_amount: The refunded amount in major currency units.
+        currency: ISO currency code of the refund.
+        reason: ``non_uniform`` or ``ambiguous`` — why the match was declined.
+        candidates: The unrefunded Payments the refund could have applied to.
+    """
+    amount_by_ticket = {p.ticket_id: p.amount for p in candidates}
+    tickets = list(
+        Ticket.objects.filter(pk__in=amount_by_ticket)
+        .select_related("event__organization", "seat", "user")
+        .order_by("event__name", "seat__label")
+    )
+    if not tickets:  # pragma: no cover - candidates always carry a ticket (OneToOne, cascade)
+        return
+
+    organization = tickets[0].event.organization
+    # Deep-link to the event's ticket admin filtered to the buyer (#744). Every Payment on
+    # one intent belongs to one buyer, so their email narrows the list to exactly the
+    # candidates below. `?search=` is already read by that page and `list_tickets`' search
+    # covers `user__email` — no new surface invented for a notification.
+    resolve_url = (
+        f"{SiteSettings.get_solo().frontend_base_url}"
+        f"/org/{organization.slug}/admin/events/{tickets[0].event_id}/tickets"
+        f"?search={quote(tickets[0].user.email)}"
+    )
+    candidate_contexts: list[RefundUnmatchedCandidate] = [
+        {
+            "ticket_id": str(ticket.id),
+            "event_name": ticket.event.name,
+            "seat_label": ticket.seat.label if ticket.seat else "",
+            "amount": str(amount_by_ticket[ticket.id]),
+            "holder_email": ticket.user.email,
+        }
+        for ticket in tickets
+    ]
+    context: dict[str, t.Any] = {
+        "organization_id": str(organization.id),
+        "organization_name": organization.name,
+        "payment_intent_id": payment_intent_id,
+        "refund_id": refund_id,
+        # Two decimals like every Payment.amount rendered above — from_stripe_amount
+        # returns an unpadded Decimal (3000 cents -> Decimal("30")).
+        "refund_amount": f"{refund_amount:.2f}",
+        "currency": currency,
+        "reason": reason,
+        "candidates": candidate_contexts,
+        "resolve_url": resolve_url,
+    }
+
+    notified = notify_org_staff(
+        organization_id=organization.id,
+        notification_type=NotificationType.REFUND_UNMATCHED,
+        context=context,
+        sender=send_refund_unmatched,
+    )
+
+    logger.info(
+        "refund_unmatched_notifications_sent",
+        payment_intent_id=payment_intent_id,
+        refund_id=refund_id,
+        reason=reason,
+        candidate_count=len(candidate_contexts),
+        recipient_count=notified,
+    )
+
+
+def send_event_refund_summary(
+    *,
+    event: Event,
+    cancelled: int,
+    refunded: int,
+    failed: int,
+    still_active: int,
+) -> None:
+    """Notify org staff that a bulk event-cancellation refund sweep has finished.
+
+    Called from ``events.send_event_refund_summary`` (the Celery task in
+    ``events/tasks/refunds.py``) once every ticket on the event is CANCELLED, or
+    once that task's retry budget (30 attempts, 120s apart) is exhausted — in
+    which case ``still_active`` is non-zero and the counts below are a
+    best-effort snapshot rather than a final tally. A plain function like
+    ``send_refund_unmatched``: the task runs outside any request transaction, so
+    there is nothing to defer the ``notification_requested.send`` behind.
+
+    Args:
+        event: The cancelled event the sweep ran against.
+        cancelled: Tickets whose ``cancellation_source`` is EVENT_CANCELLATION.
+        refunded: Refund rows (source=EVENT_CANCELLATION) that are PENDING or SUCCEEDED.
+        failed: Payments whose EVENT_CANCELLATION refund rows are all FAILED.
+        still_active: Non-CANCELLED tickets remaining on the event (0 unless the
+            sweep gave up waiting).
+    """
+    context: EventRefundSummaryContext = {
+        "organization_id": str(event.organization_id),
+        "organization_name": event.organization.name,
+        "event_id": str(event.id),
+        "event_name": event.name,
+        "cancelled": cancelled,
+        "refunded": refunded,
+        "failed": failed,
+        "still_active": still_active,
+    }
+
+    notified = notify_org_staff(
+        organization_id=event.organization_id,
+        notification_type=NotificationType.EVENT_REFUND_SUMMARY,
+        context=context,
+        sender=send_event_refund_summary,
+    )
+
+    logger.info(
+        "event_refund_summary_notifications_sent",
+        event_id=str(event.id),
+        cancelled=cancelled,
+        refunded=refunded,
+        failed=failed,
+        still_active=still_active,
+        recipient_count=notified,
+    )

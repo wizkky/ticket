@@ -1,0 +1,860 @@
+import typing as t
+import uuid
+from datetime import timedelta
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import pytest
+from django.core.files.base import ContentFile
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
+
+from accounts.models import RevelUser
+from conftest import RevelUserFactory
+from events.models import (
+    AttendeeVisibilityFlag,
+    Event,
+    EventRSVP,
+    EventSeries,
+    GeneralUserPreferences,
+    HeldSeriesPass,
+    Organization,
+    SeriesPass,
+    SeriesPassTierLink,
+    Ticket,
+    TicketTier,
+)
+from events.tasks import (
+    build_attendee_visibility_flags,
+    cleanup_ticket_file_cache,
+    generate_recurring_events_task,
+)
+from events.tasks.attendees import visibility_rebuild_lock_key
+
+pytestmark = pytest.mark.django_db
+
+
+@patch("events.service.user_preferences_service.resolve_visibility_fast")
+def test_build_attendee_visibility_flags(
+    mock_resolve_visibility_fast: MagicMock,
+    event: Event,
+    revel_user_factory: RevelUserFactory,
+) -> None:
+    """Test that build_attendee_visibility_flags creates flags correctly."""
+    # Arrange
+    # 2 attendees, 1 invitee
+    attendee1 = revel_user_factory()
+    attendee2 = revel_user_factory()
+    invitee = revel_user_factory()
+
+    # Viewer is attendee1, target is attendee2
+    # Let's say attendee1 can see attendee2
+    # Configure the mock to return boolean values directly
+    mock_resolve_visibility_fast.side_effect = lambda viewer, target, *args, **kwargs: (
+        viewer == attendee1 and target == attendee2
+    )
+
+    tier = event.ticket_tiers.first()
+    assert tier is not None
+    Ticket.objects.create(
+        guest_name="Test Guest", event=event, user=attendee1, tier=tier, status=Ticket.TicketStatus.ACTIVE
+    )
+    EventRSVP.objects.create(event=event, user=attendee2, status=EventRSVP.RsvpStatus.YES)
+    event.invitations.create(user=invitee)
+
+    # Act
+    build_attendee_visibility_flags(str(event.id))
+
+    # Assert
+    event.refresh_from_db()
+    assert event.attendee_count == 2
+
+    assert AttendeeVisibilityFlag.objects.count() > 0
+
+    # Viewer: attendee1, Target: attendee2 -> Visible
+    flag1 = AttendeeVisibilityFlag.objects.get(user=attendee1, event=event, target=attendee2)
+    assert flag1.is_visible is True
+
+    # Viewer: attendee2, Target: attendee1 -> Not Visible
+    flag2 = AttendeeVisibilityFlag.objects.get(user=attendee2, event=event, target=attendee1)
+    assert flag2.is_visible is False
+
+    # Check that a flag was created for the invitee as a viewer
+    assert AttendeeVisibilityFlag.objects.filter(user=invitee, event=event).exists()
+
+
+def test_build_attendee_visibility_flags_integration(
+    event: Event,
+    revel_user_factory: RevelUserFactory,
+) -> None:
+    """
+    Integration test for build_attendee_visibility_flags without mocking resolve_visibility.
+    """
+    # Arrange
+    attendee1 = revel_user_factory()
+    attendee2 = revel_user_factory()
+
+    tier = event.ticket_tiers.first()
+    assert tier is not None
+    Ticket.objects.create(
+        guest_name="Test Guest", event=event, user=attendee1, tier=tier, status=Ticket.TicketStatus.ACTIVE
+    )
+    EventRSVP.objects.create(event=event, user=attendee2, status=EventRSVP.RsvpStatus.YES)
+
+    # attendee1 wants to be seen by everyone
+    GeneralUserPreferences.objects.filter(user=attendee1).update(
+        show_me_on_attendee_list=GeneralUserPreferences.VisibilityPreference.ALWAYS
+    )
+    # attendee2 wants to be seen by no one
+    GeneralUserPreferences.objects.filter(user=attendee2).update(
+        show_me_on_attendee_list=GeneralUserPreferences.VisibilityPreference.NEVER
+    )
+
+    # Act
+    build_attendee_visibility_flags(str(event.id))
+
+    # Assert
+    # Anyone can see attendee1
+    assert AttendeeVisibilityFlag.objects.get(user=attendee2, event=event, target=attendee1).is_visible
+
+    # No one can see attendee2
+    assert not AttendeeVisibilityFlag.objects.get(user=attendee1, event=event, target=attendee2).is_visible
+
+
+def test_build_attendee_visibility_flags_no_attendees(
+    event: Event,
+) -> None:
+    """Test that build_attendee_visibility_flags handles the case with no attendees."""
+    # Act
+    build_attendee_visibility_flags(str(event.id))
+
+    # Assert
+    event.refresh_from_db()
+    assert event.attendee_count == 0
+    assert AttendeeVisibilityFlag.objects.filter(event=event).count() == 0
+
+
+def test_build_attendee_visibility_flags_replaces_existing(
+    event: Event,
+    revel_user_factory: RevelUserFactory,
+) -> None:
+    """Test that build_attendee_visibility_flags replaces existing flags."""
+    # Arrange
+    attendee1 = revel_user_factory()
+    attendee2 = revel_user_factory()
+
+    # Create tickets to make them attendees
+    tier = event.ticket_tiers.first()
+    assert tier is not None
+    Ticket.objects.create(
+        guest_name="Test Guest", event=event, user=attendee1, tier=tier, status=Ticket.TicketStatus.ACTIVE
+    )
+    Ticket.objects.create(
+        guest_name="Test Guest", event=event, user=attendee2, tier=tier, status=Ticket.TicketStatus.ACTIVE
+    )
+
+    # Create initial visibility flags (opposite of what they should be)
+    AttendeeVisibilityFlag.objects.all().delete()
+    AttendeeVisibilityFlag.objects.create(user=attendee1, event=event, target=attendee2, is_visible=False)
+    AttendeeVisibilityFlag.objects.create(user=attendee2, event=event, target=attendee1, is_visible=False)
+
+    # Set preferences to make them visible to each other
+    GeneralUserPreferences.objects.filter(user=attendee1).update(
+        show_me_on_attendee_list=GeneralUserPreferences.VisibilityPreference.ALWAYS
+    )
+    GeneralUserPreferences.objects.filter(user=attendee2).update(
+        show_me_on_attendee_list=GeneralUserPreferences.VisibilityPreference.ALWAYS
+    )
+
+    # Act
+    build_attendee_visibility_flags(str(event.id))
+
+    # Assert
+    # The flags should be replaced with new ones where is_visible=True
+    assert AttendeeVisibilityFlag.objects.get(user=attendee1, event=event, target=attendee2).is_visible
+    assert AttendeeVisibilityFlag.objects.get(user=attendee2, event=event, target=attendee1).is_visible
+
+
+def test_visibility_rebuild_lock_key_is_stable_and_64_bit() -> None:
+    """The advisory-lock key is deterministic, event-specific, and fits Postgres's signed bigint.
+
+    A true two-thread deadlock reproduction is deliberately not attempted:
+    ``pg_advisory_xact_lock`` serializes concurrent rebuilds by construction, so the
+    regression contract is (a) the key derivation is stable per event and (b) the task
+    actually takes the lock (see test below).
+    """
+    event_id = str(uuid.uuid4())
+
+    key = visibility_rebuild_lock_key(event_id)
+
+    # Deterministic for the same event.
+    assert visibility_rebuild_lock_key(event_id) == key
+    # Fits a signed 64-bit bigint (pg_advisory_xact_lock's argument type).
+    assert -(2**63) <= key < 2**63
+    # Distinct events get distinct keys.
+    assert visibility_rebuild_lock_key(str(uuid.uuid4())) != key
+
+
+def test_build_attendee_visibility_flags_returns_when_event_is_gone(event: Event) -> None:
+    """Both event lookups tolerate a deleted event (#937).
+
+    The first lookup is reached by the Ticket/RSVP post_delete receivers cascaded from
+    event.delete(). The second runs after the attendee-count block committed and released
+    its row lock, so a concurrent delete can land in between; we simulate it by deleting the
+    event from inside the advisory-lock key call, which sits between the two lookups.
+    """
+    build_attendee_visibility_flags(str(uuid.uuid4()))  # first lookup: unknown id
+
+    event_id = str(event.id)
+
+    def _delete_then_key(key_event_id: str) -> int:
+        Event.objects.filter(pk=key_event_id).delete()
+        return visibility_rebuild_lock_key(key_event_id)
+
+    with patch("events.tasks.attendees.visibility_rebuild_lock_key", side_effect=_delete_then_key):
+        build_attendee_visibility_flags(event_id)  # second lookup: deleted mid-task
+
+    assert not AttendeeVisibilityFlag.objects.filter(event_id=event_id).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_build_attendee_visibility_flags_takes_per_event_advisory_lock(
+    event: Event,
+    revel_user_factory: RevelUserFactory,
+) -> None:
+    """The rebuild transaction acquires the per-event advisory xact lock BEFORE the
+    visibility snapshot reads, and repeated sequential runs still produce a complete,
+    correct matrix.
+
+    This is the deadlock + stale-overwrite regression guard: concurrent rebuilds of
+    the same event's matrix deadlocked in production because delete + bulk_create
+    interleaved row locks across workers, and a task that waits on the lock must read
+    AFTER acquiring it or it overwrites a newer matrix with stale flags. We assert the
+    lock query runs exactly once, with the derived key, and strictly before every
+    snapshot read and the destructive delete (query-order inspection) rather than
+    reproducing a two-thread race.
+
+    ``transaction=True`` is required: under pytest-django's default outer transaction
+    the task's ``transaction.atomic()`` degrades to a savepoint, so
+    ``pg_advisory_xact_lock`` would attach to the test's long-lived outer transaction
+    and the "lock taken inside the task's own transaction" contract could never fail.
+    """
+    attendee1 = revel_user_factory()
+    attendee2 = revel_user_factory()
+    tier = event.ticket_tiers.first()
+    assert tier is not None
+    Ticket.objects.create(
+        guest_name="Test Guest", event=event, user=attendee1, tier=tier, status=Ticket.TicketStatus.ACTIVE
+    )
+    EventRSVP.objects.create(event=event, user=attendee2, status=EventRSVP.RsvpStatus.YES)
+
+    with CaptureQueriesContext(connection) as ctx:
+        build_attendee_visibility_flags(str(event.id))
+
+    sqls = [q["sql"] for q in ctx.captured_queries]
+    lock_indices = [i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql]
+    assert len(lock_indices) == 1
+    lock_idx = lock_indices[0]
+    assert str(visibility_rebuild_lock_key(str(event.id))) in sqls[lock_idx]
+
+    # The visibility snapshot (attendee/viewer reads) and the destructive rewrite must
+    # all happen AFTER the advisory lock — a stale pre-lock snapshot would let a queued
+    # rebuild overwrite a newer matrix. The attendee/viewer reads are the reveluser
+    # selects joined against tickets/rsvps/invitations (the pre-lock attendee-count
+    # block also prefetches staff members, so a bare reveluser match would be wrong).
+    snapshot_reads = [
+        i
+        for i, sql in enumerate(sqls)
+        if "accounts_reveluser" in sql
+        and sql.startswith("SELECT")
+        and ("events_ticket" in sql or "events_eventrsvp" in sql or "events_eventinvitation" in sql)
+    ]
+    delete_indices = [
+        i for i, sql in enumerate(sqls) if "events_attendeevisibilityflag" in sql and sql.startswith("DELETE")
+    ]
+    assert snapshot_reads, "expected attendee/viewer snapshot reads"
+    assert delete_indices, "expected the matrix delete"
+    assert all(lock_idx < i for i in snapshot_reads + delete_indices)
+
+    # A second sequential run (what the lock enforces for concurrent dispatches)
+    # still yields a complete matrix: every viewer/target pair has exactly one flag.
+    build_attendee_visibility_flags(str(event.id))
+    assert AttendeeVisibilityFlag.objects.filter(event=event).count() == 4
+    for viewer in (attendee1, attendee2):
+        for target in (attendee1, attendee2):
+            assert AttendeeVisibilityFlag.objects.filter(user=viewer, event=event, target=target).count() == 1
+
+
+class TestCleanupTicketFileCache:
+    """Tests for the cleanup_ticket_file_cache Celery task.
+
+    This task deletes cached PDF/pkpass files for tickets whose events
+    have ended, freeing storage for past events.
+    """
+
+    @pytest.fixture
+    def user(self, revel_user_factory: RevelUserFactory) -> RevelUser:
+        """User for ticket creation."""
+        return revel_user_factory()
+
+    @pytest.fixture
+    def past_org(self, user: RevelUser) -> Organization:
+        """Organization for past event tests."""
+        return Organization.objects.create(name="Past Org", slug="past-org", owner=user)
+
+    @pytest.fixture
+    def past_event(self, past_org: Organization) -> Event:
+        """Event that has already ended."""
+        now = timezone.now()
+        return Event.objects.create(
+            organization=past_org,
+            name="Past Event",
+            slug="past-event",
+            start=now - timedelta(days=2),
+            end=now - timedelta(days=1),
+            requires_ticket=True,
+            status=Event.EventStatus.CLOSED,
+        )
+
+    @pytest.fixture
+    def future_org(self, user: RevelUser) -> Organization:
+        """Organization for future event tests."""
+        return Organization.objects.create(name="Future Org", slug="future-org", owner=user)
+
+    @pytest.fixture
+    def future_event(self, future_org: Organization) -> Event:
+        """Event that has not ended yet."""
+        now = timezone.now()
+        return Event.objects.create(
+            organization=future_org,
+            name="Future Event",
+            slug="future-event",
+            start=now + timedelta(days=7),
+            end=now + timedelta(days=7, hours=3),
+            requires_ticket=True,
+            status=Event.EventStatus.OPEN,
+        )
+
+    @pytest.fixture
+    def past_tier(self, past_event: Event) -> TicketTier:
+        return TicketTier.objects.create(event=past_event, name="Past Tier", price=0)
+
+    @pytest.fixture
+    def future_tier(self, future_event: Event) -> TicketTier:
+        return TicketTier.objects.create(event=future_event, name="Future Tier", price=0)
+
+    def _create_ticket_with_files(
+        self,
+        event: Event,
+        tier: TicketTier,
+        user: RevelUser,
+        *,
+        has_pdf: bool = False,
+        has_pkpass: bool = False,
+    ) -> Ticket:
+        """Helper to create a ticket and attach cached files via the service."""
+        from events.service import ticket_file_service
+
+        ticket = Ticket.objects.create(
+            event=event,
+            user=user,
+            tier=tier,
+            status=Ticket.TicketStatus.ACTIVE,
+            guest_name="Cache Test",
+        )
+        if has_pdf or has_pkpass:
+            ticket_file_service.cache_files(
+                ticket,
+                pdf_bytes=b"%PDF-cached" if has_pdf else None,
+                pkpass_bytes=b"PK-cached" if has_pkpass else None,
+            )
+            ticket.refresh_from_db()
+        return ticket
+
+    def test_cleans_both_files_for_past_event(self, past_event: Event, past_tier: TicketTier, user: RevelUser) -> None:
+        """Should delete both PDF and pkpass for tickets of past events."""
+        ticket = self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True, has_pkpass=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 1}
+        ticket.refresh_from_db()
+        assert not ticket.pdf_file
+        assert not ticket.pkpass_file
+        assert ticket.file_content_hash is None
+
+    def test_cleans_pdf_only_ticket(self, past_event: Event, past_tier: TicketTier, user: RevelUser) -> None:
+        """Should handle tickets with only a PDF file."""
+        ticket = self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 1}
+        ticket.refresh_from_db()
+        assert not ticket.pdf_file
+
+    def test_cleans_pkpass_only_ticket(self, past_event: Event, past_tier: TicketTier, user: RevelUser) -> None:
+        """Should handle tickets with only a pkpass file."""
+        ticket = self._create_ticket_with_files(past_event, past_tier, user, has_pkpass=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 1}
+        ticket.refresh_from_db()
+        assert not ticket.pkpass_file
+
+    def test_skips_future_event_tickets(
+        self,
+        future_event: Event,
+        future_tier: TicketTier,
+        user: RevelUser,
+    ) -> None:
+        """Should not clean up files for tickets whose events have not ended."""
+        ticket = self._create_ticket_with_files(future_event, future_tier, user, has_pdf=True, has_pkpass=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 0}
+        ticket.refresh_from_db()
+        assert ticket.pdf_file
+        assert ticket.pkpass_file
+
+    def test_skips_tickets_without_files(self, past_event: Event, past_tier: TicketTier, user: RevelUser) -> None:
+        """Should not count tickets that have no cached files."""
+        self._create_ticket_with_files(past_event, past_tier, user, has_pdf=False, has_pkpass=False)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 0}
+
+    def test_returns_correct_count_for_multiple_tickets(
+        self, past_event: Event, past_tier: TicketTier, user: RevelUser
+    ) -> None:
+        """Should return the correct count when cleaning multiple tickets."""
+        self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True)
+        self._create_ticket_with_files(past_event, past_tier, user, has_pkpass=True)
+        self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True, has_pkpass=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 3}
+
+    def test_mixed_past_and_future_events(
+        self,
+        past_event: Event,
+        past_tier: TicketTier,
+        future_event: Event,
+        future_tier: TicketTier,
+        user: RevelUser,
+    ) -> None:
+        """Should only clean files for past events, leaving future events intact."""
+        past_ticket = self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True)
+        future_ticket = self._create_ticket_with_files(future_event, future_tier, user, has_pdf=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 1}
+        past_ticket.refresh_from_db()
+        future_ticket.refresh_from_db()
+        assert not past_ticket.pdf_file
+        assert future_ticket.pdf_file
+
+    def test_continues_processing_when_one_ticket_fails(
+        self, past_event: Event, past_tier: TicketTier, user: RevelUser
+    ) -> None:
+        """Should continue cleaning remaining tickets when one ticket's file deletion fails."""
+        ticket1 = self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True)
+        ticket2 = self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True)
+        ticket3 = self._create_ticket_with_files(past_event, past_tier, user, has_pdf=True)
+
+        call_count = 0
+
+        def delete_side_effect(save: bool = True) -> None:
+            nonlocal call_count
+            call_count += 1
+            # Fail on the second ticket's delete
+            if call_count == 2:
+                raise OSError("disk error")
+
+        with patch.object(
+            Ticket.pdf_file.field.attr_class,
+            "delete",
+            side_effect=delete_side_effect,
+        ):
+            result = cleanup_ticket_file_cache()
+
+        # 2 out of 3 should succeed
+        assert result == {"cleaned": 2}
+        ticket1.refresh_from_db()
+        ticket2.refresh_from_db()
+        ticket3.refresh_from_db()
+        # ticket2 should still have its file (deletion failed)
+        assert ticket2.pdf_file
+        assert ticket2.file_content_hash is not None
+
+
+class TestCleanupSeriesPassFileCacheSweep:
+    """Tests for cleanup_ticket_file_cache's HeldSeriesPass sweep (same task, no new beat row).
+
+    A held pass is only swept once every event its pass covers has ended, gated by the
+    LAST covered event's end (not the first) — a pass still covering an upcoming event
+    stays downloadable even if it also covers past events.
+    """
+
+    @pytest.fixture
+    def user(self, revel_user_factory: RevelUserFactory) -> RevelUser:
+        return revel_user_factory()
+
+    @pytest.fixture
+    def org(self, user: RevelUser) -> Organization:
+        return Organization.objects.create(name="Pass Cache Org", slug="pass-cache-org", owner=user)
+
+    @pytest.fixture
+    def event_series(self, org: Organization) -> EventSeries:
+        return EventSeries.objects.create(organization=org, name="Pass Cache Series", slug="pass-cache-series")
+
+    def _make_covered_event(
+        self,
+        org: Organization,
+        event_series: EventSeries,
+        series_pass: SeriesPass,
+        suffix: str,
+        start: t.Any,
+        end: t.Any,
+    ) -> None:
+        """Create an event + tier and link it to series_pass."""
+        event = Event.objects.create(
+            organization=org,
+            event_series=event_series,
+            name=f"Cache Event {suffix}",
+            slug=f"cache-event-{suffix}",
+            start=start,
+            end=end,
+            requires_ticket=True,
+            status=Event.EventStatus.OPEN,
+        )
+        tier = TicketTier.objects.create(event=event, name=f"Cache Tier {suffix}", price=0, currency="EUR")
+        SeriesPassTierLink.objects.create(series_pass=series_pass, event=event, tier=tier)
+
+    @pytest.fixture
+    def past_series_pass(self, org: Organization, event_series: EventSeries) -> SeriesPass:
+        """A pass whose only covered event has already ended."""
+        now = timezone.now()
+        series_pass = SeriesPass.objects.create(
+            event_series=event_series,
+            name="Past Pass",
+            price=Decimal("10.00"),
+            pro_rata_discount=Decimal("1.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.FREE,
+        )
+        self._make_covered_event(
+            org, event_series, series_pass, "past", now - timedelta(days=2), now - timedelta(days=1)
+        )
+        return series_pass
+
+    @pytest.fixture
+    def ongoing_series_pass(self, org: Organization, event_series: EventSeries) -> SeriesPass:
+        """A pass covering one past and one future event — not fully over yet."""
+        now = timezone.now()
+        series_pass = SeriesPass.objects.create(
+            event_series=event_series,
+            name="Ongoing Pass",
+            price=Decimal("20.00"),
+            pro_rata_discount=Decimal("2.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.FREE,
+        )
+        self._make_covered_event(
+            org, event_series, series_pass, "ongoing-past", now - timedelta(days=2), now - timedelta(days=1)
+        )
+        self._make_covered_event(
+            org, event_series, series_pass, "ongoing-future", now + timedelta(days=7), now + timedelta(days=7, hours=2)
+        )
+        return series_pass
+
+    def _create_held_pass_with_files(
+        self,
+        series_pass: SeriesPass,
+        user: RevelUser,
+        *,
+        has_pdf: bool = False,
+        has_pkpass: bool = False,
+    ) -> HeldSeriesPass:
+        """Helper to create a held pass and attach cached files directly (no real PDF/pkpass generation)."""
+        held_pass = HeldSeriesPass.objects.create(
+            series_pass=series_pass,
+            user=user,
+            status=HeldSeriesPass.HeldSeriesPassStatus.ACTIVE,
+            price_paid=series_pass.price,
+        )
+        if has_pdf:
+            held_pass.pdf_file.save("pass.pdf", ContentFile(b"%PDF-cached"), save=False)
+        if has_pkpass:
+            held_pass.pkpass_file.save("pass.pkpass", ContentFile(b"PK-cached"), save=False)
+        if has_pdf or has_pkpass:
+            held_pass.file_content_hash = "cached-hash"
+            held_pass.save()
+        return held_pass
+
+    def test_cleans_pass_whose_last_covered_event_ended(self, past_series_pass: SeriesPass, user: RevelUser) -> None:
+        held_pass = self._create_held_pass_with_files(past_series_pass, user, has_pdf=True, has_pkpass=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 1}
+        held_pass.refresh_from_db()
+        assert not held_pass.pdf_file
+        assert not held_pass.pkpass_file
+        assert held_pass.file_content_hash is None
+
+    def test_skips_pass_with_upcoming_covered_event(self, ongoing_series_pass: SeriesPass, user: RevelUser) -> None:
+        """The pass covers a past AND a future event — its LAST event hasn't ended, so it's untouched."""
+        held_pass = self._create_held_pass_with_files(ongoing_series_pass, user, has_pdf=True, has_pkpass=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 0}
+        held_pass.refresh_from_db()
+        assert held_pass.pdf_file
+        assert held_pass.pkpass_file
+
+    def test_skips_pass_without_files(self, past_series_pass: SeriesPass, user: RevelUser) -> None:
+        self._create_held_pass_with_files(past_series_pass, user)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 0}
+
+    def test_continues_processing_when_one_pass_fails(
+        self, past_series_pass: SeriesPass, user: RevelUser, revel_user_factory: RevelUserFactory
+    ) -> None:
+        """Should continue cleaning remaining held passes when one pass's file deletion fails."""
+        held_pass1 = self._create_held_pass_with_files(past_series_pass, user, has_pdf=True)
+        other_user = revel_user_factory()
+        held_pass2 = self._create_held_pass_with_files(past_series_pass, other_user, has_pdf=True)
+
+        call_count = 0
+
+        def delete_side_effect(save: bool = True) -> None:
+            nonlocal call_count
+            call_count += 1
+            # Fail on the first pass's delete
+            if call_count == 1:
+                raise OSError("disk error")
+
+        with patch.object(
+            HeldSeriesPass.pdf_file.field.attr_class,
+            "delete",
+            side_effect=delete_side_effect,
+        ):
+            result = cleanup_ticket_file_cache()
+
+        # 1 out of 2 should succeed: the first delete fails, the loop continues.
+        assert result == {"cleaned": 1}
+        held_pass1.refresh_from_db()
+        held_pass2.refresh_from_db()
+        # Exactly one pass keeps its file (the one whose delete raised); order-agnostic.
+        assert sum(1 for hp in (held_pass1, held_pass2) if hp.pdf_file) == 1
+
+    def test_counts_tickets_and_passes_together(
+        self,
+        past_series_pass: SeriesPass,
+        user: RevelUser,
+        org: Organization,
+        event_series: EventSeries,
+    ) -> None:
+        """The combined 'cleaned' counter spans both tickets and held passes in one run."""
+        now = timezone.now()
+        past_event = Event.objects.create(
+            organization=org,
+            event_series=event_series,
+            name="Direct Past Event",
+            slug="direct-past-event",
+            start=now - timedelta(days=2),
+            end=now - timedelta(days=1),
+            requires_ticket=True,
+            status=Event.EventStatus.CLOSED,
+        )
+        past_tier = TicketTier.objects.create(event=past_event, name="Direct Past Tier", price=0)
+        ticket = Ticket.objects.create(
+            event=past_event, user=user, tier=past_tier, status=Ticket.TicketStatus.ACTIVE, guest_name="Direct"
+        )
+        ticket.pdf_file.save("ticket.pdf", ContentFile(b"%PDF-cached"), save=False)
+        ticket.file_content_hash = "cached-hash"
+        ticket.save()
+        self._create_held_pass_with_files(past_series_pass, user, has_pdf=True)
+
+        result = cleanup_ticket_file_cache()
+
+        assert result == {"cleaned": 2}
+
+
+class TestGenerateRecurringEventsTask:
+    """Tests for the daily Celery beat task that materializes recurring series."""
+
+    @patch("notifications.service.notification_helpers.notify_series_events_generated")
+    def test_processes_active_series_only(
+        self,
+        mock_notify: MagicMock,
+        organization: Organization,
+    ) -> None:
+        """The task only processes active series with both a rule and template."""
+        from datetime import datetime as dt
+
+        from freezegun import freeze_time
+
+        from events.models import EventSeries, RecurrenceRule
+
+        dtstart = timezone.make_aware(dt(2026, 4, 6, 10, 0))
+        rule = RecurrenceRule.objects.create(
+            frequency=RecurrenceRule.Frequency.WEEKLY,
+            interval=1,
+            weekdays=[0],
+            dtstart=dtstart,
+        )
+        active = EventSeries.objects.create(
+            organization=organization,
+            name="Active Series",
+            recurrence_rule=rule,
+            is_active=True,
+            generation_window_weeks=4,
+        )
+        template = Event.objects.create(
+            organization=organization,
+            event_series=active,
+            name="Active Template",
+            start=dtstart,
+            end=dtstart + timedelta(hours=2),
+            status=Event.EventStatus.DRAFT,
+            visibility=Event.Visibility.PUBLIC,
+            event_type=Event.EventType.PUBLIC,
+            is_template=True,
+        )
+        active.template_event = template
+        active.save(update_fields=["template_event"])
+
+        # Inactive series — must be skipped.
+        rule2 = RecurrenceRule.objects.create(
+            frequency=RecurrenceRule.Frequency.WEEKLY,
+            interval=1,
+            weekdays=[0],
+            dtstart=dtstart,
+        )
+        inactive = EventSeries.objects.create(
+            organization=organization,
+            name="Inactive Series",
+            recurrence_rule=rule2,
+            is_active=False,
+            generation_window_weeks=4,
+        )
+        inactive_template = Event.objects.create(
+            organization=organization,
+            event_series=inactive,
+            name="Inactive Template",
+            start=dtstart,
+            end=dtstart + timedelta(hours=2),
+            status=Event.EventStatus.DRAFT,
+            visibility=Event.Visibility.PUBLIC,
+            event_type=Event.EventType.PUBLIC,
+            is_template=True,
+        )
+        inactive.template_event = inactive_template
+        inactive.save(update_fields=["template_event"])
+
+        # Series without recurrence rule or template — must be skipped via the queryset filter.
+        EventSeries.objects.create(
+            organization=organization,
+            name="Bare Series",
+            is_active=True,
+        )
+
+        # Act
+        with freeze_time("2026-04-06 10:00:00"):
+            result = generate_recurring_events_task()
+
+        # Assert — only the active series is dispatched (inactive series and
+        # series without rule/template are filtered out by the queryset). With
+        # CELERY_TASK_ALWAYS_EAGER the dispatched subtask runs inline and
+        # materializes 5 weekly Mondays — see test_weekly_rule_generates_expected_count
+        # for the timezone boundary discussion.
+        assert result == {"series_dispatched": 1}
+        assert active.events.filter(is_template=False).count() == 5
+        assert inactive.events.filter(is_template=False).count() == 0
+
+    @patch("notifications.service.notification_helpers.notify_series_events_generated")
+    def test_per_series_subtask_isolation_on_failure(
+        self,
+        mock_notify: MagicMock,
+        organization: Organization,
+        settings: t.Any,
+    ) -> None:
+        """One failing series subtask must not prevent the other series from generating.
+
+        The beat task dispatches per-series subtasks via ``.delay()``. In
+        production these are independent and a failure in one doesn't affect
+        the others. In tests with CELERY_TASK_EAGER_PROPAGATES we disable
+        propagation so the test reflects production semantics.
+        """
+        from datetime import datetime as dt
+
+        from freezegun import freeze_time
+
+        from events.models import EventSeries, RecurrenceRule
+
+        # In production, .delay() dispatches and returns immediately; a failing
+        # subtask is handled by Celery's retry loop. Emulate that here.
+        settings.CELERY_TASK_EAGER_PROPAGATES = False
+
+        dtstart = timezone.make_aware(dt(2026, 4, 6, 10, 0))
+
+        def _build_series(name: str) -> EventSeries:
+            rule = RecurrenceRule.objects.create(
+                frequency=RecurrenceRule.Frequency.WEEKLY,
+                interval=1,
+                weekdays=[0],
+                dtstart=dtstart,
+            )
+            series = EventSeries.objects.create(
+                organization=organization,
+                name=name,
+                recurrence_rule=rule,
+                is_active=True,
+                generation_window_weeks=4,
+            )
+            template = Event.objects.create(
+                organization=organization,
+                event_series=series,
+                name=f"{name} Template",
+                start=dtstart,
+                end=dtstart + timedelta(hours=2),
+                status=Event.EventStatus.DRAFT,
+                visibility=Event.Visibility.PUBLIC,
+                event_type=Event.EventType.PUBLIC,
+                is_template=True,
+            )
+            series.template_event = template
+            series.save(update_fields=["template_event"])
+            return series
+
+        bad = _build_series("Bad Series")
+        good = _build_series("Good Series")
+
+        # Fake generate_series_events so it raises for the bad series and runs
+        # normally for the good one. Patched at the tasks module where it's
+        # imported inside the subtask.
+        from events.service.recurrence_service import generate_series_events as real_generate
+
+        def _side_effect(series: EventSeries, **kwargs: t.Any) -> list[Event]:
+            if series.id == bad.id:
+                raise RuntimeError("boom")
+            return real_generate(series, **kwargs)
+
+        with patch("events.service.recurrence_service.generate_series_events", side_effect=_side_effect):
+            with freeze_time("2026-04-06 10:00:00"):
+                result = generate_recurring_events_task()
+
+        assert result == {"series_dispatched": 2}
+        assert good.events.filter(is_template=False).count() == 5
+        assert bad.events.filter(is_template=False).count() == 0

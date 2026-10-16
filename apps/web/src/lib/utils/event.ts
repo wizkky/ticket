@@ -1,0 +1,281 @@
+/**
+ * Event-specific utility functions
+ */
+
+import type {
+	EventInListSchema,
+	EventDetailSchema,
+	MinimalEventSchema
+} from '$lib/api/generated/types.gen';
+import { getPosterFallbackGradient } from './fallback-gradient';
+
+/**
+ * Get display string for event access/pricing
+ * Note: EventInListSchema does NOT include ticket price data.
+ * This function shows access type only (Free RSVP, Ticketed, etc.)
+ *
+ * @param event Event data from list API
+ * @param userIsMember Is the current user a member of the event's organization?
+ * @param userIsStaff Is the current user staff/owner of the event's organization?
+ * @returns Access type display string
+ */
+export function getEventAccessDisplay(
+	event: EventInListSchema,
+	_userIsMember = false,
+	_userIsStaff = false
+): string {
+	// Note: free_for_members and free_for_staff fields have been removed from the backend.
+	// Pricing/access is now managed through ticket tier membership/staff restrictions.
+
+	// For everyone, indicate ticket requirement
+	if (event.requires_ticket) {
+		// Could be free or paid, we don't know without fetching ticket tiers
+		return 'Ticketed';
+	}
+
+	// No ticket required = free RSVP
+	return 'Free RSVP';
+}
+
+/**
+ * Check if event is at capacity
+ *
+ * Reads the backend's `is_full` flag (#825), which is always public: deriving
+ * fullness from `max_attendees`/`attendee_count` stopped working when those two
+ * became withholdable, and a hidden capacity would then have read as "not full".
+ * `is_full` is computed server-side from the real numbers regardless of what the
+ * event discloses, so sold-out signalling survives a discreet event.
+ *
+ * @param event Event data
+ * @returns true if the event is at capacity
+ */
+export function isEventFull(event: EventInListSchema): boolean {
+	return event.is_full === true;
+}
+
+/**
+ * Get spots remaining (or null if unknown)
+ *
+ * `null` means "do not state a number": no capacity limit, or capacity/count
+ * withheld by the event's visibility settings (#825).
+ *
+ * @param event Event data
+ * @returns Number of spots remaining, or null when not disclosable
+ */
+export function getSpotsRemaining(event: EventInListSchema): number | null {
+	const maxAttendees = event.max_attendees;
+	const attendeeCount = event.attendee_count;
+	if (maxAttendees == null || maxAttendees === 0) return null; // Unlimited, or withheld
+	if (attendeeCount == null) return null; // Count withheld
+	return Math.max(0, maxAttendees - attendeeCount);
+}
+
+/**
+ * Generate a deterministic gradient class for event fallback images.
+ *
+ * Delegates to the shared poster-palette ramp so an event, its series and its
+ * organization all fall back to the same visual family (see
+ * `utils/fallback-gradient.ts` for why these stay mode-inert).
+ *
+ * @param eventId Event UUID
+ * @returns Tailwind gradient color-stop classes (caller supplies the direction)
+ */
+export function getEventFallbackGradient(eventId: string): string {
+	return getPosterFallbackGradient(eventId);
+}
+
+/**
+ * The city name and country that are NOT already spelled out in `text`
+ * (case-insensitive, whole words), in display order. Free-text addresses often
+ * carry the city and country already ("Stephansplatz 1, Vienna, Austria"), and
+ * appending the structured city on top rendered them twice.
+ */
+export function cityPartsNotIn(
+	text: string | null | undefined,
+	city: { name?: string | null; country?: string | null } | null | undefined
+): string[] {
+	const parts = [city?.name, city?.country].filter((part): part is string => !!part);
+	if (!text) return parts;
+	return parts.filter((part) => {
+		const escaped = part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+		return !new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}($|[^\\p{L}\\p{N}])`, 'iu').test(text);
+	});
+}
+
+/**
+ * Format event location from address and city fields
+ * Note: Only EventDetailSchema has address and city fields.
+ * EventInListSchema does not include location data.
+ * @param event Event detail data with address and city
+ * @returns Formatted location string or undefined if no location data
+ */
+export function formatEventLocation(event: EventDetailSchema): string | undefined {
+	if (!event.address && !event.city) return undefined;
+
+	const parts: string[] = [];
+
+	// Add street address if available
+	if (event.address) {
+		parts.push(event.address);
+	}
+
+	// Add city and country if available
+	if (event.city) {
+		const cityPart = cityPartsNotIn(event.address, event.city).join(', ');
+		if (cityPart) {
+			parts.push(cityPart);
+		}
+	}
+
+	return parts.length > 0 ? parts.join(', ') : undefined;
+}
+
+/**
+ * Get event logo with fallback hierarchy:
+ * 1. Event's logo
+ * 2. Event series' logo (if event is part of a series)
+ * 3. Organization's logo
+ *
+ * @param event Event data (can be MinimalEventSchema, EventInListSchema, or EventDetailSchema)
+ * @returns Logo URL path (relative) or null if no logo available
+ */
+export function getEventLogo(
+	event: MinimalEventSchema | EventDetailSchema | EventInListSchema
+): string | null {
+	// First priority: Event's own logo
+	if (event.logo) {
+		return event.logo;
+	}
+
+	// Second priority: Event series logo (may not exist in MinimalEventSchema)
+	if ('event_series' in event && event.event_series?.logo) {
+		return event.event_series.logo;
+	}
+
+	// Third priority: Organization logo (may not exist in MinimalEventSchema)
+	if ('organization' in event && event.organization?.logo) {
+		return event.organization.logo;
+	}
+
+	return null;
+}
+
+/**
+ * Get event logo thumbnail with fallback hierarchy (optimized for small displays):
+ * 1. Event's logo_thumbnail_url
+ * 2. Event series' logo_thumbnail_url (if event is part of a series)
+ * 3. Organization's logo_thumbnail_url
+ *
+ * @param event Event data (can be MinimalEventSchema, EventInListSchema, or EventDetailSchema)
+ * @returns Logo thumbnail URL path (relative) or null if no thumbnail available
+ */
+export function getEventLogoThumbnail(
+	event: MinimalEventSchema | EventDetailSchema | EventInListSchema
+): string | null {
+	// First priority: Event's own logo thumbnail
+	if (event.logo_thumbnail_url) {
+		return event.logo_thumbnail_url;
+	}
+
+	// Second priority: Event series logo thumbnail
+	if ('event_series' in event && event.event_series?.logo_thumbnail_url) {
+		return event.event_series.logo_thumbnail_url;
+	}
+
+	// Third priority: Organization logo thumbnail
+	if ('organization' in event && event.organization?.logo_thumbnail_url) {
+		return event.organization.logo_thumbnail_url;
+	}
+
+	return null;
+}
+
+/**
+ * Get event cover art with fallback hierarchy:
+ * 1. Event's cover_art
+ * 2. Event series' cover_art (if event is part of a series)
+ * 3. Organization's cover_art
+ *
+ * @param event Event data (can be MinimalEventSchema, EventInListSchema, or EventDetailSchema)
+ * @returns Cover art URL path (relative) or null if no cover art available
+ */
+export function getEventCoverArt(
+	event: MinimalEventSchema | EventDetailSchema | EventInListSchema
+): string | null {
+	// First priority: Event's own cover art
+	if (event.cover_art) {
+		return event.cover_art;
+	}
+
+	// Second priority: Event series cover art (may not exist in MinimalEventSchema)
+	if ('event_series' in event && event.event_series?.cover_art) {
+		return event.event_series.cover_art;
+	}
+
+	// Third priority: Organization cover art (may not exist in MinimalEventSchema)
+	if ('organization' in event && event.organization?.cover_art) {
+		return event.organization.cover_art;
+	}
+
+	return null;
+}
+
+/**
+ * Get event cover art thumbnail with fallback hierarchy (optimized for card displays):
+ * 1. Event's cover_art_thumbnail_url
+ * 2. Event series' cover_art_thumbnail_url (if event is part of a series)
+ * 3. Organization's cover_art_thumbnail_url
+ *
+ * @param event Event data (can be MinimalEventSchema, EventInListSchema, or EventDetailSchema)
+ * @returns Cover art thumbnail URL path (relative) or null if no thumbnail available
+ */
+export function getEventCoverArtThumbnail(
+	event: MinimalEventSchema | EventDetailSchema | EventInListSchema
+): string | null {
+	// First priority: Event's own cover art thumbnail
+	if (event.cover_art_thumbnail_url) {
+		return event.cover_art_thumbnail_url;
+	}
+
+	// Second priority: Event series cover art thumbnail
+	if ('event_series' in event && event.event_series?.cover_art_thumbnail_url) {
+		return event.event_series.cover_art_thumbnail_url;
+	}
+
+	// Third priority: Organization cover art thumbnail
+	if ('organization' in event && event.organization?.cover_art_thumbnail_url) {
+		return event.organization.cover_art_thumbnail_url;
+	}
+
+	return null;
+}
+
+/**
+ * Get event cover art social variant with fallback hierarchy (optimized for og:image/twitter:image):
+ * 1. Event's cover_art_social_url
+ * 2. Event series' cover_art_social_url (if event is part of a series)
+ * 3. Organization's cover_art_social_url
+ *
+ * @param event Event data (can be MinimalEventSchema, EventInListSchema, or EventDetailSchema)
+ * @returns Cover art social URL path (relative) or null if no social variant available
+ */
+export function getEventCoverArtSocial(
+	event: MinimalEventSchema | EventDetailSchema | EventInListSchema
+): string | null {
+	// First priority: Event's own cover art social variant
+	if (event.cover_art_social_url) {
+		return event.cover_art_social_url;
+	}
+
+	// Second priority: Event series cover art social variant
+	if ('event_series' in event && event.event_series?.cover_art_social_url) {
+		return event.event_series.cover_art_social_url;
+	}
+
+	// Third priority: Organization cover art social variant
+	if ('organization' in event && event.organization?.cover_art_social_url) {
+		return event.organization.cover_art_social_url;
+	}
+
+	return null;
+}

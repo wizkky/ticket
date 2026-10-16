@@ -1,0 +1,311 @@
+import { render, screen, fireEvent } from '@testing-library/svelte';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { tick } from 'svelte';
+import userEvent from '@testing-library/user-event';
+import ImageUploader from './ImageUploader.svelte';
+
+vi.mock('$lib/components/common/ImageCropperModal.svelte', async () => ({
+	default: (await import('./__mocks__/CropperModalStub.svelte')).default
+}));
+
+describe('ImageUploader', () => {
+	// Mock FileReader
+	beforeEach(() => {
+		global.FileReader = class FileReader {
+			readAsDataURL = vi.fn();
+			onloadend: ((this: FileReader, ev: ProgressEvent) => void) | null = null;
+			result: string | ArrayBuffer | null = 'data:image/png;base64,test';
+
+			constructor() {
+				setTimeout(() => {
+					if (this.onloadend) {
+						this.onloadend({} as ProgressEvent);
+					}
+				}, 0);
+			}
+		} as typeof FileReader;
+	});
+
+	it('renders with label', () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Event Banner'
+			}
+		});
+
+		expect(screen.getByText('Event Banner')).toBeInTheDocument();
+	});
+
+	it('shows required indicator when required', () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				required: true
+			}
+		});
+
+		const label = screen.getByText('Banner').parentElement;
+		expect(label?.textContent).toContain('*');
+	});
+
+	it('displays error message', () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				error: 'Image is required'
+			}
+		});
+
+		expect(screen.getByRole('alert')).toHaveTextContent('Image is required');
+	});
+
+	it('shows upload area when no image selected', () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner'
+			}
+		});
+
+		expect(screen.getByRole('button', { name: /upload image/i })).toBeInTheDocument();
+		expect(screen.getByText(/click to upload or drag and drop/i)).toBeInTheDocument();
+	});
+
+	it('shows preview when preview URL provided', () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				preview: 'https://example.com/image.jpg'
+			}
+		});
+
+		const img = screen.getByAltText('Preview') as HTMLImageElement;
+		expect(img).toBeInTheDocument();
+		expect(img.src).toBe('https://example.com/image.jpg');
+	});
+
+	it('calls onFileSelect when file is selected', async () => {
+		const user = userEvent.setup();
+		const handleFileSelect = vi.fn();
+
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				onFileSelect: handleFileSelect
+			}
+		});
+
+		const file = new File(['test'], 'test.jpg', { type: 'image/jpeg' });
+		const input = screen
+			.getByLabelText('Upload image')
+			.closest('div')
+			?.querySelector('input[type="file"]') as HTMLInputElement;
+
+		if (input) {
+			await user.upload(input, file);
+			expect(handleFileSelect).toHaveBeenCalledWith(file);
+		}
+	});
+
+	it('validates file type', async () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				accept: 'image/jpeg,image/png'
+			}
+		});
+
+		const file = new File(['test'], 'test.pdf', { type: 'application/pdf' });
+		const input = screen
+			.getByLabelText('Upload image')
+			.closest('div')
+			?.querySelector('input[type="file"]') as HTMLInputElement;
+
+		if (input) {
+			// This will trigger validation in the component
+			Object.defineProperty(input, 'files', {
+				value: [file],
+				writable: false
+			});
+		}
+	});
+
+	it('validates file size', async () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				maxSize: 1024 // 1KB
+			}
+		});
+
+		// Create a file larger than maxSize
+		const largeContent = new Array(2048).fill('a').join('');
+		const file = new File([largeContent], 'large.jpg', { type: 'image/jpeg' });
+
+		const input = screen
+			.getByLabelText('Upload image')
+			.closest('div')
+			?.querySelector('input[type="file"]') as HTMLInputElement;
+
+		if (input) {
+			Object.defineProperty(input, 'files', {
+				value: [file],
+				writable: false
+			});
+		}
+	});
+
+	it('shows remove button when image is selected', async () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				preview: 'https://example.com/image.jpg'
+			}
+		});
+
+		expect(screen.getByRole('button', { name: /remove image/i })).toBeInTheDocument();
+	});
+
+	it('removes image when remove button clicked', async () => {
+		const user = userEvent.setup();
+		const handleFileSelect = vi.fn();
+
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				preview: 'https://example.com/image.jpg',
+				onFileSelect: handleFileSelect
+			}
+		});
+
+		const removeButton = screen.getByRole('button', { name: /remove image/i });
+		await user.click(removeButton);
+
+		expect(handleFileSelect).toHaveBeenCalledWith(null);
+	});
+
+	it('respects disabled state', () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				disabled: true
+			}
+		});
+
+		const uploadArea = screen.getByRole('button', { name: /upload image/i });
+		expect(uploadArea).toHaveClass('cursor-not-allowed');
+	});
+
+	it('is keyboard accessible', async () => {
+		const user = userEvent.setup();
+
+		render(ImageUploader, {
+			props: {
+				label: 'Banner'
+			}
+		});
+
+		const uploadArea = screen.getByRole('button', { name: /upload image/i });
+
+		// Should be focusable
+		uploadArea.focus();
+		expect(uploadArea).toHaveFocus();
+
+		// Should respond to Enter key
+		await user.keyboard('{Enter}');
+	});
+
+	it('displays file information when file is selected', async () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				value: new File(['test'], 'test.jpg', { type: 'image/jpeg' }),
+				preview: 'data:image/png;base64,test'
+			}
+		});
+
+		expect(screen.getByText('test.jpg')).toBeInTheDocument();
+	});
+
+	it('shows accepted file types in hint', () => {
+		render(ImageUploader, {
+			props: {
+				label: 'Banner',
+				accept: 'image/jpeg,image/png,image/webp'
+			}
+		});
+
+		const hint = screen.getByText(/JPEG, PNG, WEBP/i);
+		expect(hint).toBeInTheDocument();
+	});
+});
+
+describe('ImageUploader crop mode', () => {
+	beforeEach(() => {
+		global.FileReader = class FileReader {
+			readAsDataURL = vi.fn();
+			onloadend: ((this: FileReader, ev: ProgressEvent) => void) | null = null;
+			result: string | ArrayBuffer | null = 'data:image/png;base64,test';
+			constructor() {
+				setTimeout(() => this.onloadend?.({} as ProgressEvent), 0);
+			}
+		} as unknown as typeof FileReader;
+	});
+
+	function selectFile(): void {
+		const input = document.querySelector('input[type="file"]') as HTMLInputElement;
+		const file = new File(['x'], 'pic.png', { type: 'image/png' });
+		Object.defineProperty(input, 'files', { value: [file], configurable: true });
+		fireEvent.change(input);
+	}
+
+	it('does NOT open the cropper and emits the raw file when crop is off', async () => {
+		const onFileSelect = vi.fn();
+		render(ImageUploader, { props: { label: 'Logo', onFileSelect } });
+		selectFile();
+		await tick();
+		expect(screen.queryByTestId('cropper-modal-stub')).not.toBeInTheDocument();
+		expect(onFileSelect).toHaveBeenCalledWith(expect.any(File));
+	});
+
+	it('opens the cropper on select when crop is on', async () => {
+		render(ImageUploader, { props: { label: 'Logo', crop: true } });
+		selectFile();
+		await tick();
+		expect(await screen.findByTestId('cropper-modal-stub')).toBeInTheDocument();
+	});
+
+	it('emits the cropped blob (as a File) when the cropper saves', async () => {
+		const onFileSelect = vi.fn();
+		render(ImageUploader, { props: { label: 'Logo', crop: true, onFileSelect } });
+		selectFile();
+		await tick();
+		(await screen.findByTestId('cropper-save')).click();
+		await tick();
+		expect(onFileSelect).toHaveBeenCalledWith(expect.any(File));
+	});
+
+	it('leaves value untouched when the cropper is cancelled', async () => {
+		const onFileSelect = vi.fn();
+		render(ImageUploader, { props: { label: 'Logo', crop: true, onFileSelect } });
+		selectFile();
+		await tick();
+		(await screen.findByTestId('cropper-cancel')).click();
+		await tick();
+		expect(onFileSelect).not.toHaveBeenCalled();
+	});
+
+	it('rejects a cropped file whose type no longer matches accept', async () => {
+		const onFileSelect = vi.fn();
+		// Original pic.png passes png-only accept; the cropper stub emits image/jpeg,
+		// which must be re-validated and rejected rather than silently emitted.
+		render(ImageUploader, {
+			props: { label: 'Logo', crop: true, accept: 'image/png', onFileSelect }
+		});
+		selectFile();
+		await tick();
+		(await screen.findByTestId('cropper-save')).click();
+		await tick();
+		expect(onFileSelect).not.toHaveBeenCalled();
+		expect(screen.getByRole('alert')).toBeInTheDocument();
+	});
+});

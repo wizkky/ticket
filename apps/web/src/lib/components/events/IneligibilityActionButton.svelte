@@ -1,0 +1,451 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import type { NextStep, EventTokenSchema } from '$lib/api/generated/types.gen';
+	import {
+		getActionButtonText,
+		isActionDisabled,
+		getEligibilityRefusalMessage
+	} from '$lib/utils/eligibility';
+	import { backendMessage, extractApiErrorDetail } from '$lib/utils/api-error-detail';
+	import { cn } from '$lib/utils/cn';
+	import { Button } from '$lib/components/ui/button';
+	import RequestInvitationButton from './RequestInvitationButton.svelte';
+	import RequestWhitelistButton from './RequestWhitelistButton.svelte';
+	import ClaimInvitationButton from './ClaimInvitationButton.svelte';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { eventpublicattendanceJoinWaitlist, eventpublicattendanceLeaveWaitlist } from '$lib/api';
+	import { useQueryClient } from '@tanstack/svelte-query';
+	import { invalidateAll } from '$app/navigation';
+	import { toast } from 'svelte-sonner';
+	import {
+		Check,
+		ClipboardList,
+		Clock,
+		Mail,
+		UserPlus,
+		ListPlus,
+		Bell,
+		Ticket,
+		Loader2,
+		ArrowUpCircle,
+		X,
+		ShieldCheck,
+		UserCircle
+	} from '@lucide/svelte';
+
+	interface Props {
+		nextStep?: NextStep | null;
+		eventId: string;
+		eventSlug: string;
+		organizationSlug: string;
+		organizationName?: string;
+		questionnaireIds?: string[] | null;
+		disabled?: boolean;
+		eventName?: string;
+		eventTokenDetails?: EventTokenSchema | null;
+		onInvitationRequestSuccess?: () => void;
+		onWhitelistRequestSuccess?: () => void;
+		/** Opens the ticket-tier purchase modal (for the `purchase_ticket` step). */
+		onGetTicketsClick?: () => void;
+		class?: string;
+	}
+
+	const {
+		nextStep,
+		eventId,
+		eventSlug,
+		organizationSlug,
+		organizationName = '',
+		questionnaireIds,
+		disabled = false,
+		eventName = '',
+		eventTokenDetails,
+		onInvitationRequestSuccess,
+		onWhitelistRequestSuccess,
+		onGetTicketsClick,
+		class: className
+	}: Props = $props();
+
+	const isAuthenticated = $derived(!!authStore.accessToken);
+	const queryClient = useQueryClient();
+
+	let isLoading = $state(false);
+	let isLeavingWaitlist = $state(false);
+	let showSuccess = $state(false);
+	let showError = $state(false);
+	let errorMessage = $state('');
+	// Backend's own success sentence when it carries one (join-waitlist is
+	// idempotent and says so); falls back to the generic localized copy.
+	let successMessage = $state('');
+
+	/**
+	 * Get the Lucide icon component for the current next_step
+	 */
+	function getIconComponent(step: NextStep) {
+		const iconMap: Record<NextStep, typeof Check> = {
+			rsvp: Check,
+			purchase_ticket: Ticket,
+			complete_questionnaire: ClipboardList,
+			wait_for_questionnaire_evaluation: Clock,
+			wait_to_retake_questionnaire: Clock,
+			request_invitation: Mail,
+			wait_for_invitation_approval: Clock,
+			become_member: UserPlus,
+			join_waitlist: ListPlus,
+			wait_for_open_spot: Clock,
+			wait_for_event_to_open: Bell,
+			upgrade_membership: ArrowUpCircle,
+			request_whitelist: ShieldCheck,
+			wait_for_whitelist_approval: Clock,
+			complete_profile: UserCircle
+		};
+
+		return iconMap[step] || Check;
+	}
+
+	/**
+	 * Get the button variant based on next_step
+	 */
+	function getButtonVariant(
+		step: NextStep
+	): 'default' | 'secondary' | 'destructive' | 'outline' | 'ghost' {
+		// Disabled states use secondary (muted)
+		if (isActionDisabled(step)) {
+			return 'secondary';
+		}
+
+		// Primary actions
+		if (
+			step === 'rsvp' ||
+			step === 'purchase_ticket' ||
+			step === 'complete_questionnaire' ||
+			step === 'request_invitation' ||
+			step === 'become_member' ||
+			step === 'upgrade_membership' ||
+			step === 'join_waitlist' ||
+			step === 'request_whitelist' ||
+			step === 'complete_profile'
+		) {
+			return 'default';
+		}
+
+		return 'outline';
+	}
+
+	/**
+	 * Handle button click action
+	 */
+	async function handleClick() {
+		// Disabled states do nothing
+		if (disabled || (nextStep && isActionDisabled(nextStep)) || isLoading || showSuccess) {
+			return;
+		}
+
+		// If no next step defined, do nothing
+		if (!nextStep) {
+			return;
+		}
+
+		// Clear previous errors
+		showError = false;
+		errorMessage = '';
+		successMessage = '';
+
+		// Navigation actions
+		if (nextStep === 'become_member') {
+			window.location.href = `/org/${organizationSlug}`;
+			return;
+		}
+
+		// The membership-tier gate (BE #807). It refuses non-members and members on
+		// the wrong tier alike, and the payload names neither the tiers required nor
+		// which of the two the buyer is — so the only honest move is the org's
+		// membership plans, where every tier it offers is listed. Until now this
+		// step fell through every branch and the button did nothing.
+		if (nextStep === 'upgrade_membership') {
+			window.location.href = `/org/${organizationSlug}/membership`;
+			return;
+		}
+
+		if (nextStep === 'complete_profile') {
+			// Navigate to profile settings page with redirect back to event
+			const eventUrl =
+				organizationSlug && eventSlug ? `/events/${organizationSlug}/${eventSlug}` : '';
+			const redirectParam = eventUrl ? `?redirect=${encodeURIComponent(eventUrl)}` : '';
+			window.location.href = `/account/profile${redirectParam}`;
+			return;
+		}
+
+		if (nextStep === 'complete_questionnaire') {
+			if (questionnaireIds && questionnaireIds.length > 0 && organizationSlug && eventSlug) {
+				// Navigate to first questionnaire submission page
+				window.location.href = `/events/${organizationSlug}/${eventSlug}/questionnaire/${questionnaireIds[0]}`;
+			} else {
+				// Fallback: navigate back to event if missing data
+				if (organizationSlug && eventSlug) {
+					window.location.href = `/events/${organizationSlug}/${eventSlug}`;
+				}
+			}
+			return;
+		}
+
+		// User is eligible to buy a ticket: open the ticket-tier purchase modal.
+		if (nextStep === 'purchase_ticket') {
+			onGetTicketsClick?.();
+			return;
+		}
+
+		// User is eligible to RSVP: route them to the event page where the RSVP
+		// controls live (this button can appear on summary/eligibility surfaces).
+		if (nextStep === 'rsvp') {
+			if (organizationSlug && eventSlug) {
+				window.location.href = `/events/${organizationSlug}/${eventSlug}`;
+			}
+			return;
+		}
+
+		// request_invitation is handled by RequestInvitationButton component
+		// No action needed here
+		if (nextStep === 'request_invitation') {
+			return;
+		}
+
+		// request_whitelist is handled by RequestWhitelistButton component
+		// No action needed here
+		if (nextStep === 'request_whitelist') {
+			return;
+		}
+
+		if (nextStep === 'join_waitlist') {
+			isLoading = true;
+			try {
+				const response = await eventpublicattendanceJoinWaitlist({
+					path: { event_id: eventId },
+					headers: {
+						Authorization: `Bearer ${authStore.accessToken}`
+					}
+				});
+
+				if (response.error) {
+					// 409: capacity opened up between page load and click — invite refresh.
+					// The public event page is SSR-loaded, so we re-run all load
+					// functions via invalidateAll() and also bust the TanStack cache
+					// keys other components (RequestInvitationButton, EventRSVP, …)
+					// watch.
+					if (response.response?.status === 409) {
+						toast.warning(m['joinWaitlist.capacityOpen'](), {
+							action: {
+								label: m['joinWaitlist.refreshAction'](),
+								onClick: () => {
+									queryClient.invalidateQueries({ queryKey: ['event-status', eventId] });
+									queryClient.invalidateQueries({ queryKey: ['event', eventId] });
+									void invalidateAll();
+								}
+							}
+						});
+					} else {
+						// 400 is declared `EventUserEligibility | ErrorDetail` (backend
+						// #824): probe before reading. The eligibility branch carries the
+						// refusal reason, the ErrorDetail branch a plain sentence, and a
+						// request-validation 422 a list — none of which is a bare string.
+						showError = true;
+						errorMessage =
+							getEligibilityRefusalMessage(response.error) ??
+							extractApiErrorDetail(response.error) ??
+							m['ineligibilityActionButton.waitlist_error']();
+					}
+				} else {
+					// Idempotent since backend #824: a double-submit / lost race now
+					// answers 200 with "You are already on the waitlist for this event."
+					// rather than a 400, so prefer the backend's own sentence — it is the
+					// only thing that distinguishes "you just joined" from "you already
+					// had" — and fall back to the generic success copy.
+					showSuccess = true;
+					successMessage =
+						backendMessage(response.data) ?? m['ineligibilityActionButton.success']();
+					// Optionally refresh the page or update UI to reflect waitlist status
+					setTimeout(() => {
+						window.location.reload();
+					}, 1500);
+				}
+			} catch (err) {
+				showError = true;
+				errorMessage =
+					err instanceof Error ? err.message : m['ineligibilityActionButton.waitlist_error']();
+			} finally {
+				isLoading = false;
+			}
+			return;
+		}
+	}
+
+	/**
+	 * Handle leaving the waitlist
+	 */
+	async function handleLeaveWaitlist() {
+		if (!confirm(m['ineligibilityActionButton.confirmLeaveWaitlist']())) {
+			return;
+		}
+
+		isLeavingWaitlist = true;
+		showError = false;
+		errorMessage = '';
+
+		try {
+			const response = await eventpublicattendanceLeaveWaitlist({
+				path: { event_id: eventId },
+				headers: {
+					Authorization: `Bearer ${authStore.accessToken}`
+				}
+			});
+
+			if (response.error) {
+				showError = true;
+				errorMessage =
+					extractApiErrorDetail(response.error) ??
+					m['ineligibilityActionButton.leaveWaitlist_error']();
+			} else {
+				// Success - reload the page to update the status
+				window.location.reload();
+			}
+		} catch (err) {
+			showError = true;
+			errorMessage =
+				err instanceof Error ? err.message : m['ineligibilityActionButton.leaveWaitlist_error']();
+		} finally {
+			isLeavingWaitlist = false;
+		}
+	}
+
+	// Computed values
+	const IconComponent = $derived(nextStep ? getIconComponent(nextStep) : Check);
+	const buttonText = $derived(
+		showSuccess
+			? m['ineligibilityActionButton.requestSent']()
+			: nextStep
+				? getActionButtonText(nextStep)
+				: 'Continue'
+	);
+	const buttonVariant = $derived(nextStep ? getButtonVariant(nextStep) : 'outline');
+	const isButtonDisabled = $derived(
+		disabled || (nextStep && isActionDisabled(nextStep)) || isLoading || showSuccess
+	);
+</script>
+
+<!--
+  Ineligibility Action Button Component
+
+  Smart CTA button that handles navigation and API calls based on next_step.
+
+  @component
+  @example
+  <IneligibilityActionButton
+    nextStep="request_invitation"
+    eventId={event.id}
+    eventSlug={event.slug}
+    organizationSlug={org.slug}
+    eventName={event.name}
+  />
+-->
+<div class={cn('space-y-2', className)}>
+	<!-- Use ClaimInvitationButton if token is present and grants invitation (highest priority) -->
+	{#if eventTokenDetails && eventTokenDetails.grants_invitation}
+		<ClaimInvitationButton
+			tokenId={eventTokenDetails.id || ''}
+			tokenDetails={eventTokenDetails}
+			class="w-full"
+		/>
+		<!-- Use RequestInvitationButton for invitation requests without token -->
+	{:else if nextStep === 'request_invitation'}
+		<RequestInvitationButton
+			{eventId}
+			eventName={eventName || 'this event'}
+			{isAuthenticated}
+			hasAlreadyRequested={false}
+			onSuccess={onInvitationRequestSuccess}
+			class="w-full"
+		/>
+	{:else if nextStep === 'wait_for_invitation_approval'}
+		<!-- Pending invitation approval status -->
+		<Button variant="secondary" disabled={true} class="w-full">
+			<Clock class="h-5 w-5" aria-hidden="true" />
+			<span>{buttonText}</span>
+		</Button>
+	{:else if nextStep === 'request_whitelist'}
+		<!-- Use RequestWhitelistButton for whitelist/verification requests -->
+		<RequestWhitelistButton
+			{organizationSlug}
+			{organizationName}
+			{eventId}
+			{isAuthenticated}
+			hasAlreadyRequested={false}
+			onSuccess={onWhitelistRequestSuccess}
+			class="w-full"
+		/>
+	{:else if nextStep === 'wait_for_whitelist_approval'}
+		<!-- Pending whitelist/verification approval status -->
+		<Button variant="secondary" disabled={true} class="w-full">
+			<Clock class="h-5 w-5" aria-hidden="true" />
+			<span>{buttonText}</span>
+		</Button>
+	{:else if nextStep === 'wait_for_open_spot'}
+		<!-- Special layout for waitlist status with Leave button below -->
+		<div class="space-y-2">
+			<Button variant="secondary" disabled={true} class="w-full">
+				<Clock class="h-5 w-5" aria-hidden="true" />
+				<span>{buttonText}</span>
+			</Button>
+			<Button
+				variant="destructive"
+				disabled={isLeavingWaitlist}
+				onclick={handleLeaveWaitlist}
+				class="w-full"
+			>
+				{#if isLeavingWaitlist}
+					<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+				{:else}
+					<X class="h-4 w-4" aria-hidden="true" />
+				{/if}
+				<span>{m['ineligibilityActionButton.leave']()}</span>
+			</Button>
+		</div>
+	{:else}
+		<Button
+			variant={buttonVariant}
+			disabled={isButtonDisabled}
+			onclick={handleClick}
+			class="w-full"
+		>
+			{#if isLoading}
+				<Loader2 class="h-5 w-5 animate-spin" aria-hidden="true" />
+			{:else if showSuccess}
+				<Check class="h-5 w-5" aria-hidden="true" />
+			{:else}
+				<IconComponent class="h-5 w-5" aria-hidden="true" />
+			{/if}
+			<span>{buttonText}</span>
+		</Button>
+
+		<!-- Success Message -->
+		{#if showSuccess}
+			<div
+				class="rounded-md bg-success/10 p-3 text-sm text-foreground"
+				role="status"
+				aria-live="polite"
+			>
+				{successMessage || m['ineligibilityActionButton.success']()}
+			</div>
+		{/if}
+
+		<!-- Error Message -->
+		{#if showError && errorMessage}
+			<div
+				class="rounded-md bg-destructive/10 p-3 text-sm text-destructive"
+				role="alert"
+				aria-live="assertive"
+			>
+				{errorMessage}
+			</div>
+		{/if}
+	{/if}
+</div>

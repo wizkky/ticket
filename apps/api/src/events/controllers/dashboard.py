@@ -1,0 +1,355 @@
+# src/events/controllers/dashboard.py
+import typing as t
+from uuid import UUID
+
+from django.db.models import Q, QuerySet
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from ninja import Query
+from ninja.errors import HttpError
+from ninja_extra import (
+    api_controller,
+    route,
+)
+from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseSchema, paginate
+from ninja_extra.searching import Searching, searching
+
+from common.authentication import I18nJWTAuth, ScopedJWTAuth
+from common.controllers import DistinctSearching, UserAwareController
+from common.signing import get_file_url
+from common.throttling import UserDefaultThrottle, WriteThrottle
+from events import filters, models, schema
+from events.service import dashboard_service, event_service, ticket_guest_name_service
+from events.service.attendee_invoice_service import ensure_credit_note_pdf_exists, ensure_pdf_exists
+from oauth.permissions import RequireScope
+
+# Drafts stay hidden; a fully credited invoice flips to CANCELLED but stays the buyer's record (#1012).
+_BUYER_INVOICE_STATUSES = (
+    models.AttendeeInvoice.InvoiceStatus.ISSUED,
+    models.AttendeeInvoice.InvoiceStatus.CANCELLED,
+)
+
+
+@api_controller("/dashboard", auth=ScopedJWTAuth(), permissions=[RequireScope("me:read")])
+class DashboardController(UserAwareController):
+    def get_event_queryset(self, *, include_past: bool = False) -> QuerySet[models.Event]:
+        """Get the event queryset."""
+        return models.Event.objects.for_user(self.user(), include_past=include_past)
+
+    def get_event_series_queryset(self) -> QuerySet[models.EventSeries]:
+        """Get the event series queryset."""
+        return models.EventSeries.objects.for_user(self.user())
+
+    def get_organization_queryset(self) -> QuerySet[models.Organization]:
+        """Get the organization queryset."""
+        return models.Organization.objects.for_user(self.user())
+
+    def get_user_related_events(
+        self, params: filters.DashboardEventsFiltersSchema, *, include_past: bool = False
+    ) -> QuerySet[models.Event]:
+        """Thin wrapper around :func:`dashboard_service.get_user_related_events`."""
+        return dashboard_service.get_user_related_events(self.user(), params, include_past=include_past)
+
+    @route.get(
+        "/organizations",
+        url_name="dashboard_organizations",
+        response=PaginatedResponseSchema[schema.OrganizationRetrieveSchema],
+        # "My Organizations" is organizer data, not personal data, so it answers to
+        # ``org:read`` rather than the controller's ``me:read`` (R-89).
+        permissions=[RequireScope("org:read")],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(DistinctSearching, search_fields=["name", "description", "tags__tag__name"])
+    def dashboard_organizations(
+        self,
+        params: t.Annotated[filters.DashboardOrganizationsFiltersSchema, Query(...)],
+    ) -> QuerySet[models.Organization]:
+        """View organizations for your dashboard filtered by your relationship to them.
+
+        Filter by: organizations you own, are staff of, are a member of, or have pending requests to.
+        Shows only organizations you have permission to view. Use this to display "My Organizations"
+        sections in the UI.
+        """
+        return dashboard_service.get_user_related_organizations(self.user(), params)
+
+    @route.get("/events", url_name="dashboard_events", response=PaginatedResponseSchema[schema.EventInListSchema])
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(
+        DistinctSearching,
+        search_fields=[
+            "name",
+            "description",
+            "event_series__name",
+            "event_series__description",
+            "organization__name",
+            "organization__description",
+            "tags__tag__name",
+        ],
+    )
+    def dashboard_events(
+        self,
+        params: t.Annotated[filters.DashboardEventsFiltersSchema, Query(...)],
+        order_by: t.Literal["start", "-start"] = "start",
+        include_past: bool = False,
+    ) -> QuerySet[models.Event]:
+        """View upcoming events for your dashboard filtered by your relationship to them.
+
+        Filter by: events you're organizing, attending (RSVP'd or have tickets), invited to, or have
+        requested invitations to. Only shows future events you have permission to view. Use this to
+        display "My Events" sections in the UI.
+        """
+        # Get base queryset of user-related events
+        qs = self.get_user_related_events(params, include_past=include_past)
+
+        # Filter to upcoming events only
+        today = timezone.localdate()
+        qs = qs.filter(Q(start__date__gte=today) | Q(start__isnull=True))
+
+        # No .distinct() needed - get_user_related_events already filters by unique IDs
+        return qs.order_by(order_by)
+
+    @route.get("/calendar", url_name="dashboard_calendar", response=list[schema.EventInListSchema])
+    def dashboard_calendar(
+        self,
+        params: t.Annotated[filters.DashboardEventsFiltersSchema, Query(...)],
+        calendar_params: t.Annotated[filters.CalendarParamsSchema, Query(...)],
+    ) -> QuerySet[models.Event]:
+        """View events in a calendar view filtered by your relationship to them.
+
+        Returns events for the specified time period (week, month, or year) that you have a
+        relationship with. If no time parameters are provided, defaults to the current month.
+
+        **Time Parameters:**
+        - `week`: ISO week number (1-53) - uses current year if year parameter not provided.
+        - `month`: Month number (1-12) - uses current year if year parameter not provided.
+        - `year`: Year (e.g., 2025) - returns all events in that year if month/week not specified.
+
+        **Examples:**
+        - `/dashboard/calendar` - Current month's events you're involved with
+        - `/dashboard/calendar?month=12&year=2025` - December 2025 events
+        - `/dashboard/calendar?week=1&year=2025` - Week 1 of 2025
+        - `/dashboard/calendar?year=2025` - All 2025 events
+
+        **Relationship Filters:**
+        Filter by your relationship to events using DashboardEventsFiltersSchema parameters:
+        - `owner`, `staff`, `member` - Events in organizations you have these roles in
+        - `rsvp_yes`, `rsvp_maybe`, `rsvp_no` - Events you've RSVP'd to
+        - `got_ticket`, `got_invitation` - Events you have tickets or invitations for
+
+        Results include both past and future events within the time range, ordered by start time.
+        """
+        # Calculate the date range for calendar view
+        start_datetime, end_datetime = event_service.calculate_calendar_date_range(**calendar_params.model_dump())
+
+        # Get base queryset of user-related events
+        qs = self.get_user_related_events(params, include_past=True)
+
+        # Filter to events within the calendar date range
+        qs = qs.filter(start__gte=start_datetime, start__lt=end_datetime)
+
+        # No .distinct() needed - get_user_related_events already filters by unique IDs
+        return qs.order_by("start")
+
+    @route.get(
+        "/event_series",
+        url_name="dashboard_event_series",
+        response=PaginatedResponseSchema[schema.EventSeriesRetrieveSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(DistinctSearching, search_fields=["name", "description", "tags__tag__name"])
+    def dashboard_event_series(
+        self,
+        params: t.Annotated[filters.DashboardEventSeriesFiltersSchema, Query(...)],
+    ) -> QuerySet[models.EventSeries]:
+        """View event series for your dashboard filtered by your relationship to them.
+
+        Filter by: series you're organizing or series you're attending events in. Shows only
+        series you have permission to view. Use this to display "My Series" sections in the UI.
+        """
+        return dashboard_service.get_user_related_event_series(self.user(), params)
+
+    @route.get(
+        "/invitations",
+        url_name="dashboard_invitations",
+        response=PaginatedResponseSchema[schema.MyEventInvitationSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["event__name", "event__description", "custom_message"])
+    def dashboard_invitations(
+        self,
+        event_id: UUID | None = None,
+        include_past: bool = False,
+        exclude_accepted: bool = True,
+    ) -> QuerySet[models.EventInvitation]:
+        """View your event invitations across all events.
+
+        Returns invitations you've received with event details and any special privileges granted
+        (tier assignment, waived requirements, etc.). By default shows only invitations for upcoming
+        events; set include_past=true to include past events. An event is considered past if its end
+        time has passed. Filter by event_id to see invitations for a specific event.
+
+        By default, invitations are hidden for events where you already have a non-cancelled ticket
+        or a YES RSVP. Set exclude_accepted=false to include them.
+        """
+        return dashboard_service.get_user_invitations(
+            self.user(),
+            event_id=event_id,
+            include_past=include_past,
+            exclude_accepted=exclude_accepted,
+        )
+
+    @route.get(
+        "/tickets",
+        url_name="dashboard_tickets",
+        response=PaginatedResponseSchema[schema.UserTicketSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["event__name", "event__description", "tier__name"])
+    def dashboard_tickets(
+        self,
+        params: t.Annotated[filters.TicketFilterSchema, Query(...)],
+    ) -> QuerySet[models.Ticket]:
+        """View your tickets across all events.
+
+        Returns all your tickets with their current status and event details.
+        By default, shows only tickets for upcoming events; set include_past=true
+        to include past events. An event is considered past if its end time has passed.
+        Supports filtering by status (pending/active/cancelled/checked_in) and
+        payment method. Results are ordered by newest first.
+        """
+        # Use full() manager which includes: event, organization, tier (with venue/sector/city), seat, payment
+        # No .distinct(): every filter/search field is a to-one join, and DISTINCT over the wide
+        # full() select costs ~600ms of Postgres *planning* time per request (#880).
+        qs = models.Ticket.objects.full().filter(user=self.user()).order_by("-created_at")
+        return params.filter(qs)
+
+    @route.patch(
+        "/tickets/{ticket_id}/guest-name",
+        url_name="dashboard_update_ticket_guest_name",
+        # ``me:read`` is a READ scope — its label promises only "See your profile, tickets,
+        # RSVPs, memberships, invoices and payments". A read scope must never be the sole
+        # gate on an unsafe method (a write needs a scope of its own), and no write scope
+        # in the registry covers this, so the route stays session-only (R-99).
+        auth=I18nJWTAuth(),
+        response={200: schema.UserTicketSchema},
+        throttle=WriteThrottle(),
+    )
+    def update_ticket_guest_name(self, ticket_id: UUID, payload: schema.TicketGuestNameUpdateSchema) -> models.Ticket:
+        """Rename the holder on one of your own tickets.
+
+        Clearing the name is only allowed when the event does not require names.
+        """
+        ticket = get_object_or_404(models.Ticket.objects.full(), id=ticket_id, user=self.user())
+        return ticket_guest_name_service.update_guest_name(ticket, payload.guest_name)
+
+    @route.get(
+        "/invitation-requests",
+        url_name="dashboard_invitation_requests",
+        response=PaginatedResponseSchema[schema.EventInvitationRequestSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["event__name", "event__description", "message"])
+    def dashboard_invitation_requests(
+        self,
+        params: t.Annotated[filters.InvitationRequestFilterSchema, Query(...)],
+        event_id: UUID | None = None,
+    ) -> QuerySet[models.EventInvitationRequest]:
+        """View your invitation requests across all events.
+
+        Returns your invitation requests with their current status. By default shows only pending
+        requests; use ?status=approved or ?status=rejected to see decided requests, or omit the
+        status parameter to see all requests. Filter by event_id to see requests for a specific
+        event. Use this to track which events you've requested access to.
+        """
+        qs = models.EventInvitationRequest.objects.with_event_details().filter(user=self.user())
+        if event_id:
+            qs = qs.filter(event_id=event_id)
+        # No .distinct(): all filter/search fields are to-one joins (#880).
+        return params.filter(qs)
+
+    @route.get(
+        "/rsvps",
+        url_name="dashboard_rsvps",
+        response=PaginatedResponseSchema[schema.UserRSVPSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["event__name", "event__description"])
+    def dashboard_rsvps(
+        self,
+        params: t.Annotated[filters.RSVPFilterSchema, Query(...)],
+    ) -> QuerySet[models.EventRSVP]:
+        """View your RSVPs across all events.
+
+        Returns all your RSVPs with their current status and event details.
+        By default, shows only RSVPs for upcoming events; set include_past=true
+        to include past events. An event is considered past if its end time has passed.
+        Supports filtering by status (yes/no/maybe). Results are ordered by newest first.
+        """
+        qs = models.EventRSVP.objects.with_event_details().filter(user=self.user()).order_by("-created_at")
+        # No .distinct(): all filter/search fields are to-one joins (#880).
+        return params.filter(qs)
+
+    @route.get(
+        "/invoices",
+        url_name="dashboard_invoices",
+        response=PaginatedResponseSchema[schema.BuyerAttendeeInvoiceSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    @searching(Searching, search_fields=["invoice_number", "seller_name", "buyer_name", "event__name"])
+    def dashboard_invoices(self) -> QuerySet[models.AttendeeInvoice]:
+        """View your attendee invoices with their credit notes.
+
+        Returns ISSUED and CANCELLED (fully credited) invoices; drafts are not visible to the buyer.
+        """
+        return (
+            models.AttendeeInvoice.objects.filter(user=self.user(), status__in=_BUYER_INVOICE_STATUSES)
+            .prefetch_related("credit_notes")
+            .order_by("-issued_at", "-created_at")
+        )
+
+    @route.get(
+        "/invoices/{invoice_id}/download",
+        url_name="dashboard_invoice_download",
+        response=schema.InvoiceDownloadURLSchema,
+        throttle=UserDefaultThrottle(),
+    )
+    def dashboard_invoice_download(self, invoice_id: UUID) -> schema.InvoiceDownloadURLSchema:
+        """Get a signed download URL for an attendee invoice PDF.
+
+        Generates the PDF on-demand if not yet generated.
+        """
+        invoice = get_object_or_404(
+            models.AttendeeInvoice,
+            id=invoice_id,
+            user=self.user(),
+            status__in=_BUYER_INVOICE_STATUSES,
+        )
+        ensure_pdf_exists(invoice)
+        url = get_file_url(invoice.pdf_file)
+        if not url:
+            raise HttpError(404, str(_("Invoice PDF not available.")))
+        return schema.InvoiceDownloadURLSchema(download_url=url)
+
+    @route.get(
+        "/credit-notes/{credit_note_id}/download",
+        url_name="dashboard_credit_note_download",
+        response=schema.InvoiceDownloadURLSchema,
+        throttle=UserDefaultThrottle(),
+    )
+    def dashboard_credit_note_download(self, credit_note_id: UUID) -> schema.InvoiceDownloadURLSchema:
+        """Get a signed download URL for a credit note on one of your invoices.
+
+        Generates the PDF on-demand if not yet generated.
+        """
+        credit_note = get_object_or_404(
+            models.AttendeeInvoiceCreditNote.objects.select_related("invoice"),
+            id=credit_note_id,
+            invoice__user=self.user(),
+            invoice__status__in=_BUYER_INVOICE_STATUSES,
+        )
+        ensure_credit_note_pdf_exists(credit_note)
+        url = get_file_url(credit_note.pdf_file)
+        if not url:
+            raise HttpError(404, str(_("Credit note PDF not available.")))
+        return schema.InvoiceDownloadURLSchema(download_url=url)

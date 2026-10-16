@@ -1,0 +1,465 @@
+<script lang="ts">
+	import { tick } from 'svelte';
+	import { resolve } from '$app/paths';
+	import { page } from '$app/state';
+	import { applyAction, enhance } from '$app/forms';
+	import type { SubmitFunction } from '@sveltejs/kit';
+	import type { ActionData, PageData } from './$types';
+	import TwoFactorInput from '$lib/components/forms/TwoFactorInput.svelte';
+	import SsoProviderButtons from '$lib/components/auth/SsoProviderButtons.svelte';
+	import { Eye, EyeOff, Loader2, ArrowLeft, ExternalLink } from '@lucide/svelte';
+	import { Card, CardContent } from '$lib/components/ui/card';
+	import AuthBandLayout from '$lib/components/auth/AuthBandLayout.svelte';
+	import { appStore } from '$lib/stores/app.svelte';
+	import {
+		DEMO_ACCOUNTS,
+		DEMO_PASSWORD,
+		DEMO_ACCOUNTS_README_URL
+	} from '$lib/constants/demo-accounts';
+	import * as m from '$lib/paraglide/messages.js';
+	import { SeoHead } from '$lib/seo';
+	import { oidcErrorMessage } from '$lib/utils/oidc-errors';
+	import { withReturnUrl } from '$lib/utils/safe-redirect';
+
+	interface Props {
+		data: PageData;
+		form: ActionData;
+	}
+
+	const { data, form }: Props = $props();
+
+	// Demo mode: the server already knows (data.demo, SSR — so the right
+	// variant renders immediately, no client-side form swap). The appStore
+	// fallback only matters if the server-side /version check failed.
+	const isDemoMode = $derived(data.demo || appStore.isDemoMode);
+
+	// On demo backends the account dropdown is the default variant (SSR-decided,
+	// no hydration-time swap — that was #596). An explicit user click on "Show
+	// login form" flips to the real email/password form; the form variant offers
+	// the inverse "Use a demo account" link. Non-demo backends never see either.
+	let showLoginForm = $state(false);
+	const useDemoDropdown = $derived(isDemoMode && !showLoginForm);
+
+	// A relative form action ("?/login") replaces the query string, so the
+	// returnUrl the server action reads (safeReturnUrl) would be dropped.
+	// Thread it through the action URL for every login/2FA submission.
+	const returnUrlSuffix = $derived.by(() => {
+		const returnUrl = page.url.searchParams.get('returnUrl');
+		return returnUrl ? `&returnUrl=${encodeURIComponent(returnUrl)}` : '';
+	});
+
+	// "Create account" keeps the return target: a user who was sent to
+	// /login?returnUrl=… and registers instead must come back the same way.
+	const registerHref = $derived(
+		withReturnUrl(resolve('/(public)/register', {}), page.url.searchParams.get('returnUrl'))
+	);
+
+	// The backend appends ?error=oidc_<code> to the login redirect when the
+	// OIDC browser flow fails (BE PR #919). null for any non-OIDC/absent code.
+	const oidcError = $derived(oidcErrorMessage(page.url.searchParams.get('error')));
+
+	// Form state. `?email=` seeds the field (a guest checkout/RSVP refused with
+	// guest_account_exists links here with the address that owns the account —
+	// issue #912); a failed action's echo wins over the URL seed.
+	let email = $state(form?.email || page.url.searchParams.get('email') || '');
+	let password = $state('');
+	let rememberMe = $state(form?.rememberMe || false);
+	let showPassword = $state(false);
+	let isSubmitting = $state(false);
+
+	// Demo account selection
+	let selectedAccountEmail = $state('');
+
+	// 2FA state - derive from form
+	const requires2FA = $derived(form?.requires2FA || false);
+	const tempToken = $derived(form?.tempToken || '');
+	let otpCode = $state('');
+
+	// Error handling - type assertion needed due to ActionData union
+	const errors = $derived((form?.errors || {}) as Record<string, string>);
+
+	// Handle demo account selection
+	function selectDemoAccount(accountEmail: string) {
+		selectedAccountEmail = accountEmail;
+		email = accountEmail;
+		password = DEMO_PASSWORD;
+	}
+
+	// Since requires2FA and tempToken are derived, we navigate to reset the form
+	function backToLogin() {
+		window.location.href = '/login';
+	}
+
+	// Shared submit handler for the login / demo / 2FA forms.
+	//
+	// On success the server action issues a redirect (303 → returnUrl). We follow
+	// it with a FULL-PAGE navigation (mirroring the logout flow) rather than a
+	// client-side one. A client-side redirect does not re-run the root layout's
+	// server `load`, so its `auth.hasAccessToken` flag stays `false` and the
+	// navbar keeps rendering the logged-out chrome until a manual refresh. A full
+	// reload re-runs SSR with the freshly-set auth cookie, so the in-memory auth
+	// store bootstraps and the navbar reflects the authenticated session
+	// immediately. See #485.
+	//
+	// Non-redirect results (validation errors, the 2FA-required step) are applied
+	// in-place via `applyAction` so the form updates without a reload.
+	const handleSubmit: SubmitFunction = () => {
+		// Prevent duplicate submissions
+		if (isSubmitting) return;
+		isSubmitting = true;
+
+		return async ({ result }) => {
+			isSubmitting = false;
+			if (result.type === 'redirect') {
+				window.location.href = result.location;
+				return;
+			}
+			await applyAction(result);
+		};
+	};
+</script>
+
+<SeoHead config={data.seo} />
+
+<!-- Colour-block band + floating card (uplift). Copy, form logic, action URLs
+     and every field id/aria wiring below are untouched — this is the shell
+     only. -->
+<AuthBandLayout
+	kicker={m['login.kicker']()}
+	title={requires2FA ? m['login.twoFactorAuth']() : m['login.welcomeBack']()}
+	subtitle={requires2FA ? m['login.enterCodeFromApp']() : m['login.signInToContinue']()}
+>
+	<Card>
+		<CardContent class="space-y-6 p-6 sm:p-8">
+			<!-- Error Summary -->
+			{#if errors.form}
+				<div role="alert" class="rounded-md border border-destructive bg-destructive/10 p-4">
+					<p class="text-sm font-medium text-destructive">{errors.form}</p>
+				</div>
+			{/if}
+
+			{#if oidcError}
+				<div role="alert" class="rounded-md border border-destructive bg-destructive/10 p-4">
+					<p class="text-sm font-medium text-destructive">{oidcError}</p>
+				</div>
+			{/if}
+
+			{#if !requires2FA}
+				{#if useDemoDropdown}
+					<!-- Demo Mode: Account Selector -->
+					<div class="space-y-6">
+						<!-- highlight/20 + highlight/30 border are decorative (no text-contrast
+							     requirement); the body copy and link stay on the default foreground/
+							     primary tokens, both already audited pairs. -->
+						<div
+							class="rounded-md border border-highlight/30 bg-highlight/20 p-4 dark:border-highlight/40 dark:bg-highlight/25"
+						>
+							<p class="text-sm text-foreground">
+								{m['login.demoNotice']()}
+							</p>
+							<!-- eslint-disable svelte/no-navigation-without-resolve -- external URL (off-site); not an internal route -->
+							<a
+								href={DEMO_ACCOUNTS_README_URL}
+								target="_blank"
+								rel="noopener noreferrer"
+								class="mt-2 inline-flex items-center gap-1 text-sm font-medium text-primary underline-offset-4 hover:underline"
+							>
+								{m['login.viewAllTestAccounts']()}
+								<ExternalLink class="h-3 w-3" aria-hidden="true" />
+							</a>
+							<!-- eslint-enable svelte/no-navigation-without-resolve -->
+						</div>
+
+						<form
+							method="POST"
+							action="?/login{returnUrlSuffix}"
+							use:enhance={handleSubmit}
+							class="space-y-4"
+						>
+							<!-- Demo Account Selector -->
+							<div class="space-y-2">
+								<label for="demo-account" class="block text-sm font-medium">
+									{m['login.selectTestAccount']()}
+								</label>
+								<select
+									id="demo-account"
+									bind:value={selectedAccountEmail}
+									onchange={() => selectDemoAccount(selectedAccountEmail)}
+									disabled={isSubmitting}
+									class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+								>
+									<option value="">{m['login.chooseAccount']()}</option>
+									{#each DEMO_ACCOUNTS as account (account.email)}
+										<option value={account.email}>
+											{account.name} ({account.role}{account.organization
+												? ` - ${account.organization}`
+												: ''})
+										</option>
+									{/each}
+								</select>
+							</div>
+
+							<!-- Hidden inputs for form submission -->
+							<input type="hidden" name="email" value={email} />
+							<input type="hidden" name="password" value={password} />
+							<input type="hidden" name="rememberMe" value={rememberMe ? 'on' : ''} />
+
+							<!-- Selected Account Info -->
+							{#if selectedAccountEmail}
+								{@const account = DEMO_ACCOUNTS.find((a) => a.email === selectedAccountEmail)}
+								{#if account}
+									<div class="rounded-md border border-muted bg-muted/30 p-3">
+										<p class="text-sm font-medium">{account.name}</p>
+										<p class="mt-1 text-xs text-muted-foreground">{account.email}</p>
+										{#if account.description}
+											<p class="mt-1 text-xs text-muted-foreground">{account.description}</p>
+										{/if}
+									</div>
+								{/if}
+							{/if}
+
+							<!-- Submit Button -->
+							<button
+								type="submit"
+								disabled={isSubmitting || !selectedAccountEmail}
+								class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+							>
+								{#if isSubmitting}
+									<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+									<span>{m['login.signingIn']()}</span>
+								{:else}
+									<span
+										>{m['login.signInAs']()}
+										{selectedAccountEmail
+											? DEMO_ACCOUNTS.find((a) => a.email === selectedAccountEmail)?.name
+											: 'test user'}</span
+									>
+								{/if}
+							</button>
+						</form>
+
+						<!-- Toggle to the real email/password form -->
+						<div class="text-center text-sm">
+							<button
+								type="button"
+								onclick={() => {
+									showLoginForm = true;
+									// The toggle unmounts itself in the swap — move focus to the
+									// revealed form so keyboard users aren't dropped on <body>.
+									// tick(), not rAF: the input only exists after the swap
+									// flushes, but rAF is paint-bound and under load can fire
+									// seconds late, stealing focus from a field the user (or a
+									// password manager) is already typing into — the same
+									// keystroke-spray bug as the register nudge (#608/#609).
+									// tick()'s microtask resolves before any further input
+									// events can interleave.
+									void tick().then(() => document.getElementById('email')?.focus());
+								}}
+								class="text-primary underline-offset-4 hover:underline focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+							>
+								{m['login.showLoginForm']()}
+							</button>
+						</div>
+					</div>
+				{:else}
+					<!-- Standard Login Form -->
+					<form
+						method="POST"
+						action="?/login{returnUrlSuffix}"
+						use:enhance={handleSubmit}
+						class="space-y-6"
+					>
+						<!-- Email Field -->
+						<div class="space-y-2">
+							<label for="email" class="block text-sm font-medium">
+								{m['login.emailAddress']()}
+							</label>
+							<input
+								id="email"
+								name="email"
+								type="email"
+								autocomplete="email"
+								required
+								bind:value={email}
+								aria-invalid={!!errors.email}
+								aria-describedby={errors.email ? 'email-error' : undefined}
+								disabled={isSubmitting}
+								class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.email
+									? 'border-destructive'
+									: ''}"
+								placeholder={m['login.emailPlaceholder']()}
+							/>
+							{#if errors.email}
+								<p id="email-error" class="text-sm text-destructive" role="alert">
+									{errors.email}
+								</p>
+							{/if}
+						</div>
+
+						<!-- Password Field -->
+						<div class="space-y-2">
+							<div class="flex items-center justify-between">
+								<label for="password" class="block text-sm font-medium">
+									{m['login.password']()}
+								</label>
+								<a
+									href={resolve('/(public)/password-reset', {})}
+									class="text-sm text-primary underline-offset-4 hover:underline"
+								>
+									{m['login.forgotPassword']()}
+								</a>
+							</div>
+							<div class="relative">
+								<input
+									id="password"
+									name="password"
+									type={showPassword ? 'text' : 'password'}
+									autocomplete="current-password"
+									required
+									bind:value={password}
+									onpaste={() => {
+										// Ensure paste always works on mobile
+										// This explicit handler prevents any interference from browser autofill
+										// that might block paste operations on iOS Safari
+									}}
+									aria-invalid={!!errors.password}
+									aria-describedby={errors.password ? 'password-error' : undefined}
+									disabled={isSubmitting}
+									class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 pr-10 text-sm transition-colors placeholder:text-muted-foreground focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50 {errors.password
+										? 'border-destructive'
+										: ''}"
+									placeholder={m['login.passwordPlaceholder']()}
+								/>
+								<button
+									type="button"
+									onclick={() => (showPassword = !showPassword)}
+									class="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+									aria-label={showPassword ? m['login.hidePassword']() : m['login.showPassword']()}
+								>
+									{#if showPassword}
+										<EyeOff class="h-4 w-4" aria-hidden="true" />
+									{:else}
+										<Eye class="h-4 w-4" aria-hidden="true" />
+									{/if}
+								</button>
+							</div>
+							{#if errors.password}
+								<p id="password-error" class="text-sm text-destructive" role="alert">
+									{errors.password}
+								</p>
+							{/if}
+						</div>
+
+						<!-- Remember Me Checkbox -->
+						<div class="flex items-center gap-2">
+							<input
+								id="rememberMe"
+								name="rememberMe"
+								type="checkbox"
+								bind:checked={rememberMe}
+								disabled={isSubmitting}
+								class="h-4 w-4 rounded border-input text-primary transition-colors focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+							/>
+							<label for="rememberMe" class="text-sm"> {m['login.rememberMe']()} </label>
+						</div>
+
+						<!-- Submit Button -->
+						<button
+							type="submit"
+							disabled={isSubmitting}
+							class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							{#if isSubmitting}
+								<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+								<span>{m['login.signingIn']()}</span>
+							{:else}
+								<span>{m['login.signIn']()}</span>
+							{/if}
+						</button>
+					</form>
+
+					{#if isDemoMode}
+						<!-- Inverse toggle back to the demo-account dropdown -->
+						<div class="mt-4 text-center text-sm">
+							<button
+								type="button"
+								onclick={() => {
+									showLoginForm = false;
+									// Same focus hand-off as the inverse toggle above.
+									requestAnimationFrame(() => document.getElementById('demo-account')?.focus());
+								}}
+								class="text-primary underline-offset-4 hover:underline focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+							>
+								{m['login.useADemoAccount']()}
+							</button>
+						</div>
+					{/if}
+				{/if}
+
+				{#if !useDemoDropdown}
+					<!-- SSO stays off the demo-account dropdown variant: it only appears
+					     once the user explicitly switches to the real login form. -->
+					<SsoProviderButtons
+						providers={data.ssoProviders}
+						returnUrl={page.url.searchParams.get('returnUrl')}
+					/>
+				{/if}
+			{:else}
+				<!-- 2FA Verification Form -->
+				<form
+					method="POST"
+					action="?/verify2FA{returnUrlSuffix}"
+					use:enhance={handleSubmit}
+					class="space-y-6"
+				>
+					<input type="hidden" name="tempToken" value={tempToken} />
+					<input type="hidden" name="rememberMe" value={rememberMe ? 'true' : 'false'} />
+
+					<!-- 2FA Code Input -->
+					<TwoFactorInput bind:value={otpCode} error={errors.code} disabled={isSubmitting} />
+
+					<!-- Hidden input for form submission -->
+					<input type="hidden" name="code" value={otpCode} />
+
+					<!-- Action Buttons -->
+					<div class="space-y-3">
+						<button
+							type="submit"
+							disabled={isSubmitting || otpCode.length !== 6}
+							class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							{#if isSubmitting}
+								<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+								<span>{m['login.verifying']()}</span>
+							{:else}
+								<span>{m['login.verifyAndSignIn']()}</span>
+							{/if}
+						</button>
+
+						<button
+							type="button"
+							onclick={backToLogin}
+							disabled={isSubmitting}
+							class="inline-flex h-10 w-full items-center justify-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+						>
+							<ArrowLeft class="h-4 w-4" aria-hidden="true" />
+							<span>{m['login.backToLogin']()}</span>
+						</button>
+					</div>
+				</form>
+			{/if}
+		</CardContent>
+	</Card>
+
+	<!-- Register Link -->
+	{#if !requires2FA}
+		<div class="text-center text-sm">
+			<span class="text-muted-foreground">{m['login.dontHaveAccount']()}</span>
+			<!-- eslint-disable svelte/no-navigation-without-resolve -- href is resolve() output; withReturnUrl only appends the ?returnUrl= query -->
+			<a href={registerHref} class="ml-1 text-primary underline-offset-4 hover:underline">
+				{m['login.createAccount']()}
+			</a>
+			<!-- eslint-enable svelte/no-navigation-without-resolve -->
+		</div>
+	{/if}
+</AuthBandLayout>

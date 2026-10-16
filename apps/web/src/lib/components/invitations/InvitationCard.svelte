@@ -1,0 +1,186 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import * as m from '$lib/paraglide/messages.js';
+	import type { MyEventInvitationSchema } from '$lib/api/generated/types.gen';
+	import { Card } from '$lib/components/ui/card';
+	import { Calendar, MapPin, Ticket, CheckCircle2, ChevronDown, ChevronUp } from '@lucide/svelte';
+	import { getImageUrl } from '$lib/utils/url';
+	import { formatEventDate, formatDate } from '$lib/utils/date';
+	import { getEventLogo, getEventLogoThumbnail } from '$lib/utils/event';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+
+	interface Props {
+		invitation: MyEventInvitationSchema;
+	}
+
+	const { invitation }: Props = $props();
+
+	let messageExpanded = $state(false);
+
+	// Logo with fallback hierarchy: event -> series -> organization
+	// Prefer thumbnail for card display (64x64)
+	const logoThumbnailPath = $derived(getEventLogoThumbnail(invitation.event));
+	const logoPath = $derived(getEventLogo(invitation.event));
+	const logoUrl = $derived(getImageUrl(logoThumbnailPath || logoPath));
+
+	// Format event date. `invitation.event` is an EventInListSchema, which carries
+	// a REQUIRED `timezone` — this card renders the event's OWN local time,
+	// matching EventCard, the event page, and (since BE #862 added `timezone` to
+	// MinimalEventSchema) the dashboard RSVP/ticket cards too. Only the start
+	// instant is shown, so the single-instant helper is the right one.
+	const eventDate = $derived.by(() => {
+		if (!invitation.event.start) return null;
+		return formatEventDate(invitation.event.start, invitation.event.timezone);
+	});
+
+	// Get event location
+	const eventLocation = $derived.by(() => {
+		// venue_name/location are not modeled on the event schema but may be present at runtime
+		const event = invitation.event as typeof invitation.event & {
+			venue_name?: string | null;
+			location?: string | null;
+		};
+		return event.venue_name || event.location || null;
+	});
+
+	// Format created date
+	const createdDate = $derived(formatDate(invitation.created_at));
+
+	// Get privileges granted by this invitation
+	const privileges = $derived.by(() => {
+		const priv: string[] = [];
+		if (invitation.waives_purchase) priv.push(m['invitationCard.privFreeAdmission']());
+		if (invitation.waives_questionnaire) priv.push(m['invitationCard.privNoQuestionnaire']());
+		if (invitation.waives_membership_required) priv.push(m['invitationCard.privNoMembership']());
+		if (invitation.waives_rsvp_deadline) priv.push(m['invitationCard.privExtendedDeadline']());
+		if (invitation.overrides_max_attendees) priv.push(m['invitationCard.privPriorityAccess']());
+		if (invitation.tiers?.length)
+			priv.push(
+				m['invitationCard.privAssignedTiers']({
+					tiers: invitation.tiers.map((t) => t.name).join(', ')
+				})
+			);
+		return priv;
+	});
+</script>
+
+<Card class="group overflow-hidden transition-shadow hover:shadow-poster-lg">
+	<div class="flex flex-col gap-4 p-4 md:p-6">
+		<!-- Header with Event Info -->
+		<div class="flex items-start gap-4">
+			<!-- Event Logo/Icon (with fallback: event -> series -> org) -->
+			<div class="shrink-0">
+				{#if logoUrl}
+					<img src={logoUrl} alt="" class="h-16 w-16 rounded-lg border object-cover" />
+				{:else}
+					<div
+						class="flex h-16 w-16 items-center justify-center rounded-lg bg-primary/10 text-primary"
+					>
+						<Ticket class="h-8 w-8" aria-hidden="true" />
+					</div>
+				{/if}
+			</div>
+
+			<!-- Event Details -->
+			<div class="min-w-0 flex-1">
+				<div class="mb-2">
+					<h3 class="text-lg font-bold">
+						<a
+							href={resolve('/(public)/events/[id]', { id: invitation.event.id })}
+							class="hover:underline focus:underline focus:outline-none"
+						>
+							{invitation.event.name}
+						</a>
+					</h3>
+					<StatusBadge
+						tone="success"
+						label={m['invitationCard.specialInvitation']()}
+						icon={CheckCircle2}
+						size="sm"
+						class="mt-1"
+					/>
+				</div>
+
+				<!-- Event Metadata -->
+				<ul class="space-y-1.5 text-sm">
+					{#if eventDate}
+						<li class="flex items-center gap-2 text-muted-foreground">
+							<Calendar class="h-4 w-4 shrink-0" aria-hidden="true" />
+							<!-- datetime carries the machine-readable start instant; the text
+							     is the localized rendering in the EVENT's timezone. -->
+							<time datetime={invitation.event.start} class="truncate">{eventDate}</time>
+						</li>
+					{/if}
+					{#if eventLocation}
+						<li class="flex items-center gap-2 text-muted-foreground">
+							<MapPin class="h-4 w-4 shrink-0" aria-hidden="true" />
+							<span class="truncate">{eventLocation}</span>
+						</li>
+					{/if}
+				</ul>
+			</div>
+		</div>
+
+		<!-- Custom Message -->
+		{#if invitation.custom_message}
+			<div class="rounded-md border bg-muted/50 p-3">
+				<p
+					id="invitation-message-{invitation.event.id}"
+					class="text-sm italic text-muted-foreground"
+					class:line-clamp-3={!messageExpanded}
+				>
+					"{invitation.custom_message}"
+				</p>
+				{#if invitation.custom_message.length > 150}
+					<button
+						type="button"
+						onclick={() => (messageExpanded = !messageExpanded)}
+						aria-expanded={messageExpanded}
+						aria-controls="invitation-message-{invitation.event.id}"
+						class="mt-1 inline-flex items-center gap-0.5 text-xs font-medium text-primary hover:underline"
+					>
+						{#if messageExpanded}
+							{m['invitationCard.showLess']()}
+							<ChevronUp class="h-3 w-3" aria-hidden="true" />
+						{:else}
+							{m['invitationCard.showMore']()}
+							<ChevronDown class="h-3 w-3" aria-hidden="true" />
+						{/if}
+					</button>
+				{/if}
+			</div>
+		{/if}
+
+		<!-- Privileges/Benefits -->
+		{#if privileges.length > 0}
+			<div>
+				<h4 class="mb-2 text-sm font-semibold">{m['invitationCard.specialPrivileges']()}</h4>
+				<ul class="space-y-1">
+					{#each privileges as privilege (privilege)}
+						<li class="flex items-center gap-2 text-sm">
+							<CheckCircle2 class="h-4 w-4 shrink-0 text-success" aria-hidden="true" />
+							{privilege}
+						</li>
+					{/each}
+				</ul>
+			</div>
+		{/if}
+
+		<!-- Footer -->
+		<div
+			class="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4 text-sm"
+		>
+			<div class="text-muted-foreground">
+				<span class="font-medium">{m['invitationCard.invited']()}</span>
+				<time datetime={invitation.created_at}>{createdDate}</time>
+			</div>
+
+			<a
+				href={resolve('/(public)/events/[id]', { id: invitation.event.id })}
+				class="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+			>
+				{m['invitationCard.viewEvent']()}
+			</a>
+		</div>
+	</div>
+</Card>

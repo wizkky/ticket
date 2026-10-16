@@ -1,0 +1,36 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<p>{% if context.cancellation_source == "user" %}{% blocktranslate with event=context.event_name %}You cancelled your ticket for <strong>{{ event }}</strong>.{% endblocktranslate %}{% elif context.cancellation_source == "stripe_dashboard" %}{% blocktranslate with event=context.event_name %}Your ticket for <strong>{{ event }}</strong> has been cancelled and refunded.{% endblocktranslate %}{% else %}{% blocktranslate with event=context.event_name %}Your ticket for <strong>{{ event }}</strong> has been cancelled.{% endblocktranslate %}{% endif %}</p>
+
+<div class="card card--danger">
+    <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+    <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+    {% if context.event_location %}<div class="info-row">📍 {{ context.event_location }}</div>{% endif %}
+</div>
+
+<div class="card card--danger">
+    <h3 style="margin-top: 0;">{% trans "Cancelled Ticket" %}</h3>
+    <div class="info-row"><span class="label">{% trans "Tier:" %}</span> {{ context.tier_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Ticket ID:" %}</span> <code>{{ context.ticket_id }}</code></div>
+</div>
+
+{% if context.cancellation_reason %}
+<div class="card card--danger">
+    <h3 style="margin-top: 0;">{% trans "Reason" %}</h3>
+    <p>{{ context.cancellation_reason }}</p>
+</div>
+{% endif %}
+
+{% if context.refund_amount %}
+<div class="card">
+    <h3 style="margin-top: 0;">💰 {% trans "Refund Information" %}</h3>
+    <p>{% blocktranslate with amount=context.refund_amount currency=context.payment_currency %}A refund of <strong>{{ amount }} {{ currency }}</strong> will be processed to your original payment method within 5-10 business days.{% endblocktranslate %}</p>
+</div>
+{% endif %}
+
+<center>
+    <a href="{{ context.event_url }}" class="button button--danger">{% trans "View Event Details" %}</a>
+</center>
+{% endblock %}

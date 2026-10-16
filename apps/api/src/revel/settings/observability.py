@@ -1,0 +1,254 @@
+"""Observability settings for Revel.
+
+Configures:
+- Structlog (structured logging with JSON output to stdout, scraped by Alloy)
+- OpenTelemetry (distributed tracing for Tempo)
+- Prometheus (metrics collection)
+- Pyroscope (continuous profiling - DISABLED due to SDK incompatibility)
+"""
+
+import re
+import typing as t
+
+import structlog
+from decouple import config
+
+from .base import DEBUG, DEPLOYMENT_ENVIRONMENT, VERSION
+
+# Observability toggle (FEATURE_OBSERVABILITY) lives in features.py, which is imported
+# before this module. The legacy ENABLE_OBSERVABILITY env var is still honoured there as a
+# deprecated alias. Read the toggle via ``settings.FEATURE_OBSERVABILITY``.
+
+# Sampling configuration
+TRACING_SAMPLE_RATE = config("TRACING_SAMPLE_RATE", default=1.0 if DEBUG else 0.1, cast=float)
+
+# Service identification
+SERVICE_NAME = config("SERVICE_NAME", default="revel")
+SERVICE_VERSION = VERSION
+
+# OpenTelemetry configuration
+OTEL_EXPORTER_OTLP_ENDPOINT = config("OTEL_EXPORTER_OTLP_ENDPOINT", default="http://localhost:4318")
+OTEL_EXPORTER_OTLP_PROTOCOL = config("OTEL_EXPORTER_OTLP_PROTOCOL", default="http/protobuf")
+
+# Pyroscope: disabled (SDK incompatible with Grafana Pyroscope 1.6+)
+
+# Prometheus configuration
+PROMETHEUS_EXPORT_MIGRATIONS = False  # Don't export migration metrics
+
+
+# Structlog configuration
+def scrub_pii(logger: t.Any, method_name: str, event_dict: dict[str, t.Any]) -> dict[str, t.Any]:
+    """Scrub PII from log events.
+
+    Redacts sensitive fields like passwords, card numbers, SSN, etc.
+    """
+    # Fields to completely redact
+    sensitive_keys = [
+        "password",
+        "password2",
+        "password_confirmation",
+        "old_password",
+        "new_password",
+        "card_number",
+        "cvv",
+        "card_cvc",
+        "cvc",
+        "ssn",
+        "social_security_number",
+        "social_security",
+        "secret",
+        "api_key",
+        "token",
+        "access_token",
+        "refresh_token",
+        "authorization",
+        "cookie",
+    ]
+
+    # Recursively scrub nested dicts
+    def _scrub_dict(d: t.Any) -> dict[str, t.Any]:
+        if not isinstance(d, dict):
+            return t.cast(dict[str, t.Any], d)
+
+        for key in list(d.keys()):
+            # Check if key matches sensitive pattern
+            if any(sensitive in key.lower() for sensitive in sensitive_keys):
+                d[key] = "[REDACTED]"
+            # Recursively scrub nested dicts
+            elif isinstance(d[key], dict):
+                d[key] = _scrub_dict(d[key])
+            # Scrub email patterns from string values
+            elif isinstance(d[key], str):
+                # Only scrub emails from non-email fields
+                if "email" not in key.lower():
+                    d[key] = re.sub(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", "[EMAIL]", d[key])
+
+        return t.cast(dict[str, t.Any], d)
+
+    return _scrub_dict(event_dict)
+
+
+def add_app_context(logger: t.Any, method_name: str, event_dict: dict[str, t.Any]) -> dict[str, t.Any]:
+    """Add application-level context to all log events."""
+    event_dict["service"] = SERVICE_NAME
+    event_dict["version"] = SERVICE_VERSION
+    event_dict["environment"] = DEPLOYMENT_ENVIRONMENT
+    return event_dict
+
+
+# Structlog processors for structlog-native loggers.
+#
+# The chain must NOT end with a renderer: these loggers hand their event dict to
+# the stdlib logging machinery, whose ``ProcessorFormatter`` (see LOGGING below)
+# does the one and only JSON rendering. Ending with ``JSONRenderer()`` here used
+# to double-render every structlog-native line: the formatter received an
+# already-serialized JSON string as the ``event``, re-applied the foreign chain
+# (second timestamp, contextvars duplicated at the top level) and wrapped it in
+# a second JSON object — so Loki stored ``{"event": "{\"status_code\": ...}"}``
+# and Alloy could neither promote ``status_code``/``user_id`` nor reduce the
+# line to the message. ``wrap_for_formatter`` passes the dict through intact.
+STRUCTLOG_PROCESSORS = [
+    structlog.contextvars.merge_contextvars,  # Merge context variables
+    structlog.stdlib.add_logger_name,  # Add logger name
+    structlog.stdlib.add_log_level,  # Add log level
+    structlog.stdlib.PositionalArgumentsFormatter(),  # Format positional args
+    structlog.processors.TimeStamper(fmt="iso"),  # Add ISO timestamp
+    structlog.processors.StackInfoRenderer(),  # Render stack info
+    structlog.processors.format_exc_info,  # Format exceptions
+    structlog.processors.UnicodeDecoder(),  # Decode unicode
+    add_app_context,  # Add service/version/environment
+    scrub_pii,  # Scrub PII before serialization
+    structlog.stdlib.ProcessorFormatter.wrap_for_formatter,  # Hand off to ProcessorFormatter (renders JSON once)
+]
+
+# Processors for foreign loggers (Django, Celery, etc.)
+# ``format_exc_info`` is required so standard-library ``log.error(..., exc_info=...)``
+# calls (e.g. Django's ``django.request`` logger on unhandled 500s) emit the
+# traceback as a serializable ``exception`` field rather than dropping it.
+FOREIGN_PRE_CHAIN = [
+    structlog.contextvars.merge_contextvars,
+    structlog.stdlib.add_log_level,
+    structlog.processors.TimeStamper(fmt="iso"),
+    structlog.processors.format_exc_info,
+    add_app_context,
+    scrub_pii,
+]
+
+# Structlog configuration
+structlog.configure(
+    processors=STRUCTLOG_PROCESSORS,  # type: ignore[arg-type]
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+
+
+# Django logging configuration (structlog JSON to stdout, Alloy scrapes from Docker)
+LOGGING_HANDLERS: dict[str, dict[str, t.Any]] = {
+    "console": {
+        "class": "logging.StreamHandler",
+        "formatter": "json",
+    },
+}
+
+# Add file handler for warnings and above when in DEBUG mode
+if DEBUG:
+    LOGGING_HANDLERS["file"] = {
+        "class": "logging.handlers.RotatingFileHandler",
+        "filename": "revel.log",
+        "maxBytes": 10 * 1024 * 1024,  # 10MB
+        "backupCount": 5,
+        "formatter": "json",
+        "level": "WARNING",
+    }
+
+# Determine handlers based on environment
+DEFAULT_HANDLERS = ["console", "file"] if DEBUG else ["console"]
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "json": {
+            "()": structlog.stdlib.ProcessorFormatter,
+            "processor": structlog.processors.JSONRenderer(),
+            "foreign_pre_chain": FOREIGN_PRE_CHAIN,
+        },
+    },
+    "handlers": LOGGING_HANDLERS,
+    "root": {
+        "handlers": DEFAULT_HANDLERS,
+        "level": "INFO",
+    },
+    "loggers": {
+        "django": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "INFO",
+            "propagate": False,
+        },
+        # Django logs unhandled exceptions in views (incl. admin) to ``django.request``
+        # with ``exc_info``. Without this entry, Django's default config sends them to
+        # ``mail_admins`` only — so 500s outside the Ninja API would never reach Loki.
+        #
+        # Level is ERROR (not WARNING) on purpose: Django's ``log_response`` emits 5xx at
+        # ERROR (with ``exc_info``) and 4xx at WARNING, and django-ninja-extra's access
+        # logger is *also* ``django.request`` (logs 4xx/5xx at WARNING). At WARNING this
+        # logger duplicated our own structured ``request_finished`` middleware log for every
+        # 4xx — e.g. a bare ``Not Found: /path`` with no request context (see #480). ERROR
+        # keeps exactly what this entry exists for (admin/non-API 500 tracebacks) and drops
+        # the redundant 4xx noise; API 500s are still captured separately by
+        # ``handle_general_exception`` (structlog, full traceback).
+        "django.request": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "ERROR",
+            "propagate": False,
+        },
+        "django.server": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "WARNING",  # Suppress runserver request logs (we emit our own)
+            "propagate": False,
+        },
+        "gunicorn.access": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "WARNING",  # Suppress gunicorn access logs (we emit our own via middleware)
+            "propagate": False,
+        },
+        "django.db.backends": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "WARNING",  # Only log slow queries/errors
+            "propagate": False,
+        },
+        "celery": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "INFO",
+            "propagate": False,
+        },
+        "urllib3": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "WARNING",  # Reduce noise from HTTP libraries
+            "propagate": False,
+        },
+        # Reduce noise from verbose libraries
+        "silk.middleware": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "WARNING",  # Silk is very noisy - only warnings/errors
+            "propagate": False,
+        },
+        "silk.model_factory": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "ERROR",  # Even noisier - only errors
+            "propagate": False,
+        },
+        "asyncio": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "WARNING",
+            "propagate": False,
+        },
+        "multipart": {
+            "handlers": DEFAULT_HANDLERS,
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+}

@@ -1,0 +1,357 @@
+"""This module contains the business logic for evaluating questionnaire submissions."""
+
+import typing as t
+from decimal import Decimal
+from uuid import UUID
+
+import structlog
+from django.db import transaction
+from django.db.models import Prefetch
+
+from questionnaires.llms.llm_interfaces import AnswerToEvaluate, EvaluationResponse, FreeTextEvaluator
+from questionnaires.utils.applicability import compute_applicable_ids
+
+from .models import (
+    EvaluationAuditData,
+    FileUploadQuestion,
+    FreeTextQuestion,
+    MultipleChoiceQuestion,
+    Questionnaire,
+    QuestionnaireEvaluation,
+    QuestionnaireSection,
+    QuestionnaireSubmission,
+)
+
+logger = structlog.get_logger(__name__)
+
+# Sentinel score written when a submission hard-fails (a fatal evaluation error, or a
+# mandatory question left unanswered). It is NOT a percentage: it sits below the 0-100 band
+# so it can never be mistaken for a genuine result, and the manual ``EvaluationCreateSchema.score``
+# is bounded 0-100 so a human evaluator cannot produce it. The cause of the hard fail is recorded
+# separately in the audit fields (``missing_mandatory`` / the fatal-error flag).
+HARD_FAIL_SCORE: t.Final = Decimal("-100.0")
+
+# ---- The Evaluation Service Class ----
+
+
+class SubmissionEvaluator:
+    """A service class to encapsulate the logic for evaluating a questionnaire submission.
+
+    This class orchestrates scoring for all question types, interacts with a
+    pluggable LLM backend for free-text evaluation, and correctly sets the
+    final or proposed status based on the questionnaire's evaluation mode.
+    """
+
+    def __init__(self, submission: QuestionnaireSubmission, llm_evaluator: FreeTextEvaluator | None = None):
+        """Initialize the evaluator."""
+        if submission.status != QuestionnaireSubmission.QuestionnaireSubmissionStatus.READY:
+            raise ValueError("Only submitted questionnaires can be evaluated.")
+
+        self.submission = submission
+        self.llm_evaluator = llm_evaluator if llm_evaluator else submission.questionnaire.get_llm_backend()
+        self.questionnaire = Questionnaire.objects.prefetch_related(
+            Prefetch(
+                "multiplechoicequestion_questions",
+                queryset=MultipleChoiceQuestion.objects.prefetch_related("options"),
+            ),
+            Prefetch(
+                "freetextquestion_questions",
+                queryset=FreeTextQuestion.objects.all(),
+            ),
+            Prefetch(
+                "fileuploadquestion_questions",
+                queryset=FileUploadQuestion.objects.all(),
+            ),
+            Prefetch(
+                "sections",
+                queryset=QuestionnaireSection.objects.all(),
+            ),
+        ).get(pk=submission.questionnaire_id)
+
+        # Initialize state
+        self.mc_points_scored = Decimal("0.0")
+        self.max_mc_points = Decimal("0.0")
+        self.ft_points_scored = Decimal("0.0")
+        self.max_ft_points = Decimal("0.0")
+        # File upload questions are currently informational only (no scoring)
+        # Future: add fu_points_scored and max_fu_points when LLM evaluation is added
+        self.llm_batch_response: EvaluationResponse | None = None
+        self.fatal_error = False
+        self.missing_mandatory: list[UUID] = []
+
+        # Compute applicable questions based on conditional dependencies
+        self._selected_option_ids: set[UUID] = set()
+        self._applicable_section_ids: set[UUID] = set()
+        self._applicable_mcq_ids: set[UUID] = set()
+        self._applicable_ftq_ids: set[UUID] = set()
+        self._applicable_fuq_ids: set[UUID] = set()
+        self._compute_applicable_questions()
+
+    def _compute_applicable_questions(self) -> None:
+        """Compute which questions are applicable, from the answers already persisted.
+
+        The predicate itself lives in :func:`questionnaires.utils.applicability.compute_applicable_ids`
+        so that the evaluator and the submit path cannot drift apart; only the
+        source of the selected options differs (persisted answers here, the
+        inbound payload there).
+        """
+        # Get all selected option IDs from the submission
+        self._selected_option_ids = set(
+            self.submission.multiplechoiceanswer_answers.values_list("option_id", flat=True)
+        )
+
+        applicable = compute_applicable_ids(
+            sections=self.questionnaire.sections.all(),
+            mc_questions=self.questionnaire.multiplechoicequestion_questions.all(),
+            ft_questions=self.questionnaire.freetextquestion_questions.all(),
+            fu_questions=self.questionnaire.fileuploadquestion_questions.all(),
+            selected_option_ids=self._selected_option_ids,
+        )
+        self._applicable_section_ids = applicable.sections
+        self._applicable_mcq_ids = applicable.multiple_choice
+        self._applicable_ftq_ids = applicable.free_text
+        self._applicable_fuq_ids = applicable.file_upload
+
+        logger.debug(
+            "questionnaire_applicable_questions_computed",
+            submission_id=str(self.submission.id),
+            selected_options=len(self._selected_option_ids),
+            applicable_sections=len(self._applicable_section_ids),
+            applicable_mcq=len(self._applicable_mcq_ids),
+            applicable_ftq=len(self._applicable_ftq_ids),
+            applicable_fuq=len(self._applicable_fuq_ids),
+        )
+
+    @transaction.atomic
+    def evaluate(self) -> QuestionnaireEvaluation:
+        """Main entry point to run the entire evaluation process.
+
+        This method is atomic to ensure the evaluation is an all-or-nothing operation.
+        """
+        logger.info(
+            "questionnaire_evaluation_started",
+            submission_id=str(self.submission.id),
+            questionnaire_id=str(self.questionnaire.id),
+            user_id=str(self.submission.user_id),
+        )
+        # First, check for a hard failure condition: unanswered mandatory questions.
+        self._check_for_missing_mandatory_answers()
+
+        # We proceed with scoring to provide a partial score for audit purposes,
+        # but the final result will be overridden if a mandatory question was missed.
+        self._evaluate_mc_answers()
+        self._evaluate_ft_answers_in_batch()
+        evaluation = self._create_or_update_evaluation()
+        logger.info(
+            "questionnaire_evaluation_completed",
+            submission_id=str(self.submission.id),
+            evaluation_id=str(evaluation.id),
+            score=float(evaluation.score or 0),
+            status=evaluation.status,
+        )
+        return evaluation
+
+    def _check_for_missing_mandatory_answers(self) -> None:
+        """Checks if any applicable mandatory questions were left unanswered.
+
+        Only checks questions that are applicable based on conditional dependencies.
+        A mandatory question that wasn't shown (condition not met) doesn't fail the submission.
+        """
+        # Get IDs of all mandatory questions that are also applicable
+        mandatory_mcq_ids = {
+            q.id
+            for q in self.questionnaire.multiplechoicequestion_questions.all()
+            if q.is_mandatory and q.id in self._applicable_mcq_ids
+        }
+        mandatory_ftq_ids = {
+            q.id
+            for q in self.questionnaire.freetextquestion_questions.all()
+            if q.is_mandatory and q.id in self._applicable_ftq_ids
+        }
+        mandatory_fuq_ids = {
+            q.id
+            for q in self.questionnaire.fileuploadquestion_questions.all()
+            if q.is_mandatory and q.id in self._applicable_fuq_ids
+        }
+
+        # Get IDs of all answered questions from the submission
+        answered_mcq_ids = set(self.submission.multiplechoiceanswer_answers.values_list("question_id", flat=True))
+        answered_ftq_ids = set(self.submission.freetextanswer_answers.values_list("question_id", flat=True))
+        answered_fuq_ids = set(self.submission.fileuploadanswer_answers.values_list("question_id", flat=True))
+
+        # If the difference between the sets is not empty, a mandatory question was missed
+        missing_mandatory_mcq = mandatory_mcq_ids - answered_mcq_ids
+        missing_mandatory_ftq = mandatory_ftq_ids - answered_ftq_ids
+        missing_mandatory_fuq = mandatory_fuq_ids - answered_fuq_ids
+        if missing_mandatory_ftq or missing_mandatory_mcq or missing_mandatory_fuq:
+            self.missing_mandatory = (
+                list(missing_mandatory_mcq) + list(missing_mandatory_ftq) + list(missing_mandatory_fuq)
+            )
+            logger.warning(
+                "questionnaire_missing_mandatory_questions",
+                submission_id=str(self.submission.id),
+                missing_count=len(self.missing_mandatory),
+            )
+
+    def _evaluate_mc_answers(self) -> None:
+        """Scores all applicable multiple-choice answers in the submission."""
+        # Only count max points for applicable questions
+        self.max_mc_points = sum(
+            q.positive_weight
+            for q in self.questionnaire.multiplechoicequestion_questions.all()
+            if q.id in self._applicable_mcq_ids
+        ) or Decimal("0.0")
+
+        # If we already know the submission fails on a mandatory check, don't bother scoring.
+        if self.missing_mandatory:
+            return
+
+        # Award each question's positive_weight AT MOST ONCE, even when the question
+        # allows multiple answers and several correct options were selected. Scoring per
+        # answer row would let a multi-correct question contribute N× its weight against a
+        # denominator that counts it once, inflating the score above 100% (see max_mc_points).
+        awarded_positive: set[UUID] = set()
+        for answer in self.submission.multiplechoiceanswer_answers.all().select_related("option", "question"):
+            # Only score applicable questions
+            if answer.question_id not in self._applicable_mcq_ids:
+                continue
+            if answer.option.is_correct:
+                if answer.question_id not in awarded_positive:
+                    self.mc_points_scored += answer.question.positive_weight
+                    awarded_positive.add(answer.question_id)
+            else:
+                self.mc_points_scored -= answer.question.negative_weight
+                self._fatalize(answer.question)
+
+    def _evaluate_ft_answers_in_batch(self) -> None:
+        """Evaluates all applicable free-text answers in a single batch call."""
+        # Only evaluate answers for applicable questions
+        answers_to_evaluate = [
+            answer
+            for answer in self.submission.freetextanswer_answers.all().select_related("question")
+            if answer.question_id in self._applicable_ftq_ids
+        ]
+        if not answers_to_evaluate:
+            return
+
+        # Only count max points for applicable questions
+        self.max_ft_points = sum(
+            q.positive_weight
+            for q in self.questionnaire.freetextquestion_questions.all()
+            if q.id in self._applicable_ftq_ids
+        ) or Decimal("0.0")
+
+        # If we already know the submission fails on a mandatory check, don't waste tokens.
+        if self._missing_mandatory_or_fatal():
+            return
+
+        questions_for_llm = [
+            AnswerToEvaluate(
+                question_id=answer.question_id,
+                question_text=answer.question.question,
+                answer_text=answer.answer,
+                guidelines=answer.question.llm_guidelines,
+            )
+            for answer in answers_to_evaluate
+        ]
+
+        logger.info(
+            "questionnaire_llm_evaluation_started",
+            submission_id=str(self.submission.id),
+            question_count=len(questions_for_llm),
+            llm_backend=self.llm_evaluator.__class__.__name__,
+        )
+        self.llm_batch_response = self.llm_evaluator.evaluate(
+            questions_to_evaluate=questions_for_llm,
+            questionnaire_guidelines=self.questionnaire.llm_guidelines,
+        )
+        logger.info(
+            "questionnaire_llm_evaluation_completed",
+            submission_id=str(self.submission.id),
+        )
+
+        results_map = {result.question_id: result for result in self.llm_batch_response.evaluations}
+        for answer in answers_to_evaluate:
+            result = results_map.get(answer.question_id)
+            if result:  # pragma: no branch
+                if result.is_passing:
+                    self.ft_points_scored += answer.question.positive_weight
+                else:
+                    self.ft_points_scored -= answer.question.negative_weight
+                    self._fatalize(answer.question)
+
+    def _missing_mandatory_or_fatal(self) -> bool:
+        return bool(self.missing_mandatory) or self.fatal_error
+
+    def _fatalize(self, question: FreeTextQuestion | MultipleChoiceQuestion) -> None:
+        if question.is_fatal:
+            self.fatal_error = True
+
+    def _create_or_update_evaluation(self) -> QuestionnaireEvaluation:
+        """Creates or updates the QuestionnaireEvaluation object.
+
+        Applies the business logic for different evaluation modes and storing the audit trail.
+
+        Returns:
+            QuestionnaireEvaluation
+        """
+        total_points_scored = self.mc_points_scored + self.ft_points_scored
+        total_max_points = self.max_mc_points + self.max_ft_points
+
+        # Calculate final score and proposed pass/fail status
+        if self.fatal_error or self.missing_mandatory:
+            score_percent = HARD_FAIL_SCORE
+        else:
+            score_percent = (
+                ((total_points_scored / total_max_points) * Decimal("100.0"))
+                if total_max_points > 0
+                else Decimal("100.0")
+            )
+            # Defense-in-depth: a score can never exceed 100%.
+            score_percent = min(score_percent, Decimal("100.0"))
+
+        passed = score_percent >= self.questionnaire.min_score
+        proposed_status = (
+            QuestionnaireEvaluation.QuestionnaireEvaluationProposedStatus.APPROVED
+            if passed
+            else QuestionnaireEvaluation.QuestionnaireEvaluationProposedStatus.REJECTED
+        )
+
+        # Build the structured audit data object
+        # NEW: Pass the `missing_mandatory` flag to the audit data.
+        audit_data = EvaluationAuditData(
+            mc_points_scored=self.mc_points_scored,
+            max_mc_points=self.max_mc_points,
+            ft_points_scored=self.ft_points_scored,
+            max_ft_points=self.max_ft_points,
+            llm_response=self.llm_batch_response,
+            missing_mandatory=self.missing_mandatory,  # <-- ADD THIS
+        )
+
+        # Prepare data for the database model
+        evaluation_data = {
+            "score": score_percent,
+            "proposed_status": proposed_status,
+            "raw_evaluation_data": audit_data.model_dump(mode="json"),
+            "automatically_evaluated": True,
+        }
+
+        # Apply logic for different evaluation modes
+        missing_mandatory_str = " One or more mandatory questions were not answered." if self.missing_mandatory else ""
+        if self.questionnaire.evaluation_mode == Questionnaire.QuestionnaireEvaluationMode.AUTOMATIC:
+            evaluation_data["status"] = proposed_status
+            evaluation_data["comments"] = (
+                f"This submission was automatically evaluated and finalized.{missing_mandatory_str}"
+            )
+
+        else:  # HYBRID or MANUAL
+            evaluation_data["status"] = QuestionnaireEvaluation.QuestionnaireEvaluationStatus.PENDING_REVIEW
+            evaluation_data["comments"] = (
+                f"This submission was automatically evaluated and is pending human review.{missing_mandatory_str}"
+            )
+
+        evaluation, _ = QuestionnaireEvaluation.objects.select_related("submission").update_or_create(
+            submission=self.submission,
+            defaults=evaluation_data,
+        )
+        return evaluation

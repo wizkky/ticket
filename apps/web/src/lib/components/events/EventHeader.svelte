@@ -1,0 +1,233 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import * as m from '$lib/paraglide/messages.js';
+	import type { EventDetailSchema } from '$lib/api/generated/types.gen';
+	import { formatEventDate, formatEventDateRange } from '$lib/utils/date';
+	import { cityPartsNotIn, getEventFallbackGradient, getEventCoverArt } from '$lib/utils/event';
+	import { asHttpUrl, getImageUrl } from '$lib/utils/url';
+	import { downloadRevelEventICalFile } from '$lib/utils/ical';
+	import { MapPin, Calendar, Share2, ExternalLink } from '@lucide/svelte';
+	import { cn } from '$lib/utils/cn';
+	import { toast } from 'svelte-sonner';
+
+	interface Props {
+		event: EventDetailSchema;
+		class?: string;
+	}
+
+	const { event, class: className }: Props = $props();
+
+	// Cover art with fallback hierarchy: event -> series -> organization
+	const coverArtPath = $derived(getEventCoverArt(event));
+	const coverImageUrl = $derived(getImageUrl(coverArtPath));
+
+	// Compute location display - prioritize venue info when available
+	const locationDisplay = $derived.by(() => {
+		// If event has a venue, use venue's information
+		if (event.venue) {
+			const venueName = event.venue.name;
+			// Use venue's city if available, otherwise fall back to event's city
+			const city = event.venue.city || event.city;
+			if (city) {
+				const cityCountry = city.country ? `${city.name}, ${city.country}` : city.name;
+				return `${venueName}, ${cityCountry}`;
+			}
+			return venueName;
+		}
+
+		// Fall back to event's address/city. A virtual event's address holding a
+		// join URL (#830) is not a place — keep the raw link out of the header
+		// line (EventQuickInfo renders it as a proper anchor) and say "Virtual
+		// event" instead of "Location TBD" when nothing physical remains.
+		const address = event.is_virtual && asHttpUrl(event.address) ? null : event.address;
+		const emptyLabel = event.is_virtual
+			? m['eventHeader.virtualEvent']()
+			: m['eventHeader.locationTbd']();
+		if (!event.city) return address || emptyLabel;
+		// Skip city/country the free-text address already spells out.
+		return [address, ...cityPartsNotIn(address, event.city)].filter(Boolean).join(', ');
+	});
+
+	// Compute maps URL - prioritize event's URL, fall back to venue's URL
+	const mapsUrl = $derived(event.location_maps_url || event.venue?.location_maps_url || null);
+
+	// Date range, rendered in the event's own timezone (#474). The abbreviation is
+	// suppressed here because EventDetails on the same page carries the canonical
+	// "Times shown in {place} ({offset})" label — avoids showing the tz twice.
+	const dateRange = $derived(
+		event.is_open_ended
+			? formatEventDate(event.start, event.timezone, false)
+			: formatEventDateRange(event.start, event.end, event.timezone, false)
+	);
+
+	// Fallback gradient if no cover art
+	const fallbackGradient = $derived(getEventFallbackGradient(event.id));
+
+	// Copy event link to clipboard
+	async function handleShare(): Promise<void> {
+		try {
+			await navigator.clipboard.writeText(window.location.href);
+			toast.success(m['eventHeader.linkCopiedToClipboard']());
+		} catch {
+			toast.error(m['eventHeader.failedToCopyLink']());
+		}
+	}
+
+	// Download iCal file for this event
+	function handleDownloadCalendar(): void {
+		downloadRevelEventICalFile(event);
+	}
+</script>
+
+<header class={cn('relative w-full overflow-hidden', className)}>
+	<!-- Cover Image or Gradient -->
+	<div class="relative mx-auto h-64 w-full max-w-[1920px] md:h-96">
+		{#if coverImageUrl}
+			<img
+				src={coverImageUrl}
+				alt={m['eventHeader.coverImageAlt']({ name: event.name })}
+				class="h-full w-full object-cover object-center"
+				loading="eager"
+			/>
+			<!-- Gradient overlay for text contrast -->
+			<div
+				class="absolute inset-0 bg-gradient-to-t from-poster-ink/85 via-poster-ink/45 to-transparent"
+			></div>
+		{:else}
+			<!-- Fallback cover. The direction utility was missing here, so the colour
+			     stops painted nothing and the hero rendered on bare background;
+			     restored alongside the poster ramp. The scrim now matches the
+			     cover-image branch, and the type block sits in the bottom third
+			     where `from-poster-ink/85` applies. Hand-computed against the
+			     LIGHTEST stop in the ramp (lavender, 68% L), because a composited
+			     alpha is invisible to scripts/audit-brand-themes.py:
+			       ink@85% over lavender → 14.1:1 vs white, 11.7:1 vs white/90
+			       ink@45% over lavender (mid-gradient) → 6.7:1 / 5.8:1
+			     so every text layer here clears AA on every cover. -->
+			<div class="h-full w-full bg-gradient-to-br {fallbackGradient}"></div>
+			<div
+				class="absolute inset-0 bg-gradient-to-t from-poster-ink/85 via-poster-ink/45 to-poster-ink/20"
+			></div>
+		{/if}
+
+		<!-- Header Content Overlay -->
+		<div class="absolute inset-0 flex flex-col justify-end p-6 pb-12 md:p-8">
+			<div class="max-w-4xl">
+				<!-- Kicker: who is putting this on. The organization badge below the
+				     cover repeats it as a link; up here it is the eyebrow that gives
+				     the display title something to sit on. -->
+				<p class="mb-1 text-sm font-extrabold uppercase tracking-[0.12em] text-poster-white/90">
+					{event.organization.name}
+				</p>
+
+				<!-- Event Name -->
+				<h1
+					class="mb-3 text-3xl font-black leading-[1.12] text-poster-white sm:text-4xl lg:text-5xl"
+				>
+					{event.name}
+				</h1>
+
+				<!-- Metadata Row -->
+				<div class="flex flex-col gap-2 text-sm text-poster-white/90 md:text-base">
+					<!-- Date (clickable to download iCal) -->
+					<button
+						type="button"
+						onclick={handleDownloadCalendar}
+						class="group flex items-center gap-2 transition-colors hover:text-poster-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-poster-white focus-visible:ring-offset-2 focus-visible:ring-offset-poster-ink/50"
+						title={m['eventHeader.downloadCalendarEventTitle']()}
+						aria-label={m['eventHeader.downloadCalendarEventFor']({ name: event.name })}
+					>
+						<Calendar class="h-5 w-5 shrink-0" aria-hidden="true" />
+						<time datetime={event.start} class="group-hover:underline">{dateRange}</time>
+						{#if event.is_open_ended}
+							<span class="ml-1 text-sm opacity-90">· {m['eventDetails.openEnded']()}</span>
+						{/if}
+					</button>
+
+					<!-- Location -->
+					{#if mapsUrl}
+						<!-- eslint-disable svelte/no-navigation-without-resolve -- external URL (off-site); not an internal route -->
+						<a
+							href={mapsUrl}
+							target="_blank"
+							rel="noopener noreferrer"
+							class="group flex items-center gap-2 transition-colors hover:text-poster-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-poster-white focus-visible:ring-offset-2 focus-visible:ring-offset-poster-ink/50"
+							aria-label="{locationDisplay} - {m['eventQuickInfo.openInMaps']()}"
+						>
+							<MapPin class="h-5 w-5 shrink-0" aria-hidden="true" />
+							<span class="group-hover:underline">{locationDisplay}</span>
+							<ExternalLink class="h-4 w-4 opacity-70 group-hover:opacity-100" aria-hidden="true" />
+						</a>
+						<!-- eslint-enable svelte/no-navigation-without-resolve -->
+					{:else}
+						<div class="flex items-center gap-2">
+							<MapPin class="h-5 w-5 shrink-0" aria-hidden="true" />
+							<span>{locationDisplay}</span>
+						</div>
+					{/if}
+				</div>
+			</div>
+
+			<!-- Share Button (Desktop) -->
+			<button
+				type="button"
+				onclick={handleShare}
+				class="absolute right-6 top-6 hidden rounded-full bg-poster-white/20 p-3 backdrop-blur-sm transition-colors hover:bg-poster-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-poster-white focus-visible:ring-offset-2 focus-visible:ring-offset-poster-ink/50 md:block"
+				aria-label={m['eventHeader.shareEvent']()}
+			>
+				<Share2 class="h-5 w-5 text-poster-white" aria-hidden="true" />
+			</button>
+		</div>
+	</div>
+
+	<!--
+		Poster ribbon (uplift prototype). A solid brand-purple color block under
+		the cover, carrying the organization chip as a tilted white sticker — the
+		landing's move, applied to the app's most public page. The ribbon and the
+		chip are mode-INERT by the imagery rule (they are a poster panel, not a
+		surface); every pair on them is hand-verified against the fixed values,
+		since a poster-palette pair is invisible to scripts/audit-brand-themes.py
+		(numbers are the audit script's own, for the HSL tokens):
+		  ink on white                   → 17.40:1
+		  Hearty Purple #8C3CDD on white →  5.52:1 (the text-xs kicker clears AA)
+		  white on crimson-DEEP          →  4.59:1 (the logo-less initial tile)
+		The initial tile's gradient ends on `crimson-deep`, not raw
+		`poster-crimson`: white on raw Light Crimson is 4.33:1, which fails AA
+		for the tile's 18px bold letter — the exact trap app.css documents at
+		the `--poster-crimson-deep` declaration. This is the DEFAULT rendering
+		for any org without a logo, not an edge case.
+		Note: always the ORGANIZATION logo/initial, never the event's.
+	-->
+	<div class="bg-poster-purple">
+		<div class="relative mx-auto max-w-[1920px] px-6 pb-6 md:px-8">
+			<a
+				href={resolve('/(public)/org/[slug]', { slug: event.organization.slug })}
+				class="group -mt-8 inline-flex -rotate-1 items-center gap-3 rounded-[1.25rem] bg-poster-white p-3 shadow-poster-lg transition-transform hover:rotate-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-poster-white focus-visible:ring-offset-2 focus-visible:ring-offset-poster-purple"
+			>
+				{#if event.organization.logo}
+					{@const org = event.organization}
+					<img
+						src={getImageUrl(org.logo_thumbnail_url || event.organization.logo) || ''}
+						alt={m['eventHeader.organizationLogoAlt']({ name: event.organization.name })}
+						class="h-12 w-12 rounded-md object-cover"
+					/>
+				{:else}
+					<div
+						class="flex h-12 w-12 items-center justify-center rounded-md bg-gradient-to-br from-poster-purple to-poster-crimson-deep text-lg font-black text-poster-white"
+					>
+						{event.organization.name.charAt(0).toUpperCase()}
+					</div>
+				{/if}
+
+				<div class="flex flex-col pr-2">
+					<span class="text-xs font-extrabold uppercase tracking-[0.12em] text-poster-purple">
+						{m['eventHeader.organizedBy']()}
+					</span>
+					<span class="font-extrabold text-poster-ink">
+						{event.organization.name}
+					</span>
+				</div>
+			</a>
+		</div>
+	</div>
+</header>

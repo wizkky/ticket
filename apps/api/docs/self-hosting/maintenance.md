@@ -1,0 +1,94 @@
+# Maintenance
+
+Day-to-day operation of a self-hosted instance: backups and restores, upgrades, refreshing geo
+data, and the dataset attribution you are required to keep.
+
+## Backups
+
+The `infra` repo ships a `deploy.sh` helper that wraps the common operations.
+
+```bash
+./deploy.sh backup
+```
+
+This dumps the PostgreSQL database to a timestamped file. Run it on a schedule (cron) and copy the
+dumps off the box — a backup that only lives on the server it backs up is not a backup.
+
+### Restore
+
+Restore a dump with `psql` against the running Postgres container:
+
+```bash
+# Copy the dump into the container (or mount it), then:
+docker compose exec -T revel_postgres psql -U <DB_USER> -d <DB_NAME> < backup.sql
+```
+
+Restore into an empty database. If you are recovering onto a fresh box, bring the stack up so the
+schema migrations have run, then load the dump.
+
+!!! warning "Test your restores"
+    A backup you have never restored is a hope, not a backup. Periodically restore a dump into a
+    throwaway database and confirm it loads cleanly.
+
+## Upgrades
+
+```bash
+./deploy.sh update
+```
+
+This pulls the latest application images from the registry and recreates the affected services
+with them (the `web` container runs any pending database migrations on startup). Read the changelog
+before updating a production instance, and take a backup first.
+
+## Refreshing geo data
+
+Geolocation uses two datasets: the **cities** dataset (for city/region lookups) and the
+**IP2Location** BIN (for IP-to-location).
+
+- **Cities** — the full `worldcities.csv` is loaded at first migration if present, otherwise the
+  bundled 50-city mini dataset is used. To upgrade from mini to full, drop the full CSV into the
+  geo data directory and re-run the city-loading step.
+- **IP2Location** — the BIN is refreshed by a periodic Celery task, but only if you provide a
+  download token. Set the `IP2LOCATION_TOKEN` environment variable in `.env` to your IP2Location
+  LITE token; the scheduled task then downloads and swaps in updated BIN files automatically. Without
+  the token, IP lookups simply return `None` and nothing refreshes.
+
+!!! note "Attribution is required"
+    The geo datasets (SimpleMaps world cities and IP2Location LITE) carry attribution requirements.
+    The `NOTICE` file shipped with the deployment records the required attributions — **keep it in
+    place and do not strip it**. If you redistribute or publicly display the data, honor the
+    upstream licenses' attribution terms.
+
+## OAuth signing key
+
+If you enabled the OAuth / OpenID Connect provider, `certs/oidc.pem` in the infra directory is
+state that neither `deploy.sh backup` nor the Docker volumes cover. Copy it off the box with your
+other secrets. Losing it invalidates outstanding ID tokens and every client's cached signing
+keys; access and refresh tokens live in the database and keep working.
+
+**Rotating the key** without breaking tokens already issued:
+
+1. Generate the new key next to the old one (e.g. `certs/oidc-2027.pem`, `chmod 644`).
+2. Point `OIDC_SIGNING_KEY_PATH` at the new key and add the old path to
+   `OIDC_SIGNING_KEYS_INACTIVE_PATHS` (comma-separated). New tokens are signed with the new key,
+   while `/o/jwks` keeps publishing the old public key so existing ID tokens still verify.
+3. Restart `web` and `celery_default`.
+4. After the longest-lived ID token has expired (1 hour), remove the old path from
+   `OIDC_SIGNING_KEYS_INACTIVE_PATHS` and restart again.
+
+Never regenerate `certs/oidc.pem` in place: that is a rotation with no overlap window.
+
+## Volumes to back up
+
+The database dump covers your relational data, but several named Docker volumes hold state that a
+SQL dump does not. Include these in your backup routine:
+
+- **postgres data** — the database files (also covered by `deploy.sh backup`, but back up the
+  volume too for a fast full restore).
+- **media** — user-uploaded files (event images, logos, ticket assets).
+- **caddy data/config** — issued TLS certificates and Caddy state (so you don't re-issue certs on
+  every rebuild).
+- **geo data** — the IP2Location BIN and any full cities CSV you added.
+- **`certs/`** (a host directory, not a volume) — the OAuth signing key and wallet certificates.
+- **grafana / prometheus / loki / tempo** (Full tier only) — dashboards, metrics, logs, and traces,
+  if you want observability history to survive a rebuild.

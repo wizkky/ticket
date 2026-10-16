@@ -1,0 +1,339 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { createQuery } from '@tanstack/svelte-query';
+	import {
+		dashboardDashboardTickets,
+		seriespassListMySeriesPasses
+	} from '$lib/api/generated/sdk.gen';
+	import type { PaymentMethod, TicketStatus } from '$lib/api/generated/types.gen';
+	import TicketListCard from '$lib/components/tickets/TicketListCard.svelte';
+	import HeldPassCard from '$lib/components/series-passes/HeldPassCard.svelte';
+	import DashboardBandLayout from '$lib/components/dashboard/DashboardBandLayout.svelte';
+	import EmptyState from '$lib/components/common/EmptyState.svelte';
+	import { seriesPassQueryKeys } from '$lib/queries/series-passes';
+	import { groupTicketsWithPasses } from '$lib/utils/ticket-pass-grouping';
+	import type { HeldSeriesPassSchema } from '$lib/api/generated/types.gen';
+	import { Ticket, Filter, ChevronLeft, ChevronRight, Loader2 } from '@lucide/svelte';
+	import { page } from '$app/state';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import { createDebouncedState } from '$lib/utils';
+
+	const accessToken = $derived(authStore.accessToken);
+
+	// Get current page from URL params
+	const currentPage = $derived(Number(page.url.searchParams.get('page') || '1'));
+
+	const statusFilters: Array<{ label: string; value: TicketStatus | null }> = [
+		{ label: m['dashboard.tickets.status_all'](), value: null },
+		{ label: m['dashboard.tickets.status_active'](), value: 'active' },
+		{ label: m['dashboard.tickets.status_pending'](), value: 'pending' },
+		{ label: m['dashboard.tickets.status_checkedIn'](), value: 'checked_in' },
+		{ label: m['dashboard.tickets.status_cancelled'](), value: 'cancelled' }
+	];
+
+	const paymentMethodFilters: Array<{ label: string; value: PaymentMethod | null }> = [
+		{ label: m['dashboard.tickets.payment_all'](), value: null },
+		{ label: m['dashboard.tickets.payment_free'](), value: 'free' },
+		{ label: m['dashboard.tickets.payment_paid'](), value: 'online' },
+		{ label: m['dashboard.tickets.payment_offline'](), value: 'offline' },
+		{ label: m['dashboard.tickets.payment_atDoor'](), value: 'at_the_door' }
+	];
+
+	// Active filters
+	let statusFilter = $state<TicketStatus | null>(null);
+	let paymentMethodFilter = $state<PaymentMethod | null>(null);
+	let searchQuery = $state('');
+	let includePast = $state(false);
+
+	// Debounce search input
+	const debouncedSearch = createDebouncedState(() => searchQuery, 300);
+
+	// Fetch tickets with filters
+	const ticketsQuery = createQuery(() => ({
+		queryKey: [
+			'dashboard-tickets',
+			statusFilter,
+			paymentMethodFilter,
+			debouncedSearch.value,
+			includePast,
+			currentPage
+		] as const,
+		queryFn: async () => {
+			if (!accessToken) return { results: [], count: 0 };
+
+			const response = await dashboardDashboardTickets({
+				headers: { Authorization: `Bearer ${accessToken}` },
+				query: {
+					status: statusFilter,
+					tier__payment_method: paymentMethodFilter || undefined,
+					search: debouncedSearch.value || undefined,
+					include_past: includePast,
+					page: currentPage,
+					page_size: 12
+				}
+			});
+
+			return response.data || { results: [], count: 0 };
+		},
+		enabled: !!accessToken
+	}));
+
+	// Held passes, so pass-derived tickets collapse into one pass card each.
+	// Best-effort: if this query is loading or fails, the plain ticket cards
+	// render instead (see groupTicketsWithPasses).
+	const myPassesQuery = createQuery(() => ({
+		queryKey: seriesPassQueryKeys.mineAll,
+		queryFn: async () => {
+			const response = await seriespassListMySeriesPasses({
+				headers: { Authorization: `Bearer ${accessToken}` },
+				query: { page: 1, page_size: 100 }
+			});
+			if (response.error || !response.data) {
+				throw new Error('Failed to load passes');
+			}
+			return response.data;
+		},
+		enabled: !!accessToken
+	}));
+
+	const passesById = $derived(
+		new Map<string, HeldSeriesPassSchema>(
+			(myPassesQuery.data?.results ?? [])
+				.filter((p): p is HeldSeriesPassSchema & { id: string } => !!p.id)
+				.map((p) => [p.id, p])
+		)
+	);
+
+	const tickets = $derived(ticketsQuery.data?.results || []);
+	const listEntries = $derived(groupTicketsWithPasses(tickets, passesById));
+	const totalCount = $derived(ticketsQuery.data?.count || 0);
+	const totalPages = $derived(Math.ceil(totalCount / 12));
+	const hasNextPage = $derived(currentPage < totalPages);
+	const hasPrevPage = $derived(currentPage > 1);
+
+	// Apply filter
+	function applyStatusFilter(status: TicketStatus | null) {
+		statusFilter = status;
+		navigateToPage(1); // Reset to first page when filter changes
+	}
+
+	function applyPaymentMethodFilter(method: PaymentMethod | null) {
+		paymentMethodFilter = method;
+		navigateToPage(1);
+	}
+
+	// Navigate to page
+	function navigateToPage(pageNum: number) {
+		const url = new URL(page.url);
+		if (pageNum === 1) {
+			url.searchParams.delete('page');
+		} else {
+			url.searchParams.set('page', pageNum.toString());
+		}
+		// eslint-disable-next-line svelte/no-navigation-without-resolve -- target is derived from the live page URL (base path already applied); resolve() cannot express search params
+		goto(url.toString(), { replaceState: true, noScroll: true });
+	}
+
+	// Check if filter is active
+	function isStatusFilterActive(status: TicketStatus | null): boolean {
+		return statusFilter === status;
+	}
+
+	function isPaymentMethodFilterActive(method: PaymentMethod | null): boolean {
+		return paymentMethodFilter === method;
+	}
+</script>
+
+<svelte:head>
+	<title>{m['dashboard.tickets.title']()} - Revel</title>
+	<meta name="description" content={m['dashboard.tickets.description']()} />
+</svelte:head>
+
+<!-- Celebration band + floating controls card (uplift, spec §9). See
+     DashboardBandLayout for why `bg-secondary` at full strength is the
+     theme-aware poster panel. The count, search field and filter chips are
+     gathered into ONE card that meets the band's bottom edge — bare chips
+     landing on the cut read as debris. -->
+<DashboardBandLayout
+	title={m['dashboard.tickets.title']()}
+	subtitle={m['dashboard.tickets.description']()}
+	kicker={m['userMenu.dashboard']()}
+>
+	<div class="mb-8 space-y-4 rounded-lg border-2 border-border bg-card p-4 shadow-poster sm:p-6">
+		<!-- Ticket Count -->
+		{#if !ticketsQuery.isPending && totalCount > 0}
+			<p class="text-sm text-muted-foreground">
+				{m['dashboard.tickets.showing']({
+					count: tickets.length.toString(),
+					total: totalCount.toString()
+				})}
+				{totalCount === 1 ? m['dashboard.tickets.ticket']() : m['dashboard.tickets.tickets']()}
+			</p>
+		{/if}
+
+		<!-- Search Bar -->
+		<div>
+			<label for="search" class="sr-only">{m['dashboard.tickets.searchPlaceholder']()}</label>
+			<input
+				id="search"
+				type="search"
+				bind:value={searchQuery}
+				placeholder={m['dashboard.tickets.searchPlaceholder']()}
+				class="w-full rounded-lg border border-input bg-background px-4 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+			/>
+		</div>
+
+		<!-- Filters -->
+		<div class="space-y-4">
+			<!-- Status Filter -->
+			<div>
+				<div class="mb-2 flex items-center gap-2">
+					<Filter class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+					<span class="text-sm font-medium">{m['dashboard.tickets.status']()}</span>
+				</div>
+				<div class="flex flex-wrap gap-2">
+					{#each statusFilters as filter (filter.value ?? 'all')}
+						<button
+							type="button"
+							onclick={() => applyStatusFilter(filter.value)}
+							class="rounded-md border px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-ring {isStatusFilterActive(
+								filter.value
+							)
+								? 'bg-primary text-primary-foreground hover:bg-primary/90'
+								: 'bg-background hover:bg-accent hover:text-accent-foreground'}"
+						>
+							{filter.label}
+						</button>
+					{/each}
+				</div>
+			</div>
+
+			<!-- Payment Method Filter -->
+			<div>
+				<div class="mb-2">
+					<span class="text-sm font-medium">{m['dashboard.tickets.paymentMethod']()}</span>
+				</div>
+				<div class="flex flex-wrap gap-2">
+					{#each paymentMethodFilters as filter (filter.value ?? 'all')}
+						<button
+							type="button"
+							onclick={() => applyPaymentMethodFilter(filter.value)}
+							class="rounded-md border px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus:ring-2 focus:ring-ring {isPaymentMethodFilterActive(
+								filter.value
+							)
+								? 'bg-primary text-primary-foreground hover:bg-primary/90'
+								: 'bg-background hover:bg-accent hover:text-accent-foreground'}"
+						>
+							{filter.label}
+						</button>
+					{/each}
+				</div>
+			</div>
+
+			<!-- Include Past Events Checkbox -->
+			<div>
+				<div class="mb-2">
+					<span class="text-sm font-medium">{m['dashboardTicketsPage.options']()}</span>
+				</div>
+				<label class="flex cursor-pointer items-center gap-2">
+					<input
+						type="checkbox"
+						bind:checked={includePast}
+						onchange={() => navigateToPage(1)}
+						class="h-4 w-4 cursor-pointer rounded border-input text-primary focus:ring-2 focus:ring-ring focus:ring-offset-2"
+					/>
+					<span class="text-sm">{m['dashboard.tickets.includePast']()}</span>
+				</label>
+			</div>
+		</div>
+	</div>
+
+	<!-- Tickets List -->
+	{#if ticketsQuery.isPending}
+		<!-- Loading State -->
+		<div class="flex items-center justify-center py-12">
+			<Loader2 class="h-8 w-8 animate-spin text-primary" aria-hidden="true" />
+			<span class="sr-only">{m['dashboardTicketsPage.loading']()}</span>
+		</div>
+	{:else if tickets.length === 0}
+		<!-- Empty State -->
+		{#snippet ticketsEmptyAction()}
+			{#if statusFilter || paymentMethodFilter || debouncedSearch}
+				<button
+					type="button"
+					onclick={() => {
+						statusFilter = null;
+						paymentMethodFilter = null;
+						searchQuery = '';
+						navigateToPage(1);
+					}}
+					class="rounded-lg border bg-background px-6 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					{m['dashboardTicketsPage.clearFilters']()}
+				</button>
+			{:else}
+				<a
+					href={resolve('/(public)/events', {})}
+					class="inline-flex items-center gap-2 rounded-lg bg-primary px-6 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					{m['dashboardTicketsPage.browseEvents']()}
+				</a>
+			{/if}
+		{/snippet}
+		<EmptyState
+			icon={Ticket}
+			title={m['dashboardTicketsPage.noResults']()}
+			body={statusFilter || paymentMethodFilter || debouncedSearch
+				? m['dashboardTicketsPage.noResultsFiltered']()
+				: m['dashboardTicketsPage.emptyHint']()}
+			action={ticketsEmptyAction}
+			level={2}
+		/>
+	{:else}
+		<!-- Tickets Grid -->
+		<div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+			{#each listEntries as entry (entry.kind === 'ticket' ? entry.ticket.id : entry.heldPass.id)}
+				{#if entry.kind === 'ticket'}
+					<TicketListCard ticket={entry.ticket} />
+				{:else}
+					<HeldPassCard heldPass={entry.heldPass} />
+				{/if}
+			{/each}
+		</div>
+
+		<!-- Pagination -->
+		{#if totalPages > 1}
+			<div class="mt-8 flex items-center justify-between border-t border-border pt-6">
+				<div class="text-sm text-muted-foreground">
+					Page {currentPage} of {totalPages}
+				</div>
+
+				<div class="flex gap-2">
+					<button
+						type="button"
+						onclick={() => navigateToPage(currentPage - 1)}
+						disabled={!hasPrevPage}
+						class="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+						aria-label={m['dashboard.tickets.previousPage']()}
+					>
+						<ChevronLeft class="h-4 w-4" aria-hidden="true" />
+						{m['dashboard.tickets.previousPage']()}
+					</button>
+
+					<button
+						type="button"
+						onclick={() => navigateToPage(currentPage + 1)}
+						disabled={!hasNextPage}
+						class="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+						aria-label={m['dashboard.tickets.nextPage']()}
+					>
+						{m['dashboard.tickets.nextPage']()}
+						<ChevronRight class="h-4 w-4" aria-hidden="true" />
+					</button>
+				</div>
+			</div>
+		{/if}
+	{/if}
+</DashboardBandLayout>

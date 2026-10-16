@@ -1,0 +1,76 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    name: Publish Docker Image
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Belt-and-suspenders: version consistency (tag == package.json == CHANGELOG) is already
+      # enforced by release.yaml before the release is created. This guards manual `make release`
+      # fallbacks too, where no such check runs.
+      - name: Validate tag format
+        run: |
+          TAG_NAME="${{ github.event.release.tag_name }}"
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag '$TAG_NAME' must be vX.Y.Z (semantic versioning, e.g. v1.0.0)"
+            exit 1
+          fi
+          echo "✅ Tag format is valid: $TAG_NAME"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      # One image for all deployments. PUBLIC_API_URL and ORIGIN are set at
+      # RUNTIME (#396), so they are not build args; demo/prod differ only by the
+      # runtime env in their respective compose files. PUBLIC_VERSION (shown in
+      # the footer) is known only at release time, so it is passed as a build arg
+      # and baked into the image's runtime ENV — read at runtime via
+      # $env/dynamic/public (#493), not inlined into the JS bundle.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          # Supply-chain attestations published alongside the image to GHCR.
+          sbom: true
+          provenance: mode=max
+          build-args: |
+            PUBLIC_VERSION=${{ github.event.release.tag_name }}
+          tags: |
+            ghcr.io/letsrevel/revel-frontend:latest
+            ghcr.io/letsrevel/revel-frontend:${{ github.event.release.tag_name }}
+
+      # Ops signal: fires only after the image is pullable from GHCR. Failure
+      # (Discord down, missing secret) must never fail the publish job.
+      - name: Notify Discord
+        continue-on-error: true
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_FRONTEND_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "DISCORD_FRONTEND_WEBHOOK_URL not set, skipping notification"
+            exit 0
+          fi
+          curl -sf --max-time 10 -X POST "$DISCORD_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"content\": \"📦 \`ghcr.io/letsrevel/revel-frontend:${{ github.event.release.tag_name }}\` is published and ready to deploy — ${{ github.event.release.html_url }}\"}"

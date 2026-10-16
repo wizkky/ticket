@@ -1,0 +1,738 @@
+# src/events/signals.py
+
+import typing as t
+
+import structlog
+from django.db import transaction
+from django.db.models.signals import post_delete, post_save, pre_save
+from django.dispatch import receiver
+
+from accounts.models import RevelUser
+from common.models import SiteSettings
+from events.models import (
+    DEFAULT_TICKET_TIER_NAME,
+    Blacklist,
+    Event,
+    EventInvitation,
+    EventRSVP,
+    EventWaitList,
+    GeneralUserPreferences,
+    MembershipPayment,
+    MembershipSubscription,
+    MembershipSubscriptionPlan,
+    Organization,
+    OrganizationMember,
+    OrganizationStaff,
+    PendingEventInvitation,
+    ReservedSlugToken,
+    Ticket,
+    TicketTier,
+)
+from events.models.organization import MembershipTier
+from events.service import permission_snapshot, ticket_number_service
+from events.service.blacklist_service import apply_blacklist_consequences, link_blacklist_entries_for_user
+from events.service.follow_service import get_followers_for_new_event_notification
+from events.service.potluck_service import unclaim_user_potluck_items
+from events.service.user_preferences_service import trigger_visibility_flags_for_user
+from events.tasks import (
+    build_attendee_visibility_flags,
+    notify_admin_new_organization_discord,
+    notify_admin_new_organization_pushover,
+)
+from events.utils import format_event_datetime, get_invitation_message
+from events.utils.reserved_slug_tokens import invalidate_reserved_tokens_cache
+from notifications.enums import NotificationType
+from notifications.signals import notification_requested
+
+__all__ = ["unclaim_user_potluck_items"]
+
+logger = structlog.get_logger(__name__)
+
+
+@receiver(post_save, sender=Event)
+def handle_event_save(sender: type[Event], instance: Event, created: bool, **kwargs: t.Any) -> None:
+    """Handle event creation and updates."""
+    from events.suppression import is_default_tier_creation_suppressed
+
+    if is_default_tier_creation_suppressed():
+        return
+
+    # Create default ticket tier if needed
+    if instance.requires_ticket and not TicketTier.objects.filter(event=instance).exists():
+        TicketTier.objects.create(event=instance, name=DEFAULT_TICKET_TIER_NAME)
+
+
+@receiver(post_save, sender=Organization)
+def handle_organization_creation(
+    sender: type[Organization], instance: Organization, created: bool, **kwargs: t.Any
+) -> None:
+    """Create default 'General membership' tier and notify admin when an organization is created."""
+    if not created:
+        return
+
+    MembershipTier.objects.create(organization=instance, name="General membership")
+    logger.info(
+        "default_membership_tier_created",
+        organization_id=str(instance.id),
+        organization_name=instance.name,
+    )
+
+    if not SiteSettings.get_solo().notify_organization_created:
+        return
+
+    organization_id = str(instance.id)
+
+    def _dispatch_admin_notifications() -> None:
+        notify_admin_new_organization_pushover.delay(organization_id=organization_id)
+        notify_admin_new_organization_discord.delay(organization_id=organization_id)
+
+    transaction.on_commit(_dispatch_admin_notifications)
+
+
+@receiver(post_save, sender=RevelUser)
+def handle_user_creation(sender: type[RevelUser], instance: RevelUser, created: bool, **kwargs: t.Any) -> None:
+    """Creates GeneralUserPreferences, links blacklist entries, and processes pending invitations."""
+    if not created:
+        return
+    logger.info("revel_user_created", user_id=str(instance.id))
+    GeneralUserPreferences.objects.create(user=instance)
+
+    # Link any existing blacklist entries that match this user's identifiers
+    if linked_count := link_blacklist_entries_for_user(instance):
+        logger.info("blacklist_entries_linked", user_id=str(instance.id), count=linked_count)
+
+    # Convert any pending invitations for this email to real invitations
+    pending_invitations = PendingEventInvitation.objects.prefetch_related("tiers").filter(email__iexact=instance.email)
+
+    if pending_invitations.exists():
+        logger.info(
+            "converting_pending_invitations",
+            user_id=str(instance.id),
+            count=pending_invitations.count(),
+        )
+
+        with transaction.atomic():
+            for pending in pending_invitations:
+                # Preserve any existing custom message from the pending invitation,
+                # or generate a default one using the user's display name if none was set.
+                custom_message = pending.custom_message
+                if not custom_message:
+                    custom_message = get_invitation_message(instance.get_display_name(), pending.event)
+
+                # Create EventInvitation from PendingEventInvitation
+                invitation = EventInvitation.objects.create(
+                    event=pending.event,
+                    user=instance,
+                    waives_questionnaire=pending.waives_questionnaire,
+                    waives_purchase=pending.waives_purchase,
+                    overrides_max_attendees=pending.overrides_max_attendees,
+                    waives_membership_required=pending.waives_membership_required,
+                    waives_rsvp_deadline=pending.waives_rsvp_deadline,
+                    waives_apply_deadline=pending.waives_apply_deadline,
+                    custom_message=custom_message,
+                )
+                # Copy tier links from pending invitation
+                pending_tiers = pending.tiers.all()
+                if pending_tiers:
+                    invitation.tiers.set(pending_tiers)
+            pending_invitations.delete()
+
+
+@receiver(post_save, sender=EventRSVP)
+def handle_event_rsvp_save(sender: type[EventRSVP], instance: EventRSVP, created: bool, **kwargs: t.Any) -> None:
+    """Trigger visibility task and unclaim potluck items after RSVP is changed or created.
+
+    When a user's RSVP status changes to anything other than YES (i.e., NO or MAYBE),
+    we automatically unclaim all potluck items they had previously claimed, since they
+    are no longer confirmed to attend.
+    """
+    event_id = str(instance.event_id)
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(event_id))
+
+    if instance.status in [EventRSVP.RsvpStatus.NO, EventRSVP.RsvpStatus.MAYBE]:
+        unclaim_user_potluck_items(instance.event_id, instance.user_id)
+
+
+@receiver(post_delete, sender=EventRSVP)
+def handle_event_rsvp_delete(sender: type[EventRSVP], instance: EventRSVP, **kwargs: t.Any) -> None:
+    """Trigger visibility task and unclaim potluck items after RSVP is deleted.
+
+    When a user deletes their RSVP entirely, we unclaim all potluck items they had claimed.
+    """
+    event_id = str(instance.event_id)
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(event_id))
+    # Unclaim items when RSVP is deleted entirely
+    unclaim_user_potluck_items(instance.event_id, instance.user_id)
+
+
+@receiver(post_save, sender=Ticket)
+def handle_ticket_visibility_and_potluck(
+    sender: type[Ticket], instance: Ticket, created: bool, **kwargs: t.Any
+) -> None:
+    """Trigger visibility task and unclaim potluck items when ticket status becomes CANCELLED.
+
+    When a ticket's status changes to CANCELLED, we automatically unclaim all potluck items
+    the user had claimed, since they are no longer confirmed to attend.
+
+    Note: This is one of multiple post_save handlers for Ticket model:
+    - events.signals.handle_ticket_visibility_and_potluck: Handles visibility flags + potluck (this handler)
+    - notifications.signals.ticket.handle_ticket_notifications: Sends notifications
+    - notifications.signals.waitlist.handle_ticket_waitlist_logic: Manages waitlist removal
+    """
+    event_id = str(instance.event_id)
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(event_id))
+
+    if instance.status == Ticket.TicketStatus.CANCELLED:
+        unclaim_user_potluck_items(instance.event_id, instance.user_id)
+
+
+@receiver(post_save, sender=Ticket)
+def assign_ticket_number_on_issue(sender: type[Ticket], instance: Ticket, **kwargs: t.Any) -> None:
+    """Give a ticket its fiscal number (assigned without gaps) once it is issued (ACTIVE/CHECKED_IN).
+
+    Covers every ``save()`` path; the bulk writers that skip signals call
+    ``ticket_number_service.assign_ticket_numbers`` themselves.
+    """
+    if not kwargs.get("raw"):
+        ticket_number_service.assign_ticket_numbers([instance])
+
+
+@receiver(post_delete, sender=Ticket)
+def handle_ticket_delete(sender: type[Ticket], instance: Ticket, **kwargs: t.Any) -> None:
+    """Trigger visibility task and unclaim potluck items after Ticket is deleted.
+
+    When a user's ticket is deleted entirely, we unclaim all potluck items they had claimed.
+    """
+    event_id = str(instance.event_id)
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(event_id))
+    # Unclaim items when ticket is deleted
+    unclaim_user_potluck_items(instance.event_id, instance.user_id)
+
+
+@receiver(post_delete, sender=EventInvitation)
+def handle_invitation_delete(sender: type[EventInvitation], instance: EventInvitation, **kwargs: t.Any) -> None:
+    """Trigger visibility task after invitation is deleted."""
+    event_id = str(instance.event_id)
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(event_id))
+
+
+@receiver(post_save, sender=GeneralUserPreferences)
+def handle_default_user_pref_save(
+    sender: type[GeneralUserPreferences], instance: GeneralUserPreferences, **kwargs: t.Any
+) -> None:
+    """Trigger visibility task after user preferences is changed or created."""
+    # Iterate over all future events the user is attending
+    trigger_visibility_flags_for_user(instance.user_id)
+
+
+@receiver(post_save, sender=OrganizationMember)
+def handle_membership_granted(
+    sender: type[OrganizationMember], instance: OrganizationMember, created: bool, **kwargs: t.Any
+) -> None:
+    """Send notification when user is granted membership to an organization."""
+    if not created:
+        return
+
+    def send_membership_notification() -> None:
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+
+        notification_requested.send(
+            sender=sender,
+            user=instance.user,
+            notification_type=NotificationType.MEMBERSHIP_GRANTED,
+            context={
+                "organization_id": str(instance.organization_id),
+                "organization_name": instance.organization.name,
+                "role": "member",
+                "action": "granted",
+                "frontend_url": f"{frontend_base_url}/org/{instance.organization.slug}",
+            },
+        )
+
+        logger.info(
+            "membership_granted_notification_sent",
+            organization_id=str(instance.organization_id),
+            user_id=str(instance.user_id),
+        )
+
+    transaction.on_commit(send_membership_notification)
+
+
+@receiver(post_delete, sender=OrganizationMember)
+def handle_membership_removed(sender: type[OrganizationMember], instance: OrganizationMember, **kwargs: t.Any) -> None:
+    """Send notification when user is removed from an organization."""
+
+    def send_removal_notification() -> None:
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+
+        notification_requested.send(
+            sender=sender,
+            user=instance.user,
+            notification_type=NotificationType.MEMBERSHIP_REMOVED,
+            context={
+                "organization_id": str(instance.organization_id),
+                "organization_name": instance.organization.name,
+                "role": "member",
+                "action": "removed",
+                "frontend_url": f"{frontend_base_url}/organizations",
+            },
+        )
+
+        logger.info(
+            "membership_removed_notification_sent",
+            organization_id=str(instance.organization_id),
+            user_id=str(instance.user_id),
+        )
+
+    transaction.on_commit(send_removal_notification)
+
+
+@receiver(post_save, sender=OrganizationMember)
+@receiver(post_delete, sender=OrganizationMember)
+@receiver(post_save, sender=OrganizationStaff)
+@receiver(post_delete, sender=OrganizationStaff)
+def invalidate_permission_snapshot(
+    sender: type[OrganizationMember | OrganizationStaff],
+    instance: OrganizationMember | OrganizationStaff,
+    **kwargs: t.Any,
+) -> None:
+    """Bust the user's cached my-permissions payload on any membership/staff write (#886).
+
+    Membership writes are scattered across services, Stripe sync, admin and signals, so
+    a receiver beats enumerating call sites. Note: ``bulk_create``/``bulk_update``
+    bypass signals — no such call sites exist for these models today; if one is added,
+    it must invalidate explicitly.
+    """
+    permission_snapshot.invalidate_my_permissions(instance.user_id)
+
+
+@receiver(pre_save, sender=OrganizationMember)
+def capture_member_old_tier(sender: type[OrganizationMember], instance: OrganizationMember, **kwargs: t.Any) -> None:
+    """Stash the pre-save tier id so post_save can detect tier changes."""
+    if instance.pk:
+        instance._old_tier_id = (  # type: ignore[attr-defined]
+            OrganizationMember.objects.filter(pk=instance.pk).values_list("tier_id", flat=True).first()
+        )
+
+
+@receiver(post_save, sender=OrganizationMember)
+def handle_membership_tier_changed(
+    sender: type[OrganizationMember], instance: OrganizationMember, created: bool, **kwargs: t.Any
+) -> None:
+    """Send a card re-download notification when a member's tier changes.
+
+    The wallet card face shows the tier, and passes are write-once (Google saves
+    with a known object id are no-ops — the tier is part of the object id), so a
+    tier change requires the member to re-add the card.
+    """
+    if created:
+        return
+    old_tier_id = getattr(instance, "_old_tier_id", instance.tier_id)
+    if old_tier_id == instance.tier_id:
+        return
+
+    def send_card_updated_notification() -> None:
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+        notification_requested.send(
+            sender=sender,
+            user=instance.user,
+            notification_type=NotificationType.MEMBERSHIP_CARD_UPDATED,
+            context={
+                "organization_id": str(instance.organization_id),
+                "organization_name": instance.organization.name,
+                "member_id": str(instance.id),
+                "tier_name": instance.tier.name if instance.tier else "",
+                "frontend_url": f"{frontend_base_url}/org/{instance.organization.slug}",
+            },
+        )
+
+    transaction.on_commit(send_card_updated_notification)
+
+
+@receiver(post_save, sender=OrganizationStaff)
+def handle_membership_promoted(
+    sender: type[OrganizationStaff], instance: OrganizationStaff, created: bool, **kwargs: t.Any
+) -> None:
+    """Send notification when user is promoted to staff."""
+    if not created:
+        return
+
+    def send_promotion_notification() -> None:
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+
+        notification_requested.send(
+            sender=sender,
+            user=instance.user,
+            notification_type=NotificationType.MEMBERSHIP_PROMOTED,
+            context={
+                "organization_id": str(instance.organization_id),
+                "organization_name": instance.organization.name,
+                "role": "staff",
+                "action": "promoted",
+                "frontend_url": f"{frontend_base_url}/org/{instance.organization.slug}",
+            },
+        )
+
+        logger.info(
+            "membership_promoted_notification_sent",
+            organization_id=str(instance.organization_id),
+            user_id=str(instance.user_id),
+        )
+
+    transaction.on_commit(send_promotion_notification)
+
+
+@receiver(post_save, sender=Blacklist)
+def handle_blacklist_user_linked(sender: type[Blacklist], instance: Blacklist, created: bool, **kwargs: t.Any) -> None:
+    """Handle consequences when a user is linked to a blacklist entry.
+
+    When a blacklist entry has a user FK set on creation, we apply
+    blacklist consequences:
+    1. Remove them from OrganizationStaff (if they are staff)
+    2. Set their OrganizationMember status to BANNED (or create one with BANNED)
+
+    Note: Auto-linking via `link_blacklist_entries_for_user` handles its own
+    consequences since .update() doesn't trigger signals.
+    """
+    # Only act on creation with a user FK set
+    # (Updates via link_blacklist_entries_for_user handle their own consequences)
+    if not created or instance.user is None:
+        return
+
+    apply_blacklist_consequences(instance.user, instance.organization)
+
+
+@receiver(pre_save, sender=Event)
+def capture_event_old_status(sender: type[Event], instance: Event, **kwargs: t.Any) -> None:
+    """Capture the old status value before save for change detection in post_save.
+
+    This allows us to reliably detect when an event's status changes to OPEN,
+    regardless of whether save() is called with or without update_fields.
+    """
+    from events.suppression import is_event_notifications_suppressed
+
+    if is_event_notifications_suppressed():
+        return
+
+    if instance.pk:
+        try:
+            old_instance = Event.objects.only("status").get(pk=instance.pk)
+            if old_instance.status != instance.status:
+                instance._old_status = old_instance.status  # type: ignore[attr-defined]
+        except Event.DoesNotExist:
+            # Event was deleted between check and fetch (race condition) - skip silently
+            pass
+
+
+def _should_notify_followers_for_event(event: Event, created: bool) -> bool:
+    """Check if followers should be notified for this event status change.
+
+    Returns True only when a PUBLIC event transitions to OPEN status (either on
+    creation or via update). Non-public events are only visible to members, staff,
+    or explicitly invited users — not general followers.
+    """
+    if event.status != Event.EventStatus.OPEN:
+        return False
+
+    # Only PUBLIC events notify followers. UNLISTED, PRIVATE, MEMBERS_ONLY,
+    # STAFF_ONLY do not — the org decides explicitly who to share with.
+    if event.visibility != Event.Visibility.PUBLIC:
+        return False
+
+    if created:
+        return True
+
+    # For existing events, check if status actually changed to OPEN
+    old_status = getattr(event, "_old_status", None)
+    return old_status is not None and old_status != Event.EventStatus.OPEN
+
+
+def _get_event_location_string(event: Event) -> str:
+    """Build a human-readable location string for an event."""
+    location = event.address or ""
+    if event.city:
+        location = f"{location}, {event.city.name}" if location else event.city.name
+    return location
+
+
+@receiver(post_save, sender=Event)
+def handle_event_opened_notify_followers(sender: type[Event], instance: Event, created: bool, **kwargs: t.Any) -> None:
+    """Notify followers when an event becomes OPEN.
+
+    Sends notifications to:
+    - Organization followers who have notify_new_events enabled
+    - Event series followers (if event belongs to a series) who have notify_new_events enabled
+
+    Series followers are prioritized - if a user follows both the org and series,
+    they receive the series notification only.
+    """
+    from events.suppression import is_event_notifications_suppressed
+
+    if is_event_notifications_suppressed():
+        return
+
+    if not _should_notify_followers_for_event(instance, created):
+        return
+
+    organization = instance.organization
+    if not organization:
+        return
+
+    def send_follower_notifications() -> None:
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+        event_series = instance.event_series
+        event_location = _get_event_location_string(instance)
+
+        for user, notification_type in get_followers_for_new_event_notification(organization, event_series):
+            context: dict[str, t.Any] = {
+                "organization_id": str(organization.id),
+                "organization_name": organization.name,
+                "event_id": str(instance.id),
+                "event_name": instance.name,
+                "event_description": instance.description or "",
+                "event_start": instance.start.isoformat() if instance.start else "",
+                "event_start_formatted": format_event_datetime(instance.start, instance),
+                "event_location": event_location,
+                "event_url": f"{frontend_base_url}/events/{instance.id}",
+            }
+
+            if notification_type == NotificationType.NEW_EVENT_FROM_FOLLOWED_SERIES and event_series:
+                context["event_series_id"] = str(event_series.id)
+                context["event_series_name"] = event_series.name
+
+            notification_requested.send(
+                sender=sender,
+                user=user,
+                notification_type=notification_type,
+                context=context,
+            )
+
+        logger.info(
+            "follower_notifications_sent_for_event",
+            event_id=str(instance.id),
+            organization_id=str(organization.id),
+        )
+
+    transaction.on_commit(send_follower_notifications)
+
+
+# Map subscription status -> the OrganizationMember status it implies.
+_SUBSCRIPTION_TO_MEMBER_STATUS: dict[str, str] = {
+    MembershipSubscription.SubscriptionStatus.PENDING.value: OrganizationMember.MembershipStatus.ACTIVE.value,
+    MembershipSubscription.SubscriptionStatus.ACTIVE.value: OrganizationMember.MembershipStatus.ACTIVE.value,
+    MembershipSubscription.SubscriptionStatus.PAST_DUE.value: OrganizationMember.MembershipStatus.ACTIVE.value,
+    MembershipSubscription.SubscriptionStatus.PAUSED.value: OrganizationMember.MembershipStatus.PAUSED.value,
+    MembershipSubscription.SubscriptionStatus.EXPIRED.value: OrganizationMember.MembershipStatus.CANCELLED.value,
+    MembershipSubscription.SubscriptionStatus.CANCELLED.value: OrganizationMember.MembershipStatus.CANCELLED.value,
+}
+
+
+def _has_paid_current_period(subscription: MembershipSubscription) -> bool:
+    """Whether money was ever collected for the period a PAST_DUE row is honoring.
+
+    PAST_DUE maps to an ACTIVE member so Stripe's dunning grace keeps a *paying*
+    member's access while a renewal retries. A **first** invoice that fails —
+    or stalls on SCA, which ``invoice.payment_action_required`` deliberately
+    routes through the failure branch, and which async methods (SEPA) can do
+    days after the checkout completed — moves the row PENDING → PAST_DUE
+    (``subscription.stripe.sync._apply_invoice_outcome``). Without this check
+    that grace would grant, or upgrade a free member to, the paid tier with
+    zero money collected. A revival checkout is the same story on a reused row.
+
+    ``current_period_end is None`` alone is not a sound discriminator: a
+    ``customer.subscription.*`` sync mirrors Stripe's period onto a still
+    ``incomplete`` (locally PENDING) row, so an unpaid row can carry one. What
+    separates dunning from a never-paid row is a SUCCEEDED payment whose period
+    runs up to the start of the period being honored — renewal periods are
+    contiguous, while a revival's (or a first invoice's) period starts after a
+    gap, with no payment reaching it.
+    """
+    if subscription.current_period_start is None:
+        return False
+    return MembershipPayment.objects.filter(
+        subscription_id=subscription.pk,
+        status=MembershipPayment.PaymentStatus.SUCCEEDED,
+        period_end__gte=subscription.current_period_start,
+    ).exists()
+
+
+@receiver(pre_save, sender=MembershipSubscription)
+def capture_subscription_old_status(
+    sender: type[MembershipSubscription],
+    instance: MembershipSubscription,
+    **kwargs: t.Any,
+) -> None:
+    """Stamp the committed status on the instance for :func:`sync_member_from_subscription`.
+
+    Same pre_save capture pattern as :func:`capture_event_old_status`, but the
+    attribute is stamped on *every* save because the post_save consumer needs to
+    distinguish "was PAUSED" from "was already ACTIVE", not merely "changed".
+    The UUID pk is populated before the INSERT, so a create is identified by the
+    lookup finding no committed row — leaving ``_old_status`` ``None``.
+    """
+    instance._old_status = (  # type: ignore[attr-defined]
+        MembershipSubscription.objects.filter(pk=instance.pk).values_list("status", flat=True).first()
+    )
+
+
+@receiver(post_save, sender=MembershipSubscription)
+def sync_member_from_subscription(
+    sender: type[MembershipSubscription],
+    instance: MembershipSubscription,
+    created: bool,
+    **kwargs: t.Any,
+) -> None:
+    """Sync ``OrganizationMember.status`` and ``tier`` from the subscription.
+
+    Rules:
+    - Never creates an :class:`OrganizationMember`. Creation lives in
+      :func:`events.service.subscription.lifecycle.create_subscription` for the
+      OFFLINE flow, and in
+      :func:`events.service.subscription.stripe.sync._ensure_active_member`
+      for the ONLINE flow (gated on Stripe's first paid invoice / ``active``
+      status, so members don't get tier benefits before paying).
+    - Leaves ``BANNED`` members untouched.
+    - Leaves a ``PAUSED`` member paused unless the subscription is itself
+      transitioning *out of* PAUSED (the staff resume paths). A staff-imposed
+      pause is mirrored onto the subscription, so any other save of a
+      still-ACTIVE row — a webhook echo sync, an uncancel, an ``invoice.paid``
+      on a row that was never PAUSED — used to silently lift the suspension.
+    - Subscription tier wins: ``member.tier`` is set to ``plan.tier`` whenever
+      they differ.
+    - Skips syncing when a newer non-terminal subscription exists for the
+      same (user, org) — older terminal rows must not clobber the effective
+      subscription when, e.g., admin re-saves a historical entry after the
+      user has resubscribed.
+    - For ONLINE plans in PENDING state — or in PAST_DUE without a paid
+      period behind them — returns early so a subscription doesn't grant
+      ACTIVE membership before Stripe collects the first invoice.
+    """
+    target_status = _SUBSCRIPTION_TO_MEMBER_STATUS.get(instance.status)
+    if target_status is None:
+        return
+
+    # ONLINE plans gate ACTIVE membership on the first successful Stripe
+    # payment. PENDING is the "awaiting first invoice" state — leave the
+    # member alone until the webhook flips us to ACTIVE. A PAST_DUE row that
+    # never collected a period is the same state wearing a dunning hat (first
+    # invoice failed / stalled on SCA, revival checkout never settled), so it
+    # gets the same treatment — see :func:`_has_paid_current_period`.
+    if instance.plan.payment_method == MembershipSubscriptionPlan.PaymentMethod.ONLINE.value and (
+        instance.status == MembershipSubscription.SubscriptionStatus.PENDING.value
+        or (
+            instance.status == MembershipSubscription.SubscriptionStatus.PAST_DUE.value
+            and not _has_paid_current_period(instance)
+        )
+    ):
+        return
+
+    # If a newer non-terminal subscription exists, it owns the member state.
+    newer_active_exists = (
+        MembershipSubscription.objects.filter(
+            organization_id=instance.organization_id,
+            user_id=instance.user_id,
+            created_at__gt=instance.created_at,
+        )
+        .exclude(status__in=MembershipSubscription.TERMINAL_STATUSES)
+        .exists()
+    )
+    if newer_active_exists:
+        return
+
+    member = OrganizationMember.objects.filter(
+        organization_id=instance.organization_id,
+        user_id=instance.user_id,
+    ).first()
+    if member is None:
+        return
+    if member.status == OrganizationMember.MembershipStatus.BANNED:
+        return
+
+    # A staff pause is only lifted by the resume paths — OFFLINE
+    # ``resume_subscription`` and ``resume_online_subscription`` both flip the
+    # row PAUSED → ACTIVE, and so does the ``customer.subscription.updated``
+    # echo that clears ``pause_collection``. Everything else that saves an
+    # already-ACTIVE row must leave the member suspended (tier still follows
+    # the plan). ``update_member(status=ACTIVE)`` is unaffected: it saves the
+    # member row directly and never routes through this signal.
+    if (
+        member.status == OrganizationMember.MembershipStatus.PAUSED
+        and target_status == OrganizationMember.MembershipStatus.ACTIVE
+        and getattr(instance, "_old_status", None) != MembershipSubscription.SubscriptionStatus.PAUSED.value
+    ):
+        target_status = member.status
+
+    target_tier_id = instance.plan.tier_id
+    update_fields = []
+    if member.status != target_status:
+        member.status = target_status
+        update_fields.append("status")
+    if member.tier_id != target_tier_id:
+        member.tier_id = target_tier_id
+        update_fields.append("tier")
+
+    if not update_fields:
+        return
+
+    update_fields.append("updated_at")
+    member.save(update_fields=update_fields)
+
+    logger.info(
+        "membership_subscription_synced_member",
+        subscription_id=str(instance.id),
+        member_id=str(member.id),
+        status=member.status,
+        tier_id=str(member.tier_id) if member.tier_id else None,
+    )
+
+
+@receiver(post_save, sender=ReservedSlugToken)
+def _invalidate_reserved_slug_token_cache_on_save(
+    sender: type[ReservedSlugToken],
+    instance: ReservedSlugToken,
+    **kwargs: t.Any,
+) -> None:
+    invalidate_reserved_tokens_cache()
+
+
+@receiver(post_delete, sender=ReservedSlugToken)
+def _invalidate_reserved_slug_token_cache_on_delete(
+    sender: type[ReservedSlugToken],
+    instance: ReservedSlugToken,
+    **kwargs: t.Any,
+) -> None:
+    invalidate_reserved_tokens_cache()
+
+
+@receiver(post_delete, sender=EventWaitList)
+def handle_waitlist_entry_deleted(sender: type[EventWaitList], instance: EventWaitList, **kwargs: t.Any) -> None:
+    """Revoke any PENDING WaitlistOffer for (event, user) when the entry is removed.
+
+    Policy note: the rest of the advanced-waitlist feature uses **explicit**
+    ``enqueue_waitlist_processing(event_id)`` calls at every capacity-freeing
+    site rather than signals (see docs/superpowers/specs/2026-05-19-advanced-waitlist-design.md
+    decisions log). This handler is the deliberate exception: ``EventWaitList``
+    rows are deleted from many paths — admin ``delete_waitlist_entry``,
+    user-side ``leave_waitlist``, ``EventManager._claim_active_offer``,
+    ``BatchTicketService.claim_waitlist_offer_if_any``, ad-hoc ORM
+    ``.filter().delete()`` calls — and wiring each one inline is repetitive
+    and easy to miss. Callers should still document inline that the offer
+    revoke is handled here so future readers don't have to chase it down.
+
+    Idempotent: only PENDING offers are affected. CLAIMED offers (deletion happens
+    AFTER claim flips status) and EXPIRED offers (leave_waitlist flips status BEFORE
+    delete) are not touched.
+    """
+    from events.models import WaitlistOffer
+    from events.service.waitlist_service import enqueue_waitlist_processing
+
+    # Use a conditional UPDATE so a concurrent claim/expire flip cannot be
+    # silently clobbered: we only enqueue if THIS query actually transitioned
+    # a row, and the database — not Python — decides which writer wins.
+    affected = WaitlistOffer.objects.filter(
+        event_id=instance.event_id,
+        user_id=instance.user_id,
+        status=WaitlistOffer.WaitlistOfferStatus.PENDING,
+    ).update(status=WaitlistOffer.WaitlistOfferStatus.REVOKED)
+    if affected:
+        enqueue_waitlist_processing(instance.event_id)

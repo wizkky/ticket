@@ -1,0 +1,23 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<h2>{% trans "New Verification Request" %}</h2>
+
+<p>{% blocktranslate with name=context.requester_name org=context.organization_name %}<strong>{{ name }}</strong> has requested verification for <strong>{{ org }}</strong>.{% endblocktranslate %}</p>
+
+<div class="card card--info">
+    <h3 style="margin-top: 0;">{% trans "Request Details:" %}</h3>
+    <div class="info-row"><strong>{% trans "Name:" %}</strong> {{ context.requester_name }}</div>
+    <div class="info-row"><strong>{% trans "Email:" %}</strong> {{ context.requester_email }}</div>
+    <div class="info-row"><strong>{% trans "Matched Entries:" %}</strong> {{ context.matched_entries_count }}</div>
+    {% if context.request_message %}
+    <div class="info-row"><strong>{% trans "Message:" %}</strong><br>{{ context.request_message }}</div>
+    {% endif %}
+</div>
+
+<center>
+    <a href="{{ context.frontend_url }}" class="button">{% trans "Review Request" %}</a>
+</center>
+
+<p style="color: #666; font-size: 12px;">{% trans "This user matched entries in your blacklist and is requesting verification to access your organization." %}</p>
+{% endblock %}

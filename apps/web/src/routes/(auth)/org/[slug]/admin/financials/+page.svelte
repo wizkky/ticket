@@ -1,0 +1,343 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { page } from '$app/stores';
+	import { goto } from '$app/navigation';
+	import { createQuery } from '@tanstack/svelte-query';
+	import { organizationadminrevenueGetOrganizationFinancials } from '$lib/api';
+	import type {
+		CurrencyFinancialsSchema,
+		EventFinancialsSchema,
+		OrganizationFinancialsSchema
+	} from '$lib/api/generated';
+	import { formatMoney } from '$lib/utils/format';
+	import { formatDate, formatEventDate } from '$lib/utils/date';
+	import CurrencyFinancialsSummary from '$lib/components/financials/CurrencyFinancialsSummary.svelte';
+	import MembershipFinancialsSummary from '$lib/components/financials/MembershipFinancialsSummary.svelte';
+	import CombinedTotalsSummary from '$lib/components/financials/CombinedTotalsSummary.svelte';
+	import FinancialsNote from '$lib/components/financials/FinancialsNote.svelte';
+	import AttributionBreakdownSection from '$lib/components/financials/AttributionBreakdownSection.svelte';
+	import PeriodFilter from '$lib/components/financials/PeriodFilter.svelte';
+	import type { PeriodValue } from '$lib/components/financials/period';
+	import { entryFor, selectSections } from '$lib/components/financials/entries';
+	import RevenueReportButton from '$lib/components/financials/RevenueReportButton.svelte';
+	import { BarChart3, ChevronDown, Loader2, ArrowUpDown } from '@lucide/svelte';
+	import PageHeader from '$lib/components/common/PageHeader.svelte';
+	import SectionHeader from '$lib/components/common/SectionHeader.svelte';
+	import EmptyState from '$lib/components/common/EmptyState.svelte';
+	import type { PageData } from './$types';
+
+	const { data }: { data: PageData } = $props();
+	const slug = $derived(data.organization.slug);
+
+	// Parse a URL param to an integer only when it falls within [min, max];
+	// anything else (NaN, out of range) is treated as absent. Keeps crafted URLs
+	// from producing malformed date ranges / backend 422s.
+	function intInRange(value: string | null, min: number, max: number): number | null {
+		if (!value) return null;
+		const n = Number.parseInt(value, 10);
+		return Number.isFinite(n) && n >= min && n <= max ? n : null;
+	}
+
+	// All filter/sort state lives in the URL so views are shareable and survive reload.
+	const params = $derived.by(() => {
+		const sp = $page.url.searchParams;
+		const quarter = intInRange(sp.get('quarter'), 1, 4);
+		return {
+			year: intInRange(sp.get('year'), 1970, 9999) ?? new Date().getFullYear(),
+			// Month and quarter are mutually exclusive; quarter wins if both appear.
+			month: quarter ? null : intInRange(sp.get('month'), 1, 12),
+			quarter,
+			currency: sp.get('currency'),
+			sort: sp.get('sort') === 'event_start' ? 'event_start' : 'revenue',
+			order: sp.get('order') === 'asc' ? 'asc' : 'desc'
+		};
+	});
+
+	const period = $derived<PeriodValue>({
+		year: params.year,
+		month: params.month,
+		quarter: params.quarter
+	});
+
+	function updateParams(next: Record<string, string | number | null>) {
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- not reactive state: local URL builder, mutated synchronously then discarded via goto()
+		const sp = new URLSearchParams($page.url.searchParams);
+		for (const [key, value] of Object.entries(next)) {
+			if (value === null || value === '') sp.delete(key);
+			else sp.set(key, String(value));
+		}
+		// eslint-disable-next-line svelte/no-navigation-without-resolve -- same-route query-only update; the relative "?"+params string preserves the current pathname (resolve() cannot express search params)
+		goto(`?${sp.toString()}`, { replaceState: true, keepFocus: true, noScroll: true });
+	}
+
+	function handlePeriodChange(value: PeriodValue) {
+		// Reset the currency to the new period's dominant default — a currency
+		// carried over from another period may have no sales here, which would
+		// otherwise leave the view filtered to an empty currency.
+		updateParams({ year: value.year, month: value.month, quarter: value.quarter, currency: null });
+	}
+
+	function toggleOrder() {
+		updateParams({ order: params.order === 'asc' ? 'desc' : 'asc' });
+	}
+
+	const financialsQuery = createQuery<OrganizationFinancialsSchema>(() => ({
+		queryKey: ['org-financials', slug, params],
+		queryFn: async () => {
+			const response = await organizationadminrevenueGetOrganizationFinancials({
+				path: { slug },
+				query: {
+					year: params.year,
+					month: params.month,
+					quarter: params.quarter,
+					currency: params.currency,
+					sort: params.sort,
+					order: params.order
+				}
+			});
+			if (response.error || !response.data) {
+				throw new Error('Failed to load organization financials');
+			}
+			return response.data;
+		}
+	}));
+
+	const financials = $derived(financialsQuery.data);
+	const activeCurrency = $derived(financials?.active_currency ?? params.currency ?? null);
+
+	// Ticket totals, membership money and their sum, all narrowed to the active
+	// currency. See `entries.ts` for why `combined` is withheld when only one side
+	// has money, and why "nothing at all" is not the same as "no ticket sales".
+	const sections = $derived(selectSections(financials, activeCurrency));
+
+	const expanded = $state<Record<string, boolean>>({});
+	function toggleExpanded(eventId: string) {
+		expanded[eventId] = !expanded[eventId];
+	}
+
+	function eventEntry(event: EventFinancialsSchema): CurrencyFinancialsSchema | undefined {
+		return entryFor(event.by_currency, activeCurrency);
+	}
+</script>
+
+<svelte:head>
+	<title>{m['financials.title']()} · {data.organization.name}</title>
+	<meta name="robots" content="noindex, nofollow" />
+</svelte:head>
+
+<section class="space-y-6">
+	{#snippet financialsActions()}
+		<RevenueReportButton {slug} {period} />
+	{/snippet}
+	<PageHeader
+		title={m['financials.title']()}
+		subtitle={m['financials.subtitle']()}
+		actions={financialsActions}
+	/>
+
+	<!-- Filters -->
+	<div
+		class="flex flex-wrap items-end justify-between gap-4 rounded-lg border border-border bg-card p-4"
+	>
+		<PeriodFilter value={period} onChange={handlePeriodChange} />
+
+		<div class="flex flex-wrap items-end gap-3">
+			<div class="flex flex-col gap-1">
+				<label for="financials-sort" class="text-xs font-medium text-muted-foreground">
+					{m['financials.sort.label']()}
+				</label>
+				<div class="flex gap-2">
+					<select
+						id="financials-sort"
+						value={params.sort}
+						onchange={(e) => updateParams({ sort: e.currentTarget.value })}
+						class="h-9 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+					>
+						<option value="revenue">{m['financials.sort.revenue']()}</option>
+						<option value="event_start">{m['financials.sort.eventStart']()}</option>
+					</select>
+					<button
+						type="button"
+						onclick={toggleOrder}
+						class="inline-flex h-9 items-center gap-1.5 rounded-md border border-input bg-background px-3 text-sm font-medium transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						aria-label={params.order === 'asc'
+							? m['financials.sort.ascending']()
+							: m['financials.sort.descending']()}
+					>
+						<ArrowUpDown class="h-4 w-4" aria-hidden="true" />
+						{params.order === 'asc' ? m['financials.sort.asc']() : m['financials.sort.desc']()}
+					</button>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- Sales by source (#880 follow-up; moved here from /admin/tickets) —
+	     independent of the financials query below, so it stays usable even
+	     while that query is loading or has failed. -->
+	<AttributionBreakdownSection
+		slug={data.organization.slug}
+		organizationId={data.organization.id}
+	/>
+
+	<!-- Currency switcher -->
+	{#if financials && financials.available_currencies.length > 1}
+		<div class="flex flex-wrap items-center gap-2">
+			<span class="text-sm text-muted-foreground">{m['financials.currency.label']()}</span>
+			{#each financials.available_currencies as currency (currency)}
+				<button
+					type="button"
+					onclick={() => updateParams({ currency })}
+					class="rounded-full border px-3 py-1 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring {activeCurrency ===
+					currency
+						? 'border-primary bg-primary/10 text-primary'
+						: 'border-input bg-background text-muted-foreground hover:bg-accent'}"
+					aria-pressed={activeCurrency === currency}
+				>
+					{currency}
+				</button>
+			{/each}
+		</div>
+	{/if}
+
+	{#if financialsQuery.isPending}
+		<div class="flex items-center justify-center py-16" role="status">
+			<Loader2 class="h-6 w-6 animate-spin text-muted-foreground" aria-hidden="true" />
+			<span class="ml-2 text-sm text-muted-foreground">{m['financials.loading']()}</span>
+		</div>
+	{:else if financialsQuery.error}
+		<div
+			role="alert"
+			class="rounded-lg border border-destructive bg-destructive/10 p-6 text-center"
+		>
+			<p class="text-sm font-medium text-destructive">{m['financials.error']()}</p>
+			<button
+				type="button"
+				onclick={() => financialsQuery.refetch()}
+				class="mt-3 inline-flex h-9 items-center justify-center rounded-md border border-input bg-background px-4 text-sm font-medium transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+			>
+				{m['financials.retry']()}
+			</button>
+		</div>
+	{:else if financials}
+		<!-- Period range -->
+		<p class="text-sm text-muted-foreground">
+			{m['financials.periodRange']({
+				from: formatDate(financials.date_from, 'UTC'),
+				to: formatDate(financials.date_to, 'UTC')
+			})}
+		</p>
+
+		{#if sections.nothingAtAll}
+			<EmptyState
+				icon={BarChart3}
+				level={2}
+				title={m['financials.empty.title']()}
+				body={m['financials.empty.description']()}
+			/>
+		{:else}
+			<!-- Ticket totals -->
+			{#if sections.totals}
+				<!-- Bare h2, not SectionHeader: e2e locates this card as the deepest div
+				     containing the "Totals" heading (financials.spec.ts) — SectionHeader's
+				     two wrapper divs would make that innermost div hold only the heading,
+				     not the money figures below it. E2E specs are frozen; the app
+				     accommodates. Same reasoning for the two cards below. -->
+				<div class="space-y-4 rounded-lg border border-border bg-card p-5">
+					<h2 class="text-lg font-bold">{m['financials.totalsHeading']()}</h2>
+					<CurrencyFinancialsSummary data={sections.totals} />
+					<FinancialsNote>{m['financials.netTaxableNote']()}</FinancialsNote>
+				</div>
+			{/if}
+
+			<!-- Membership revenue (org-level, no VAT treatment) -->
+			{#if sections.memberships}
+				<div class="space-y-4 rounded-lg border border-border bg-card p-5">
+					<h2 class="text-lg font-bold">{m['financials.membershipsHeading']()}</h2>
+					<MembershipFinancialsSummary data={sections.memberships} />
+				</div>
+			{/if}
+
+			<!-- Tickets + memberships -->
+			{#if sections.combined}
+				<div class="space-y-4 rounded-lg border border-primary/40 bg-card p-5">
+					<h2 class="text-lg font-bold">{m['financials.combinedHeading']()}</h2>
+					<CombinedTotalsSummary data={sections.combined} />
+				</div>
+			{/if}
+
+			<!-- Per-event breakdown -->
+			<div>
+				<SectionHeader title={m['financials.byEventHeading']()} class="mb-3" />
+
+				{#if financials.events.length === 0}
+					<EmptyState
+						icon={BarChart3}
+						level={3}
+						title={m['financials.empty.eventsTitle']()}
+						body={m['financials.empty.eventsDescription']()}
+					/>
+				{:else}
+					<ul class="space-y-2">
+						{#each financials.events as event (event.event_id)}
+							{@const entry = eventEntry(event)}
+							<li class="overflow-hidden rounded-lg border border-border bg-card">
+								<button
+									type="button"
+									onclick={() => toggleExpanded(event.event_id)}
+									class="flex w-full items-center gap-4 p-4 text-left transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+									aria-expanded={expanded[event.event_id] ?? false}
+								>
+									<div class="min-w-0 flex-1">
+										<span class="block truncate font-bold">{event.event_name}</span>
+										<span class="text-sm text-muted-foreground">
+											{formatEventDate(event.event_start)}
+										</span>
+									</div>
+
+									<div class="hidden shrink-0 text-right sm:block">
+										<span class="block text-xs text-muted-foreground"
+											>{m['financials.gross']()}</span
+										>
+										<span class="tabular-nums">
+											{formatMoney(entry?.gross ?? 0, entry?.currency ?? activeCurrency)}
+										</span>
+									</div>
+
+									<div class="shrink-0 text-right">
+										<span class="block text-xs text-muted-foreground">{m['financials.net']()}</span>
+										<!-- Headline revenue figure: studio's one permitted font-black flourish. -->
+										<span class="font-black tabular-nums">
+											{formatMoney(entry?.net ?? 0, entry?.currency ?? activeCurrency)}
+										</span>
+									</div>
+
+									<ChevronDown
+										class="h-5 w-5 shrink-0 text-muted-foreground transition-transform {expanded[
+											event.event_id
+										]
+											? 'rotate-180'
+											: ''}"
+										aria-hidden="true"
+									/>
+								</button>
+
+								{#if expanded[event.event_id]}
+									<div class="border-t border-border bg-muted/20 p-4">
+										{#if entry}
+											<CurrencyFinancialsSummary data={entry} />
+										{:else}
+											<p class="text-sm text-muted-foreground">
+												{m['financials.noFiguresForCurrency']()}
+											</p>
+										{/if}
+									</div>
+								{/if}
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</div>
+		{/if}
+	{/if}
+</section>

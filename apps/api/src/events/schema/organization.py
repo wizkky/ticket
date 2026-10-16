@@ -1,0 +1,607 @@
+"""Organization-related schemas."""
+
+import typing as t
+from decimal import ROUND_HALF_UP, Decimal
+from uuid import UUID
+
+from ninja import ModelSchema, Schema
+from pydantic import UUID4, AwareDatetime, EmailStr, Field, StringConstraints, model_validator
+
+from accounts.schema import BaseEmailJWTPayloadSchema, MemberUserSchema, MinimalRevelUserSchema
+from common.models import SiteSettings
+from common.schema import BillingInfoSchemaMixin, OneToOneFiftyString, StrippedString, VATIdUpdateBaseSchema
+from common.service.vat_utils import TWO_PLACES, b2b_vat_context
+from events import models
+from events.compliance import (
+    AttendeeInvoicingCapability,
+    ComplianceNotice,
+    NoticeTopic,
+    PaymentChannelCapability,
+    get_policy,
+)
+from events.compliance.base import ALL_NEXUS
+from events.models import (
+    MembershipRequestStatus,
+    Organization,
+    OrganizationMember,
+    OrganizationMembershipRequest,
+    PermissionsSchema,
+)
+from events.models.organization import Organization as OrganizationModel
+from questionnaires.models import QuestionnaireEvaluation
+
+from .attribution import AttributionPayloadMixin
+from .mixins import (
+    CityEditMixin,
+    CityRetrieveMixin,
+    LogoCoverArtThumbnailMixin,
+    SocialMediaSchemaEditMixin,
+    SocialMediaSchemaRetrieveMixin,
+    TaggableSchemaMixin,
+    get_image_field_url,
+)
+
+
+class OrganizationCreateSchema(CityEditMixin, AttributionPayloadMixin):
+    """Schema for creating a new organization."""
+
+    name: OneToOneFiftyString
+    description: StrippedString | None = None
+    contact_email: EmailStr
+
+
+class VerifyOrganizationContactEmailJWTPayloadSchema(BaseEmailJWTPayloadSchema):
+    """JWT payload schema for organization contact email verification."""
+
+    type: t.Literal["org_contact_email_verification"] = "org_contact_email_verification"
+    organization_id: UUID4
+
+
+class OrganizationEditSchema(CityEditMixin, SocialMediaSchemaEditMixin):
+    """Schema for editing an existing organization.
+
+    Note: contact_email is excluded from this schema as it requires
+    a separate verification flow via the update-contact-email endpoint.
+    """
+
+    description: StrippedString = ""
+    visibility: Organization.Visibility
+    accept_membership_requests: bool = False
+    contact_method: Organization.ContactMethod = Organization.ContactMethod.NONE
+    revenue_report_cadence: Organization.RevenueReportCadence = Organization.RevenueReportCadence.NONE
+    membership_grace_period_days: t.Annotated[int, Field(ge=0)] = 7
+    membership_subscription_revival_window_days: t.Annotated[int, Field(ge=0)] = 30
+    membership_refund_policy: StrippedString = ""
+    # Membership eligibility policy defaults (overridable per tier). The questionnaire id
+    # is validated (org-scoped, MEMBERSHIP type) in the service layer before persisting.
+    default_membership_questionnaire_id: UUID | None = None
+    default_requires_membership_approval: bool = False
+
+
+class ComplianceNoticeSchema(Schema):
+    """A non-blocking compliance hint for the organizer; show it next to ``applies_to``."""
+
+    key: str
+    applies_to: NoticeTopic
+    message: str
+
+
+def compliance_notices(notices: list[ComplianceNotice]) -> list[ComplianceNoticeSchema]:
+    """Serialize policy notices."""
+    return [ComplianceNoticeSchema(key=n.key, applies_to=n.applies_to, message=n.message) for n in notices]
+
+
+class OrganizationComplianceSchema(Schema):
+    """What the organization's country lets Revel do (EU layer 1, #1057-#1067).
+
+    Computed, read-only, and effective today (a restriction with a future start date
+    reads ``allowed`` until then). Payment channels describe events held in the org's
+    own country; an event held elsewhere follows that country (the API answers 422).
+    The frontend hides invoicing modes and payment methods from it.
+    """
+
+    country: str = Field(description="Resolved ISO 3166-1 alpha-2 country; empty when undeclared.")
+    region: str = Field(
+        description="ISO 3166-2 subdivision with its own rules (e.g. ES-PV, the Basque Country), from the "
+        "organization's city; empty otherwise."
+    )
+    attendee_invoicing: AttendeeInvoicingCapability
+    online_payment: PaymentChannelCapability
+    offline_payment: PaymentChannelCapability
+    notices: list[ComplianceNoticeSchema]
+
+
+def _compliance(obj: Organization) -> OrganizationComplianceSchema:
+    """Org-level capabilities for the organization's own country, effective today."""
+    policy = get_policy(obj)
+    return OrganizationComplianceSchema(
+        country=policy.country,
+        region=policy.jurisdiction if policy.jurisdiction != policy.country else "",
+        attendee_invoicing=policy.attendee_invoicing_capability(),
+        online_payment=policy.online_payment_capability(),
+        offline_payment=policy.offline_payment_capability(),
+        notices=compliance_notices(policy.organizer_notices(ALL_NEXUS)),
+    )
+
+
+class OrganizationBillingInfoSchema(Schema):
+    """Read-only schema for organization billing info and VAT settings."""
+
+    billing_name: str
+    vat_id: str
+    vat_country_code: str
+    vat_rate: Decimal
+    vat_id_validated: bool
+    vat_id_validated_at: AwareDatetime | None = None
+    billing_address: str
+    billing_email: str
+    invoicing_mode: OrganizationModel.InvoicingMode
+    compliance: OrganizationComplianceSchema
+
+    @staticmethod
+    def resolve_compliance(obj: Organization) -> OrganizationComplianceSchema:
+        """Country-compliance capabilities for the organization."""
+        return _compliance(obj)
+
+
+class OrganizationBillingInfoUpdateSchema(BillingInfoSchemaMixin):
+    """Schema for updating organization billing info (excludes vat_id, use PUT /vat-id).
+
+    vat_country_code must be a valid ISO 3166-1 alpha-2 code.
+    Conflict check with existing VAT ID prefix is done at the controller level.
+    """
+
+    vat_rate: Decimal | None = Field(None, ge=0, le=100)
+
+
+class VATIdUpdateSchema(VATIdUpdateBaseSchema):
+    """Schema for setting/updating the organization's VAT ID."""
+
+
+def _platform_fee_vat_context(obj: Organization) -> tuple[bool, Decimal]:
+    """Return ``(reverse_charge, applicable_vat_rate)`` for the platform fee charged to this org.
+
+    Reads the platform's VAT registration from the :class:`~common.models.SiteSettings`
+    singleton (cached via ``SOLO_CACHE``, so this is not an extra query per request).
+    """
+    site = SiteSettings.get_solo()
+    # unknown_country_domestic mirrors the fee-collection paths so the
+    # advertised rate always equals what a checkout would actually charge.
+    return b2b_vat_context(obj, site.platform_vat_country, site.platform_vat_rate, unknown_country_domestic=True)
+
+
+def _resolve_public_contact_email(obj: Organization) -> str | None:
+    """Return contact_email only when contact_method=EMAIL and the email is verified."""
+    if obj.contact_method == Organization.ContactMethod.EMAIL and obj.contact_email_verified:
+        return obj.contact_email
+    return None
+
+
+class MinimalOrganizationSchema(LogoCoverArtThumbnailMixin):
+    """Lightweight organization schema for use in event lists - excludes city and tags to avoid N+1 queries."""
+
+    id: UUID
+    name: str
+    slug: str
+    description: str | None = ""
+    logo: str | None = None
+    cover_art: str | None = None
+    visibility: Organization.Visibility
+    is_stripe_connected: bool
+    platform_fee_percent: Decimal | None = Field(None, ge=0, le=100)
+    accept_membership_requests: bool
+    contact_method: Organization.ContactMethod
+    contact_email: str | None = None
+
+    @staticmethod
+    def resolve_contact_email(obj: Organization, context: t.Any) -> str | None:
+        """Expose contact_email only when the org opted into EMAIL mode."""
+        return _resolve_public_contact_email(obj)
+
+
+class OrganizationInListSchema(CityRetrieveMixin, TaggableSchemaMixin, LogoCoverArtThumbnailMixin):
+    """Schema for organization list endpoints - includes city and tags with proper prefetching."""
+
+    id: UUID
+    name: str
+    slug: str
+    description: str | None = ""
+    logo: str | None = None
+    cover_art: str | None = None
+    visibility: Organization.Visibility
+    is_stripe_connected: bool
+    platform_fee_percent: Decimal | None = Field(None, ge=0, le=100)
+    accept_membership_requests: bool
+    contact_method: Organization.ContactMethod
+    contact_email: str | None = None
+    updated_at: AwareDatetime | None = None
+    created_at: AwareDatetime | None = None
+
+    @staticmethod
+    def resolve_contact_email(obj: Organization, context: t.Any) -> str | None:
+        """Expose contact_email only when the org opted into EMAIL mode."""
+        return _resolve_public_contact_email(obj)
+
+
+class OrganizationRetrieveSchema(
+    CityRetrieveMixin, TaggableSchemaMixin, SocialMediaSchemaRetrieveMixin, LogoCoverArtThumbnailMixin
+):
+    id: UUID
+    name: str
+    slug: str
+    description: str | None = ""
+    logo: str | None = None
+    cover_art: str | None = None
+    visibility: Organization.Visibility
+    is_stripe_connected: bool
+    platform_fee_percent: Decimal | None = Field(None, ge=0, le=100)
+    accept_membership_requests: bool
+    contact_method: Organization.ContactMethod
+    contact_email: str | None = None
+    # Member-facing subscription policy: shown to prospective subscribers before
+    # they request/pay for a membership. The two day counts joined the public payload
+    # in #809 (2026-07) — the pre-purchase billing disclosure needs the real numbers;
+    # they stay read-only here, writable only via the admin edit schema. Given
+    # defaults so they're non-required in the public schema — narrower org payloads
+    # (list/minimal) that don't carry them stay structurally assignable.
+    membership_refund_policy: str = ""
+    membership_grace_period_days: int = 7
+    membership_subscription_revival_window_days: int = 30
+
+    @staticmethod
+    def resolve_contact_email(obj: Organization, context: t.Any) -> str | None:
+        """Expose contact_email only when the org opted into EMAIL mode."""
+        return _resolve_public_contact_email(obj)
+
+
+class OrganizationAdminDetailSchema(
+    CityRetrieveMixin, TaggableSchemaMixin, SocialMediaSchemaRetrieveMixin, LogoCoverArtThumbnailMixin
+):
+    """Comprehensive organization schema for admin use with all fields including platform fees and Stripe details."""
+
+    id: UUID
+    name: str
+    slug: str
+    description: str | None = ""
+    logo: str | None = None
+    cover_art: str | None = None
+    visibility: Organization.Visibility
+    platform_fee_percent: Decimal
+    platform_fee_fixed: Decimal
+    is_stripe_connected: bool
+    stripe_account_email: str | None = None
+    stripe_account_id: str | None = None
+    stripe_charges_enabled: bool
+    stripe_details_submitted: bool
+    accept_membership_requests: bool
+    contact_method: Organization.ContactMethod
+    contact_email: str | None = None
+    contact_email_verified: bool
+    # VAT / billing
+    billing_name: str
+    vat_id: str
+    vat_country_code: str
+    vat_rate: Decimal
+    vat_id_validated: bool
+    vat_id_validated_at: AwareDatetime | None = None
+    billing_address: str
+    billing_email: str
+    invoicing_mode: OrganizationModel.InvoicingMode
+    revenue_report_cadence: OrganizationModel.RevenueReportCadence
+    # Membership subscription policy
+    membership_grace_period_days: int
+    membership_subscription_revival_window_days: int
+    membership_refund_policy: str
+    # Membership eligibility policy defaults
+    default_membership_questionnaire_id: UUID | None = None
+    default_requires_membership_approval: bool
+    # Platform-fee VAT context (issue #866): computed, read-only. Tells the FE what VAT
+    # applies to Revel's platform fee so net-payout previews can account for it.
+    platform_fee_vat_rate: str
+    platform_fee_reverse_charge: bool
+    compliance: OrganizationComplianceSchema
+
+    @staticmethod
+    def resolve_compliance(obj: Organization) -> OrganizationComplianceSchema:
+        """Country-compliance capabilities for the organization."""
+        return _compliance(obj)
+
+    @staticmethod
+    def resolve_platform_fee_vat_rate(obj: Organization, context: t.Any) -> str:
+        """VAT rate applied to the platform fee, e.g. "20.00" ("0.00" under reverse charge / non-EU)."""
+        _, rate = _platform_fee_vat_context(obj)
+        return str(rate.quantize(TWO_PLACES, rounding=ROUND_HALF_UP))
+
+    @staticmethod
+    def resolve_platform_fee_reverse_charge(obj: Organization, context: t.Any) -> bool:
+        """Whether the EU B2B reverse-charge mechanism applies to the platform fee."""
+        reverse_charge, _ = _platform_fee_vat_context(obj)
+        return reverse_charge
+
+
+class OrganizationPermissionsSchema(Schema):
+    memberships: dict[str, "MinimalOrganizationMemberSchema"] = Field(default_factory=dict)
+    organization_permissions: dict[str, PermissionsSchema | t.Literal["owner"]] | None = None
+
+
+class OrganizationMembershipRequestCreateSchema(Schema):
+    message: t.Annotated[str, StringConstraints(max_length=500, strip_whitespace=True)] | None = None
+
+
+class OrganizationContactMessageCreateSchema(Schema):
+    """Payload for the public contact-organization endpoint."""
+
+    # subject ends up in the email Subject header; reject embedded \r/\n so the
+    # task can't trip Django's BadHeaderError on send.
+    subject: t.Annotated[
+        str,
+        StringConstraints(max_length=200, strip_whitespace=True, pattern=r"^[^\r\n]*$"),
+    ] = ""
+    message: t.Annotated[str, StringConstraints(min_length=1, max_length=2000, strip_whitespace=True)]
+
+
+class MembershipApplicationSubmissionInfo(Schema):
+    """Pointer to the submission that satisfied the questionnaire gate."""
+
+    id: UUID4
+    # The FE review route is keyed on the OrganizationQuestionnaire, not the raw questionnaire.
+    org_questionnaire_id: UUID4
+    evaluation_status: QuestionnaireEvaluation.QuestionnaireEvaluationStatus | None = None
+
+
+class OrganizationMembershipRequestRetrieve(ModelSchema):
+    user: MinimalRevelUserSchema
+    status: MembershipRequestStatus
+    tier: "MembershipTierSchema | None" = None
+    questionnaire_submission: MembershipApplicationSubmissionInfo | None = None
+
+    class Meta:
+        model = OrganizationMembershipRequest
+        fields = ["id", "status", "message", "created_at", "user", "tier"]
+
+    @staticmethod
+    def resolve_questionnaire_submission(obj: OrganizationMembershipRequest) -> dict[str, t.Any] | None:
+        """Return the attached submission plus its OrganizationQuestionnaire pk and evaluation status.
+
+        Returns a plain dict rather than a ``MembershipApplicationSubmissionInfo`` instance: Ninja's
+        response pipeline re-validates nested values, and a pre-built schema instance no longer
+        carries the Django relations the outer validator expects.
+
+        Resolves through the ``select_related`` chain set up by the admin list queryset. Yields
+        ``None`` if the OrganizationQuestionnaire is gone — a dangling pointer the FE cannot link
+        to is worse than an absent one.
+        """
+        submission = obj.questionnaire_submission
+        if submission is None:
+            return None
+        org_questionnaire = getattr(submission.questionnaire, "org_questionnaires", None)
+        if org_questionnaire is None:
+            return None
+        evaluation = getattr(submission, "evaluation", None)
+        return {
+            "id": submission.pk,
+            "org_questionnaire_id": org_questionnaire.pk,
+            "evaluation_status": evaluation.status if evaluation is not None else None,
+        }
+
+
+class ApproveMembershipRequestSchema(Schema):
+    """Schema for approving a membership request.
+
+    ``tier_id`` is optional when the application already carries a tier (new flow).
+    Required for legacy tier-less applications.
+    """
+
+    tier_id: UUID4 | None = None
+    force: bool = Field(
+        default=False,
+        description=(
+            "Approve even when the user holds an active subscription or a paused membership. "
+            "Without this, such an approval is refused so a free grant cannot silently overwrite a paid tier."
+        ),
+    )
+
+
+class MembershipTierSchema(ModelSchema):
+    description: str | None = None
+
+    class Meta:
+        model = models.MembershipTier
+        fields = ["id", "name", "description", "display_order"]
+
+
+class MembershipTierAdminSchema(MembershipTierSchema):
+    """Admin-facing tier view exposing the eligibility-policy overrides for form prefill.
+
+    ``requires_membership_approval`` is tri-state: ``None`` means "inherit the org default".
+    Kept separate from the member-facing ``MembershipTierSchema`` so these policy fields
+    don't leak into nested member/subscription/ticket-tier serializations.
+    """
+
+    membership_questionnaire_id: UUID | None = None
+    requires_membership_approval: bool | None = None
+
+
+class MembershipTierCreateSchema(Schema):
+    name: OneToOneFiftyString
+    description: str | None = None
+    membership_questionnaire_id: UUID | None = None
+    requires_membership_approval: bool | None = None
+
+
+class MembershipTierUpdateSchema(Schema):
+    name: OneToOneFiftyString | None = None
+    description: str | None = None
+    membership_questionnaire_id: UUID | None = None
+    requires_membership_approval: bool | None = None
+
+
+class MemberVerificationTierSchema(Schema):
+    """Minimal tier info for door verification."""
+
+    id: UUID
+    name: str
+
+
+class MemberVerificationSchema(Schema):
+    """Lean door-verification view of a membership.
+
+    Deliberately reports EVERY status (paused, cancelled, banned) rather than
+    404ing on non-active members: the door needs to see "banned", not a lookup
+    failure. Identity fields (name, photo via user) are the anti-impersonation
+    measure — staff compare the face to the card.
+
+    No ``kind`` discriminator here: this schema is the sole response of the
+    verify endpoint and appears nested (as ``member``) in the check-in union —
+    the discriminators live on the two top-level union schemas only.
+    """
+
+    member_id: UUID
+    status: OrganizationMember.MembershipStatus
+    tier: MemberVerificationTierSchema | None = None
+    member_since: AwareDatetime
+    user: MinimalRevelUserSchema
+
+    @classmethod
+    def from_member(cls, member: OrganizationMember) -> "MemberVerificationSchema":
+        """Build from a member row with ``user`` and ``tier`` select_related."""
+        return cls(
+            member_id=member.id,
+            status=t.cast(OrganizationMember.MembershipStatus, member.status),
+            tier=MemberVerificationTierSchema(id=member.tier.id, name=member.tier.name) if member.tier else None,
+            member_since=member.created_at,
+            user=MinimalRevelUserSchema.from_orm(member.user),
+        )
+
+
+class MinimalOrganizationMemberSchema(ModelSchema):
+    """Organization member info without user details - used in permission contexts."""
+
+    member_since: AwareDatetime = Field(alias="created_at")
+    tier: MembershipTierSchema | None = None
+
+    class Meta:
+        model = models.OrganizationMember
+        fields = ["created_at", "status", "tier"]
+
+
+class OrganizationMemberUpdateSchema(Schema):
+    status: OrganizationMember.MembershipStatus | None = None
+    tier_id: UUID4 | None = None
+
+
+class OrganizationStaffSchema(Schema):
+    user: MemberUserSchema
+    staff_since: AwareDatetime = Field(alias="created_at")
+    permissions: PermissionsSchema
+
+
+class MemberAddSchema(Schema):
+    tier_id: UUID
+
+
+class OrganizationTokenSchema(ModelSchema):
+    # Additive, public-safe org details so the pre-claim token preview (unauthenticated)
+    # can render which organization the invitee is joining without a second lookup.
+    # ``organization`` stays a bare UUID to keep the org-admin token list contract unchanged.
+    organization_name: str
+    organization_slug: str
+    organization_logo_url: str | None = None
+    membership_tier_name: str | None = None
+
+    class Meta:
+        model = models.OrganizationToken
+        fields = [
+            "id",
+            "name",
+            "issuer",
+            "organization",
+            "expires_at",
+            "uses",
+            "max_uses",
+            "grants_membership",
+            "grants_staff_status",
+            "membership_tier",
+            "created_at",
+        ]
+
+    @staticmethod
+    def resolve_organization_name(obj: models.OrganizationToken) -> str:
+        """Return the token's organization name."""
+        return obj.organization.name
+
+    @staticmethod
+    def resolve_organization_slug(obj: models.OrganizationToken) -> str:
+        """Return the token's organization slug."""
+        return obj.organization.slug
+
+    @staticmethod
+    def resolve_organization_logo_url(obj: models.OrganizationToken) -> str | None:
+        """Return the token's organization logo thumbnail URL, if any (public, unsigned)."""
+        return get_image_field_url(obj.organization, "logo_thumbnail")
+
+    @staticmethod
+    def resolve_membership_tier_name(obj: models.OrganizationToken) -> str | None:
+        """Return the granted membership tier's name, if the token targets a specific tier."""
+        return obj.membership_tier.name if obj.membership_tier else None
+
+
+class OrganizationTokenRejectionSchema(Schema):
+    """Returned with 410 Gone when an org token exists but is no longer servable.
+
+    Lets the unauthenticated pre-claim page tell "expired" from "used up" and still
+    render which organization the dead link pointed at.
+    """
+
+    message: str
+    reason: t.Literal["expired", "used_up"]
+    organization_name: str
+    organization_slug: str
+
+
+class OrganizationTokenBaseSchema(Schema):
+    name: OneToOneFiftyString | None = None
+    max_uses: int = 1
+    grants_membership: bool = True
+    grants_staff_status: bool = False
+    membership_tier_id: UUID4 | None = None
+
+
+class OrganizationTokenCreateSchema(OrganizationTokenBaseSchema):
+    duration: int = 24 * 60
+
+    @model_validator(mode="after")
+    def validate_token_grants(self) -> "OrganizationTokenCreateSchema":
+        """Validate token grant configuration.
+
+        Ensures:
+        - At least one of grants_membership or grants_staff_status is True
+        - membership_tier_id is provided when grants_membership is True
+        """
+        if not self.grants_membership and not self.grants_staff_status:
+            raise ValueError("At least one of grants_membership or grants_staff_status must be True")
+        if self.grants_membership and not self.membership_tier_id:
+            raise ValueError("membership_tier_id is required when grants_membership is True")
+        return self
+
+
+class OrganizationTokenUpdateSchema(OrganizationTokenBaseSchema):
+    expires_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def validate_token_grants(self) -> "OrganizationTokenUpdateSchema":
+        """Validate token grant configuration for updates.
+
+        Ensures:
+        - If both grants are explicitly set, at least one must be True
+        - membership_tier_id is provided when grants_membership is explicitly set to True
+        """
+        both_explicitly_set = (
+            "grants_membership" in self.model_fields_set and "grants_staff_status" in self.model_fields_set
+        )
+        if both_explicitly_set and not self.grants_membership and not self.grants_staff_status:
+            raise ValueError("At least one of grants_membership or grants_staff_status must be True")
+        # Only validate tier if grants_membership was explicitly set to True in the update payload
+        if "grants_membership" in self.model_fields_set and self.grants_membership and not self.membership_tier_id:
+            raise ValueError("membership_tier_id is required when grants_membership is True")
+        return self

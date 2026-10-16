@@ -1,0 +1,32 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<p>{% blocktranslate with event=context.event_name %}Your ticket refund for <strong>{{ event }}</strong> has been processed.{% endblocktranslate %}</p>
+
+<div class="card">
+    <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+    <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+    {% if context.event_location %}<div class="info-row">📍 {{ context.event_location }}</div>{% endif %}
+</div>
+
+<div class="card">
+    <h3 style="margin-top: 0;">💰 {% trans "Refund Information" %}</h3>
+    <div class="info-row"><span class="label">{% trans "Amount:" %}</span> <strong>{{ context.refund_amount }} {{ context.payment_currency }}</strong></div>
+    <div class="info-row"><span class="label">{% trans "Ticket ID:" %}</span> <code>{{ context.ticket_id }}</code></div>
+    <div class="info-row"><span class="label">{% trans "Tier:" %}</span> {{ context.tier_name }}</div>
+</div>
+
+{% if context.refund_reason %}
+<div class="card">
+    <h3 style="margin-top: 0;">{% trans "Reason" %}</h3>
+    <p>{{ context.refund_reason }}</p>
+</div>
+{% endif %}
+
+<p>{% blocktranslate %}The refund will appear in your original payment method within <strong>5-10 business days</strong>, depending on your bank or card issuer.{% endblocktranslate %}</p>
+
+<center>
+    <a href="{{ context.event_url }}" class="button">{% trans "View Event Details" %}</a>
+</center>
+{% endblock %}

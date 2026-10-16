@@ -1,0 +1,42 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block extra_styles %}
+.comments { background:#f0f0f0; padding:15px; margin:15px 0; border-radius:4px; font-style:italic; color:#555; }
+{% endblock %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+{% if context.evaluation_status == "APPROVED" %}
+    {% if context.event_name %}
+<p>{% blocktranslate with questionnaire=context.questionnaire_name event=context.event_name %}Great news! Your questionnaire <strong>{{ questionnaire }}</strong> for <strong>{{ event }}</strong> has been approved.{% endblocktranslate %}</p>
+    {% else %}
+<p>{% blocktranslate with questionnaire=context.questionnaire_name org=context.organization_name %}Great news! Your questionnaire <strong>{{ questionnaire }}</strong> for <strong>{{ org }}</strong> has been approved.{% endblocktranslate %}</p>
+    {% endif %}
+{% else %}
+    {% if context.event_name %}
+<p>{% blocktranslate with questionnaire=context.questionnaire_name event=context.event_name %}Your questionnaire <strong>{{ questionnaire }}</strong> for <strong>{{ event }}</strong> was not approved.{% endblocktranslate %}</p>
+    {% else %}
+<p>{% blocktranslate with questionnaire=context.questionnaire_name org=context.organization_name %}Your questionnaire <strong>{{ questionnaire }}</strong> for <strong>{{ org }}</strong> was not approved.{% endblocktranslate %}</p>
+    {% endif %}
+{% endif %}
+<div class="card {% if context.evaluation_status == "APPROVED" %}{% else %}card--danger{% endif %}">
+    <div class="info-row"><span class="label">{% trans "Questionnaire:" %}</span> {{ context.questionnaire_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Organization:" %}</span> {{ context.organization_name }}</div>
+    {% if context.event_name %}<div class="info-row"><span class="label">{% trans "Event:" %}</span> {{ context.event_name }}</div>{% endif %}
+    <div class="info-row"><span class="label">{% trans "Status:" %}</span> {% if context.evaluation_status == "APPROVED" %}{% trans "Approved" %}{% else %}{% trans "Not Approved" %}{% endif %}</div>
+    {% if context.evaluation_score %}<div class="info-row"><span class="label">{% trans "Score:" %}</span> {{ context.evaluation_score }}</div>{% endif %}
+</div>
+{% if context.evaluation_comments %}
+<p><strong>{% trans "Evaluator Comments:" %}</strong></p>
+<div class="comments">{{ context.evaluation_comments }}</div>
+{% endif %}
+{% if context.evaluation_status == "APPROVED" and context.event_url %}
+<div class="card card--warning">
+    <strong>⚠️ {% trans "Important:" %}</strong> {% if context.requires_ticket %}{% trans "Approval does not mean you are registered. Please secure your ticket to confirm your attendance." %}{% else %}{% trans "Approval does not mean you are registered. Please RSVP to confirm your attendance." %}{% endif %}
+</div>
+{% endif %}
+{% if context.event_url %}
+<center>
+    <a href="{{ context.event_url }}" class="button {% if context.evaluation_status != "APPROVED" %}button--danger{% endif %}">{% if context.evaluation_status == "APPROVED" %}{% if context.requires_ticket %}{% trans "Get Ticket" %}{% else %}{% trans "RSVP Now" %}{% endif %}{% else %}{% trans "View Event" %}{% endif %}</a>
+</center>
+{% endif %}
+{% endblock %}

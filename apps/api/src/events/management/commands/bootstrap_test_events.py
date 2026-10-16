@@ -1,0 +1,909 @@
+# src/events/management/commands/bootstrap_test_events.py
+
+import typing as t
+import uuid
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+import structlog
+from django.core.management.base import BaseCommand
+from django.utils import timezone
+
+from accounts.models import ReferralApplication, ReferralCode, RevelUser
+from common.models import SiteSettings, Tag
+from events import models as events_models
+from events.management.commands.bootstrap_helpers.compliance import create_compliance_fixtures
+from events.management.commands.bootstrap_helpers.logos import attach_logo
+from events.management.commands.seeder.tickets import ATTRIBUTION_CAMPAIGNS
+from geo.models import City
+from questionnaires import models as questionnaires_models
+
+logger = structlog.get_logger(__name__)
+
+# Org Alpha, seeded by ``bootstrap_events``: the Stripe-connected organization
+# (CONNECTED_TEST_STRIPE_ID), so revival checkouts against it reach real Stripe.
+ORG_ALPHA_SLUG = "revel-events-collective"
+
+# Referral-program fixtures for the frontend E2E suite (J21). Deterministic ids so the
+# specs can build ``/register?referral_invite=<id>`` without an API to look them up.
+REFERRAL_PENDING_APPLICATION_ID = uuid.UUID("aaaaaaaa-0000-4000-8000-000000000001")
+REFERRAL_OPEN_INVITE_ID = uuid.UUID("aaaaaaaa-0000-4000-8000-000000000002")
+REFERRAL_BLOCKED_APPLICATION_ID = uuid.UUID("aaaaaaaa-0000-4000-8000-000000000003")
+REFERRAL_REJECTED_APPLICATION_ID = uuid.UUID("aaaaaaaa-0000-4000-8000-000000000004")
+
+
+class Command(BaseCommand):
+    """Bootstrap test events covering all eligibility gates for frontend testing.
+
+    Creates a third organization with events that test every possible eligibility
+    scenario: questionnaires, membership requirements, invitations, capacity limits,
+    RSVP deadlines, ticket sales windows, and event status gates.
+    """
+
+    help = "Bootstrap test events covering all eligibility gates for frontend testing."
+
+    def handle(self, *args, **options) -> None:  # type: ignore[no-untyped-def]
+        """Bootstrap test events data."""
+        logger.info("Starting eligibility test events bootstrap...")
+
+        self.now = timezone.now()
+
+        # Load city
+        self.city = City.objects.get(name="Vienna", country="Austria")
+
+        # Create users
+        self._create_users()
+
+        # Create organization
+        self._create_organization()
+
+        # Create questionnaire
+        self._create_questionnaire()
+
+        # Create test events
+        self._create_test_events()
+
+        # Create ticket tiers
+        self._create_ticket_tiers()
+
+        # Create some relationships to simulate sold-out scenarios
+        self._create_relationships()
+
+        # Seed subscription states no API can arrange (EXPIRED / PAST_DUE)
+        self._create_subscription_fixtures()
+
+        # Referral program: a referrer, applications in every state, an open invite
+        self._create_referral_program_fixtures()
+
+        # EU country compliance (Journey 29): one org per country, pre-gate tiers and a stale draft
+        create_compliance_fixtures(self.now)
+
+        logger.info("Eligibility test events bootstrap complete!")
+        logger.info("\n=== Test Users Created ===")
+        logger.info(f"Random User (no org): {self.random_user.email} / password123")
+        logger.info(f"Admin User: {self.admin_user.email} / password123")
+        logger.info(f"Staff User: {self.staff_user.email} / password123")
+        logger.info(f"Member User: {self.member_user.email} / password123")
+        logger.info("Subscription fixtures: test.revival.in@ / test.revival.out@ / test.pastdue@example.com")
+        logger.info("Referrer: test.referrer@example.com / password123 (code test-partner, 20% share)")
+        logger.info(
+            "Referral applications: pending test.applicant@ (%s), open invite test.invitee@ (%s), "
+            "blocked test.blocked@, rejected test.rejected@example.com",
+            REFERRAL_PENDING_APPLICATION_ID,
+            REFERRAL_OPEN_INVITE_ID,
+        )
+        logger.info(f"\nOrganization: {self.org.name} (slug: {self.org.slug})")
+        logger.info("Compliance (Journey 29): test.compliance@example.com / password123, orgs compliance-<cc>")
+
+    def _create_users(self) -> None:
+        """Create test users for eligibility testing."""
+        logger.info("Creating test users...")
+
+        # Random user with no organization memberships
+        self.random_user = RevelUser.objects.create_user(
+            username="test.random@example.com",
+            password="password123",
+            email="test.random@example.com",
+            first_name="Random",
+            last_name="Tester",
+            email_verified=True,
+        )
+
+        # Organization-specific users
+        self.admin_user = RevelUser.objects.create_user(
+            username="test.admin@example.com",
+            password="password123",
+            email="test.admin@example.com",
+            first_name="Test",
+            last_name="Admin",
+            email_verified=True,
+        )
+
+        self.staff_user = RevelUser.objects.create_user(
+            username="test.staff@example.com",
+            password="password123",
+            email="test.staff@example.com",
+            first_name="Test",
+            last_name="Staff",
+            email_verified=True,
+        )
+
+        self.member_user = RevelUser.objects.create_user(
+            username="test.member@example.com",
+            password="password123",
+            email="test.member@example.com",
+            first_name="Test",
+            last_name="Member",
+            email_verified=True,
+        )
+
+        logger.info("Created 4 test users")
+
+    def _create_organization(self) -> None:
+        """Create test organization with members."""
+        logger.info("Creating test organization...")
+
+        self.org = events_models.Organization.objects.create(
+            name="Eligibility Test Organization",
+            slug="eligibility-test-org",
+            owner=self.admin_user,
+            visibility=events_models.Organization.Visibility.PUBLIC,
+            description="""This organization contains test events designed to showcase every eligibility gate and access control scenario in the Revel platform. Perfect for frontend testing!
+
+## Purpose
+- Test all NextStep scenarios
+- Validate eligibility checks
+- Test user experience flows
+- Frontend development and QA
+""",  # noqa: E501
+            city=self.city,
+        )
+
+        # Add staff and members
+        self.org.staff_members.add(self.staff_user)
+
+        # Add member with default tier
+        default_tier = events_models.MembershipTier.objects.get(organization=self.org, name="General membership")
+        events_models.OrganizationMember.objects.create(organization=self.org, user=self.member_user, tier=default_tier)
+
+        # Add some tags
+        Tag.objects.get_or_create(name="tech", defaults={"color": "#6C5CE7"})
+        Tag.objects.get_or_create(name="test", defaults={"color": "#FF6B6B"})
+        self.org.add_tags("tech", "test")
+
+        # Update organization settings
+        self.org.accept_membership_requests = True
+        self.org.contact_email = "test@eligibility.example.com"
+        self.org.contact_email_verified = True
+        self.org.save()
+
+        # Give it a placeholder logo so the frontend's branding accents render
+        attach_logo(self.org, key=self.org.slug, name=self.org.name)
+
+        logger.info(f"Created organization: {self.org.name}")
+
+    def _create_questionnaire(self) -> None:
+        """Create a simple questionnaire for testing."""
+        logger.info("Creating test questionnaire...")
+
+        # Simple automatic questionnaire
+        self.questionnaire = questionnaires_models.Questionnaire.objects.create(
+            name="Eligibility Test Questionnaire",
+            status=questionnaires_models.Questionnaire.QuestionnaireStatus.PUBLISHED,
+            evaluation_mode=questionnaires_models.Questionnaire.QuestionnaireEvaluationMode.AUTOMATIC,
+            shuffle_questions=False,
+            llm_backend=questionnaires_models.Questionnaire.QuestionnaireLLMBackend.MOCK,
+            max_attempts=3,
+            min_score=Decimal("100.00"),
+        )
+
+        section = questionnaires_models.QuestionnaireSection.objects.create(
+            questionnaire=self.questionnaire,
+            name="Agreement",
+            order=1,
+        )
+
+        question = questionnaires_models.MultipleChoiceQuestion.objects.create(
+            questionnaire=self.questionnaire,
+            section=section,
+            question="Do you agree to participate in this test event?",
+            allow_multiple_answers=False,
+            shuffle_options=False,
+            positive_weight=1,
+            negative_weight=0,
+            is_fatal=True,
+            is_mandatory=True,
+            order=1,
+        )
+
+        questionnaires_models.MultipleChoiceOption.objects.create(
+            question=question,
+            option="Yes, I agree",
+            is_correct=True,
+            order=1,
+        )
+
+        questionnaires_models.MultipleChoiceOption.objects.create(
+            question=question,
+            option="No, I decline",
+            is_correct=False,
+            order=2,
+        )
+
+        # Add a free text question
+        questionnaires_models.FreeTextQuestion.objects.create(
+            questionnaire=self.questionnaire,
+            section=section,
+            question="Why are you interested in attending this event? (This helps us understand our attendees better)",
+            llm_guidelines="Look for genuine interest and enthusiasm. Any thoughtful response should be accepted.",
+            positive_weight=1,
+            negative_weight=0,
+            is_fatal=False,
+            is_mandatory=True,
+            order=2,
+        )
+
+        # Create OrganizationQuestionnaire
+        self.org_questionnaire = events_models.OrganizationQuestionnaire.objects.create(
+            organization=self.org,
+            questionnaire=self.questionnaire,
+            questionnaire_type=events_models.OrganizationQuestionnaire.QuestionnaireType.ADMISSION,
+        )
+
+        logger.info("Created test questionnaire")
+
+    def _create_test_events(self) -> None:
+        """Create events testing each eligibility gate."""
+        logger.info("Creating test events for each eligibility scenario...")
+
+        self.events = {}
+
+        # Event 1: Perfect event - random user should be able to access
+        self.events["accessible"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="✅ Accessible Public Event",
+            slug="test-accessible-event",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now + timedelta(days=30),
+            end=self.now + timedelta(days=30, hours=3),
+            max_attendees=0,  # Unlimited
+            description="""# ✅ Accessible Public Event
+
+**Test Scenario:** No restrictions - any user can RSVP
+
+This event has:
+- ✅ Public visibility
+- ✅ Public event type
+- ✅ Status: OPEN
+- ✅ No ticket required
+- ✅ No questionnaire
+- ✅ No RSVP deadline
+- ✅ Unlimited capacity
+
+**Expected NextStep:** RSVP
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 2: Requires questionnaire completion
+        event_with_questionnaire = events_models.Event.objects.create(
+            organization=self.org,
+            name="📋 Event Requires Questionnaire",
+            slug="test-event-with-questionnaire",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now + timedelta(days=35),
+            end=self.now + timedelta(days=35, hours=3),
+            description="""# 📋 Event Requires Questionnaire
+
+**Test Scenario:** QuestionnaireGate - Must complete questionnaire first
+
+This event has:
+- ✅ Public visibility
+- ❌ Requires questionnaire completion
+
+**Expected NextStep:** COMPLETE_QUESTIONNAIRE
+**Expected Reason:** Questionnaire has not been filled
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+        self.org_questionnaire.events.add(event_with_questionnaire)
+        self.events["questionnaire"] = event_with_questionnaire
+
+        # Event 3: Members-only event
+        self.events["members_only"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="👥 Members-Only Event",
+            slug="test-members-only-event",
+            event_type=events_models.Event.EventType.MEMBERS_ONLY,
+            visibility=events_models.Event.Visibility.PUBLIC,  # Visible but requires membership
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now + timedelta(days=40),
+            end=self.now + timedelta(days=40, hours=3),
+            description="""# 👥 Members-Only Event
+
+**Test Scenario:** MembershipGate - Must be organization member
+
+This event has:
+- ✅ Public visibility (visible to all)
+- ❌ Members-only event type
+
+**Expected NextStep:** BECOME_MEMBER
+**Expected Reason:** Only members are allowed
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 4: Private event (requires invitation)
+        self.events["private"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="🔒 Private Event (Invitation Required)",
+            slug="test-private-event",
+            event_type=events_models.Event.EventType.PRIVATE,
+            visibility=events_models.Event.Visibility.PUBLIC,  # Visible but requires invitation
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now + timedelta(days=45),
+            end=self.now + timedelta(days=45, hours=3),
+            description="""# 🔒 Private Event (Invitation Required)
+
+**Test Scenario:** InvitationGate - Must have valid invitation
+
+This event has:
+- ✅ Public visibility (visible to all)
+- ❌ Private event type (invitation required)
+
+**Expected NextStep:** REQUEST_INVITATION
+**Expected Reason:** Requires invitation
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 5: Event at capacity (full)
+        self.events["full"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="🚫 Event at Full Capacity",
+            slug="test-full-capacity-event",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now + timedelta(days=50),
+            end=self.now + timedelta(days=50, hours=3),
+            max_attendees=10,  # Will be filled in _create_relationships
+            waitlist_open=True,
+            description="""# 🚫 Event at Full Capacity
+
+**Test Scenario:** AvailabilityGate - Event is full
+
+This event has:
+- ✅ Public visibility
+- ❌ Max attendees reached (10/10)
+- ✅ Waitlist available
+
+**Expected NextStep:** JOIN_WAITLIST
+**Expected Reason:** Event is full
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 6: RSVP deadline passed
+        self.events["rsvp_deadline"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="⏰ RSVP Deadline Passed",
+            slug="test-rsvp-deadline-passed",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now + timedelta(days=10),
+            end=self.now + timedelta(days=10, hours=3),
+            rsvp_before=self.now - timedelta(hours=1),  # Deadline already passed
+            description="""# ⏰ RSVP Deadline Passed
+
+**Test Scenario:** RSVPDeadlineGate - RSVP period ended
+
+This event has:
+- ✅ Public visibility
+- ❌ RSVP deadline has passed
+
+**Expected NextStep:** None
+**Expected Reason:** The RSVP deadline has passed
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 7: Tickets not yet on sale
+        self.events["tickets_not_on_sale"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="🎟️ Tickets Not Yet On Sale",
+            slug="test-tickets-not-on-sale",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=True,
+            start=self.now + timedelta(days=60),
+            end=self.now + timedelta(days=60, hours=3),
+            description="""# 🎟️ Tickets Not Yet On Sale
+
+**Test Scenario:** TicketSalesGate - Sales haven't started
+
+This event has:
+- ✅ Public visibility
+- ❌ Ticket sales start in the future
+
+**Expected NextStep:** None
+**Expected Reason:** Tickets are not currently on sale
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 8: Draft event (not open)
+        self.events["draft"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="📝 Draft Event (Not Yet Open)",
+            slug="test-draft-event",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.DRAFT,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now + timedelta(days=90),
+            end=self.now + timedelta(days=90, hours=3),
+            description="""# 📝 Draft Event (Not Yet Open)
+
+**Test Scenario:** EventStatusGate - Event not yet open
+
+This event has:
+- ✅ Public visibility
+- ❌ Status: DRAFT
+
+**Expected NextStep:** WAIT_FOR_EVENT_TO_OPEN
+**Expected Reason:** Event is not open
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 9: Past event (finished)
+        self.events["finished"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="⏹️ Past Event (Finished)",
+            slug="test-finished-event",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.CLOSED,
+            city=self.city,
+            requires_ticket=False,
+            start=self.now - timedelta(days=7),
+            end=self.now - timedelta(days=6),
+            description="""# ⏹️ Past Event (Finished)
+
+**Test Scenario:** EventStatusGate - Event already ended
+
+This event has:
+- ✅ Public visibility
+- ❌ Event end time in the past
+
+**Expected NextStep:** None
+**Expected Reason:** Event has finished
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 10: Requires ticket purchase
+        self.events["requires_ticket"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="🎫 Event Requires Ticket Purchase",
+            slug="test-requires-ticket",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=True,
+            start=self.now + timedelta(days=55),
+            end=self.now + timedelta(days=55, hours=3),
+            description="""# 🎫 Event Requires Ticket Purchase
+
+**Test Scenario:** User must purchase ticket to attend
+
+This event has:
+- ✅ Public visibility
+- ✅ Tickets on sale
+- ❌ Requires ticket purchase
+
+**Expected NextStep:** PURCHASE_TICKET
+**Expected Reason:** Requires purchase
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        # Event 11: Sold out ticketed event
+        self.events["sold_out"] = events_models.Event.objects.create(
+            organization=self.org,
+            name="💸 Sold Out Event",
+            slug="test-sold-out-event",
+            event_type=events_models.Event.EventType.PUBLIC,
+            visibility=events_models.Event.Visibility.PUBLIC,
+            status=events_models.Event.EventStatus.OPEN,
+            city=self.city,
+            requires_ticket=True,
+            start=self.now + timedelta(days=65),
+            end=self.now + timedelta(days=65, hours=3),
+            max_attendees=5,  # Small capacity
+            waitlist_open=True,
+            description="""# 💸 Sold Out Event
+
+**Test Scenario:** AvailabilityGate - All tickets sold
+
+This event has:
+- ✅ Public visibility
+- ❌ All tickets sold (5/5)
+- ✅ Waitlist available
+
+**Expected NextStep:** JOIN_WAITLIST
+**Expected Reason:** Sold out
+""",
+            address="Test Venue, Vienna, Austria",
+        )
+
+        logger.info(f"Created {len(self.events)} test events")
+
+    def _create_ticket_tiers(self) -> None:
+        """Create ticket tiers for ticketed events."""
+        logger.info("Creating ticket tiers...")
+
+        # Tickets not yet on sale event
+        events_models.TicketTier.objects.filter(
+            event=self.events["tickets_not_on_sale"], name="General Admission"
+        ).update(
+            visibility=events_models.TicketTier.Visibility.PUBLIC,
+            payment_method=events_models.TicketTier.PaymentMethod.ONLINE,
+            purchasable_by=events_models.TicketTier.PurchasableBy.PUBLIC,
+            price=Decimal("50.00"),
+            currency="EUR",
+            total_quantity=100,
+            quantity_sold=0,
+            sales_start_at=self.now + timedelta(days=30),  # Future start date
+            sales_end_at=self.now + timedelta(days=59),
+            description="Tickets on sale starting in 30 days",
+        )
+
+        # Requires ticket event (tickets currently on sale)
+        events_models.TicketTier.objects.filter(event=self.events["requires_ticket"], name="General Admission").update(
+            name="General Admission",
+            visibility=events_models.TicketTier.Visibility.PUBLIC,
+            payment_method=events_models.TicketTier.PaymentMethod.ONLINE,
+            purchasable_by=events_models.TicketTier.PurchasableBy.PUBLIC,
+            price=Decimal("25.00"),
+            currency="EUR",
+            total_quantity=50,
+            quantity_sold=10,
+            sales_start_at=self.now - timedelta(days=1),
+            sales_end_at=self.now + timedelta(days=54),
+            description="Currently on sale",
+        )
+
+        # Sold out event
+        events_models.TicketTier.objects.filter(event=self.events["sold_out"], name="General Admission").update(
+            name="General Admission",
+            visibility=events_models.TicketTier.Visibility.PUBLIC,
+            payment_method=events_models.TicketTier.PaymentMethod.ONLINE,
+            purchasable_by=events_models.TicketTier.PurchasableBy.PUBLIC,
+            price=Decimal("30.00"),
+            currency="EUR",
+            total_quantity=5,
+            quantity_sold=5,  # Sold out
+            sales_start_at=self.now - timedelta(days=5),
+            sales_end_at=self.now + timedelta(days=64),
+            description="SOLD OUT",
+        )
+
+        logger.info("Created ticket tiers")
+
+    def _create_relationships(self) -> None:
+        """Create relationships to simulate full events."""
+        logger.info("Creating test relationships...")
+
+        # Fill up the "full" event with RSVPs
+        # Create dummy users and RSVP them
+        for i in range(10):
+            dummy_user = RevelUser.objects.create_user(
+                username=f"dummy{i}@test.com",
+                password="password123",
+                email=f"dummy{i}@test.com",
+            )
+            events_models.EventRSVP.objects.create(
+                event=self.events["full"],
+                user=dummy_user,
+                status=events_models.EventRSVP.RsvpStatus.YES,
+            )
+
+        # Create tickets for sold out event, with a deterministic campaign mix so the
+        # organizer's attribution breakdown/export show real-looking data (#922).
+        sold_out_tier = events_models.TicketTier.objects.get(event=self.events["sold_out"], name="General Admission")
+
+        campaigns = ["newsletter", "newsletter", "instagram", "partner_embed", "direct"]
+        for i, campaign in enumerate(campaigns):
+            ticket_user = RevelUser.objects.create_user(
+                username=f"ticketholder{i}@test.com",
+                password="password123",
+                email=f"ticketholder{i}@test.com",
+            )
+            events_models.Ticket.objects.create(
+                guest_name=ticket_user.get_display_name(),
+                event=self.events["sold_out"],
+                user=ticket_user,
+                tier=sold_out_tier,
+                status=events_models.Ticket.TicketStatus.ACTIVE,
+                attribution=ATTRIBUTION_CAMPAIGNS[campaign],
+            )
+
+        # Give the member user an invitation to the private event
+        # (so they can see the difference in eligibility)
+        events_models.EventInvitation.objects.create(
+            event=self.events["private"],
+            user=self.member_user,
+            waives_questionnaire=False,
+            waives_purchase=False,
+            custom_message="You're invited to test the invitation gate!",
+        )
+
+        logger.info("Created test relationships")
+
+    def _create_subscription_fixtures(self) -> None:
+        """Seed EXPIRED / PAST_DUE subscriptions for the revival & grace journeys (issue #795).
+
+        Those two statuses are only ever produced by Stripe webhooks and the daily
+        ``events.expire_subscriptions_past_grace`` sweep, so the frontend E2E suite
+        cannot arrange them through the API. Everything hangs off Org Alpha (the
+        Stripe-connected organization) and is written idempotently so the canonical
+        reseed order stays re-runnable.
+        """
+        logger.info("Creating subscription lifecycle fixtures...")
+
+        org = events_models.Organization.objects.filter(slug=ORG_ALPHA_SLUG).first()
+        if org is None:
+            logger.warning("subscription_fixtures_skipped", reason="org_alpha_missing", slug=ORG_ALPHA_SLUG)
+            return
+
+        tier, _ = events_models.MembershipTier.objects.get_or_create(
+            organization=org,
+            name="E2E Revival Tier",
+            defaults={"description": "Tier backing the revival / past-due E2E fixtures."},
+        )
+        plan_model = events_models.MembershipSubscriptionPlan
+        plan, _ = plan_model.objects.update_or_create(
+            tier=tier,
+            name="E2E Revival Plan",
+            defaults={
+                "description": "€10/month online plan used by the revival and past-due E2E journeys.",
+                "price": Decimal("10.00"),
+                "currency": "EUR",
+                "period_unit": plan_model.PeriodUnit.MONTH,
+                "period_count": 1,
+                "is_active": True,
+                "sales_status": plan_model.SalesStatus.OPEN,
+                "max_subscriptions": None,
+                "payment_method": plan_model.PaymentMethod.ONLINE,
+            },
+        )
+
+        statuses = events_models.MembershipSubscription.SubscriptionStatus
+
+        # Expired 5 days ago — inside the org's default 30-day revival window,
+        # so ``revival_deadline`` lands ~25 days out and revive is offered.
+        revival_in = self._seed_subscription(
+            org=org,
+            plan=plan,
+            email="test.revival.in@example.com",
+            first_name="Revival",
+            last_name="InWindow",
+            status=statuses.EXPIRED,
+            current_period_end=self.now - timedelta(days=5),
+            expired_at=self.now - timedelta(days=5),
+        )
+
+        # Ledger entry for the last paid period (#802): ``clear_stale_pending_checkout``
+        # deletes payment-less PENDING rows but reverts ones with payment history to
+        # EXPIRED, so an E2E spec that clicks Rejoin and abandons the hosted checkout
+        # stays re-runnable instead of losing the fixture on the next subscribe call.
+        assert revival_in.current_period_start is not None and revival_in.current_period_end is not None
+        payment = revival_in.payments.order_by("-created_at").first() or events_models.MembershipPayment(
+            subscription=revival_in
+        )
+        payment.amount = plan.price
+        payment.currency = plan.currency
+        payment.status = events_models.MembershipPayment.PaymentStatus.SUCCEEDED
+        payment.period_start = revival_in.current_period_start
+        payment.period_end = revival_in.current_period_end
+        payment.occurred_at = revival_in.current_period_start
+        payment.notes = "E2E fixture: last paid period before expiry (#802)."
+        payment.save()
+
+        # Expired 60 days ago — well outside the revival window: revive is refused.
+        self._seed_subscription(
+            org=org,
+            plan=plan,
+            email="test.revival.out@example.com",
+            first_name="Revival",
+            last_name="OutOfWindow",
+            status=statuses.EXPIRED,
+            current_period_end=self.now - timedelta(days=60),
+            expired_at=self.now - timedelta(days=60),
+        )
+
+        # Payment failed 2 days ago — with the org's default 7-day grace period the
+        # account-hub banner shows a deadline 5 days out.
+        self._seed_subscription(
+            org=org,
+            plan=plan,
+            email="test.pastdue@example.com",
+            first_name="Past",
+            last_name="Due",
+            status=statuses.PAST_DUE,
+            current_period_end=self.now - timedelta(days=2),
+            expired_at=None,
+        )
+
+        logger.info("Created subscription lifecycle fixtures", organization=org.slug, plan=plan.name)
+
+    def _seed_subscription(
+        self,
+        *,
+        org: events_models.Organization,
+        plan: events_models.MembershipSubscriptionPlan,
+        email: str,
+        first_name: str,
+        last_name: str,
+        status: events_models.MembershipSubscription.SubscriptionStatus,
+        current_period_end: datetime,
+        expired_at: datetime | None,
+    ) -> events_models.MembershipSubscription:
+        """Create (or reset) a single subscription fixture and its subscriber."""
+        user = RevelUser.objects.filter(username=email).first()
+        if user is None:
+            user = RevelUser.objects.create_user(
+                username=email,
+                password="password123",
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                email_verified=True,
+            )
+
+        # The real ONLINE flow creates the membership on the first paid invoice, so
+        # these one-time subscribers have one. The post_save signal below moves it to
+        # CANCELLED for expired rows and keeps it ACTIVE while in grace.
+        events_models.OrganizationMember.objects.update_or_create(
+            organization=org,
+            user=user,
+            defaults={"tier": plan.tier, "status": events_models.OrganizationMember.MembershipStatus.ACTIVE},
+        )
+
+        subscription = (
+            events_models.MembershipSubscription.objects.filter(user=user, organization=org)
+            .order_by("-created_at")
+            .first()
+        ) or events_models.MembershipSubscription(user=user, organization=org)
+        subscription.plan = plan
+        subscription.status = status
+        subscription.current_period_start = current_period_end - timedelta(days=30)
+        subscription.current_period_end = current_period_end
+        subscription.expired_at = expired_at
+        subscription.cancel_at_period_end = False
+        subscription.cancelled_at = None
+        subscription.pending_plan = None
+        # No live Stripe subscription: revive mints a fresh Checkout Session on the
+        # plan's price rather than resuming a Stripe record (#776).
+        subscription.stripe_subscription_id = None
+        subscription.stripe_checkout_session_id = ""
+        subscription.stripe_schedule_id = ""
+        subscription.save()
+        return subscription
+
+    def _create_referral_program_fixtures(self) -> None:
+        """Seed the referral-program states the frontend E2E suite cannot arrange through the API.
+
+        Public applications go through ``POST /referral/apply`` but every admin decision
+        (approve / reject / block / invite) is Django-admin only, so the decided states are
+        written here directly. Idempotent: rows are keyed by fixed ids and the referrer by email.
+
+        Fixtures:
+        - ``SiteSettings.referral_applications_enabled`` switched on (``/version`` exposes it).
+        - ``test.referrer@example.com`` / password123: enrolled, code ``test-partner`` (stored
+          as typed, matched case-insensitively) with a 20% per-referrer share override.
+        - ``test.applicant@example.com``: PENDING application (id ``REFERRAL_PENDING_APPLICATION_ID``).
+        - ``test.invitee@example.com``: APPROVED admin invite with no account yet
+          (id ``REFERRAL_OPEN_INVITE_ID``) — registering with that email enrolls it.
+        - ``test.blocked@example.com``: BLOCKED — a new application from it is silently dropped (202).
+        - ``test.rejected@example.com``: REJECTED — may apply again.
+        """
+        logger.info("Creating referral program fixtures...")
+
+        site = SiteSettings.get_solo()
+        if not site.referral_applications_enabled:
+            site.referral_applications_enabled = True
+            site.save(update_fields=["referral_applications_enabled"])
+
+        referrer, created = RevelUser.objects.get_or_create(
+            username="test.referrer@example.com",
+            defaults={
+                "email": "test.referrer@example.com",
+                "first_name": "Test",
+                "last_name": "Referrer",
+                "email_verified": True,
+            },
+        )
+        if created:
+            referrer.set_password("password123")
+            referrer.save(update_fields=["password"])
+        ReferralCode.objects.update_or_create(
+            user=referrer, defaults={"code": "test-partner", "revenue_share_percent": Decimal("20.00")}
+        )
+
+        applications: list[tuple[uuid.UUID, dict[str, t.Any]]] = [
+            (
+                REFERRAL_PENDING_APPLICATION_ID,
+                {
+                    "email": "test.applicant@example.com",
+                    "code": "applicant-code",
+                    "note": "Seeded pending application: I run a monthly meetup and want to bring my organizers.",
+                    "status": ReferralApplication.Status.PENDING,
+                    "source": ReferralApplication.Source.APPLICATION,
+                },
+            ),
+            (
+                REFERRAL_OPEN_INVITE_ID,
+                {
+                    "email": "test.invitee@example.com",
+                    "code": "invitee-code",
+                    "admin_note": "Seeded invite awaiting signup.",
+                    "status": ReferralApplication.Status.APPROVED,
+                    "source": ReferralApplication.Source.INVITE,
+                    "decided_by": self.admin_user,
+                    "decided_at": self.now,
+                },
+            ),
+            (
+                REFERRAL_BLOCKED_APPLICATION_ID,
+                {
+                    "email": "test.blocked@example.com",
+                    "code": "blocked-code",
+                    "note": "Seeded application that was permanently rejected.",
+                    "status": ReferralApplication.Status.BLOCKED,
+                    "source": ReferralApplication.Source.APPLICATION,
+                    "decided_by": self.admin_user,
+                    "decided_at": self.now,
+                },
+            ),
+            (
+                REFERRAL_REJECTED_APPLICATION_ID,
+                {
+                    "email": "test.rejected@example.com",
+                    "code": "rejected-code",
+                    "note": "Seeded application that was rejected with a note.",
+                    "admin_note": "Not this year, please apply again once your events are public.",
+                    "status": ReferralApplication.Status.REJECTED,
+                    "source": ReferralApplication.Source.APPLICATION,
+                    "decided_by": self.admin_user,
+                    "decided_at": self.now,
+                },
+            ),
+        ]
+        for application_id, defaults in applications:
+            ReferralApplication.objects.update_or_create(id=application_id, defaults=defaults)
+
+        logger.info("Created referral program fixtures")

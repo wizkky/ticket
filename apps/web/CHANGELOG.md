@@ -1,0 +1,1597 @@
+# Changelog
+
+All notable changes to the Revel Frontend are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [2.22.1] - 2026-10-16
+
+### Fixed
+- The "let's revel" wordmark in social preview (OG) images and the email logo now uses a typographic apostrophe instead of an opening quote
+
+## [2.22.0] - 2026-10-13
+
+### Changed
+- **Organizer alerts for tickets and series passes have their own settings**: owners and staff now see separate "Ticket sold", "Ticket cancelled", "Ticket refunded", "Series pass sold" and "Series pass cancelled" entries in per-type notification settings, with descriptions in all six languages. These are optional and can be switched off independently of your own purchases.
+  - Your own ticket confirmations, cancellations and refunds are "Always on" for everyone, organizers and staff included; the old note saying those toggles only control organizer alerts is gone
+  - The "you may miss bookings" warning for organizers now follows the new organizer alert types
+  - Requires backend v2.22.0 or later
+
+## [2.21.0] - 2026-10-12
+
+### Added
+- **Notification settings now say which emails can't be turned off**: account settings shows the "Some emails always arrive" notice (previously only on the unsubscribe page), with a short reminder under silence-all.
+- **Warning for organizers and staff who switch off booking alerts**: owners and staff of an organization see a non-blocking warning when silence-all, an empty channel list, or disabling a transactional alert (new tickets, cancellations and refunds, RSVPs, questionnaire submissions, membership and invitation requests) means they may miss bookings and pending reviews. Saving is still allowed.
+
+### Changed
+- Per-type notification settings no longer offer a toggle that can't take effect: receipts and notices about your own purchase or account (payments, ticket confirmations, cancellations and refunds, subscription notices, bans, system announcements) are marked "Always on". The ticket toggles stay for organizers and staff, where they control organizer alerts only.
+
+## [2.20.0] - 2026-10-05
+
+### Added
+- **Hide the footer's Solutions column on self-hosted instances**: set `PUBLIC_HIDE_SOLUTIONS_FOOTER=true` to drop the Solutions marketing links (including the referral link) from the footer, read at runtime so no rebuild is needed; the remaining columns fill the row. Unset by default, so the hosted app is unchanged.
+
+## [2.19.0] - 2026-10-05
+
+### Added
+- **Bot check on registration (Cloudflare Turnstile)**: `/register` shows a Turnstile widget whenever the backend publishes `turnstile_site_key` on `/version`, and sends its token with the signup; nothing changes while the backend has Turnstile off
+  - The widget resets after a failed submit (tokens are single-use), and the page re-reads the site key if it couldn't be loaded the first time
+  - If an ad or script blocker stops the widget from loading, the page explains how to allow `challenges.cloudflare.com` instead of failing silently
+  - CSP allows `https://challenges.cloudflare.com` in `script-src` and `frame-src`
+
+## [2.18.2] - 2026-10-04
+
+### Fixed
+
+- Signing in no longer fails with "Invalid response from server", and account pages (`/account/profile`, `/account/settings`, `/account/security`) no longer fail with a server error. Server-rendered pages could intermittently receive API responses they couldn't read, caused by a faulty network library version; the library is now pinned to a fixed release.
+
+## [2.18.1] - 2026-10-03
+
+### Fixed
+
+- Account pages (`/account/profile`, `/account/settings`, `/account/security`) no longer fail with a server error for some users. Server-rendered pages now always receive API responses in a format they can read, and if an unreadable response still arrives they retry it once instead of crashing.
+
+## [2.18.0] - 2026-10-02
+
+### Added
+
+- **EU country rules**: organizations see the rules that apply to their country, and the app enforces them where you sell and invoice.
+  - A "Country rules" card in billing settings names your country and lists its restrictions and notices, with a link to the country docs page.
+  - Invoicing modes the country does not allow (e.g. Croatia, Portugal, Romania, Slovenia, Greece, Hungary) are disabled with the reason next to them. Belgium (Peppol), Poland (KSeF) and Spain (Verifactu) get advance notices. Fiscal-system notices (Croatia, Slovenia, Greece, Hungary) appear beside the attendee-invoicing mode selector.
+  - The Basque Country (TicketBAI) and Navarre (NaTicket) get their own wording and docs links instead of the Spain copy.
+  - In the tier editor, online card payment is disabled up front where the event's country blocks it (e.g. Italy), and existing online tiers there show a banner with a "Change payment method" action.
+  - On the event page, tiers and series passes that cannot be paid online show a disabled "Not available online" button with an explanation before you start checkout. Priced offline and door tiers in Italy show reservation copy.
+  - Tickets show country-specific fiscal details in the ticket view.
+  - When checkout, issuing an invoice, resuming a tier or changing invoicing mode is refused under a country rule, the reason is shown inline.
+- **Documents to issue yourself**: a new billing page (`/org/[slug]/admin/billing/skipped-documents`, owners only) lists the attendee invoices and credit notes Revel skipped under a country policy. You can filter and search them and mark each one as issued with the document number from your own system.
+  - Ticket lists show an "Invoice to issue yourself" badge on those sales and have an "Invoice skipped by Revel" filter.
+  - Attendee invoice drafts that can no longer be issued show the reason and a "Can't be issued" badge, and their Issue button is disabled.
+  - A "Documents to issue yourself" daily summary appears in notification settings, where you can mute it. Its in-app notification opens the documents page for owners and the filtered ticket list for staff.
+
+### Changed
+
+- The logo, favicon, app icons and social sharing images now use the designer's official artwork. The wordmark in share images shows the correct apostrophe in "let’s".
+- Landing page sign-up buttons carry campaign tags through registration, and organizations created from a campaign link are attributed to that campaign. Guests sent to log in from organization creation come back to the same link with its tags.
+
+### Fixed
+
+- Country names in Portuguese use European Portuguese spellings (e.g. "Roménia" instead of "Romênia").
+- Spanish, Italian, French and Portuguese wording of the compliance and invoicing copy reviewed. Spanish now uses "factura rectificativa" for credit notes and "NIF-IVA" for VAT ID throughout.
+
+## [2.17.0] - 2026-10-01
+
+### Added
+
+- Notification settings list "Organization setup tips" (occasional reminders when your organization is still private, has a forgotten draft, or has gone quiet) with a readable name and description, so you can turn them off. Unsubscribe links from these emails offer a one-click stop for setup tips only.
+
+### Changed
+
+- Pages become interactive much sooner on slow phones: each page now loads only the translations it uses instead of every message in every language. On mobile, the menu and language picker no longer ignore taps for several seconds after the page appears.
+
+## [2.16.0] - 2026-09-30
+
+### Added
+
+- **Mute an organization's announcements**: any signed-in member or attendee can mute an organization's announcements from its page. It stops them on every channel, and they stay readable on the page. Followers use the announcements toggle in their follow menu, which is the same setting.
+  - A "Muted organizations" list in `/account/settings` shows everything you have muted and lets you unmute each one.
+- **Undeliverable address banner**: when Revel has stopped emailing your address after a bounce, an invalid or blocked address, or a spam complaint, a banner explains why and since when. It says tickets and receipts are still in the app and offers "Change email address" and "Contact support". It appears across the app (dismissible for the session) and in account settings.
+- The unsubscribe page offers a one-click "Stop these emails" for the kind of email the link came from. For organization announcements it mutes just that organization.
+- People invited to an event without a Revel account can stop invitation emails from the link in the invitation, with a single confirmation button.
+
+### Changed
+
+- Unsubscribing from an email now turns off email only. In-app notifications stay on, "silence everything" stays off, and the page lists the mail that always arrives (tickets, receipts, payment and refund notices, legal and platform notices).
+- After saving unsubscribe preferences, the page shows the confirmation with a "Go home" link instead of redirecting to the homepage after 3 seconds.
+- When inviting people to an event would go over the organization's daily limit of invitations to people without an account, the invite dialog shows the reason and keeps every address, so you can trim the list and retry. The dialog also stops you from sending more than 500 addresses at once.
+
+### Fixed
+
+- Expired or invalid unsubscribe links now show the "Invalid or Expired Link" page, with a way to log in and manage preferences, as soon as they open instead of failing when you save.
+- Turning email back on in notification settings now restores email for every notification type, instead of leaving types switched off by an earlier unsubscribe.
+- After saving notification settings, the Save button no longer stays enabled, and a second save no longer resends unchanged settings.
+- Changes made while notification settings are still saving are no longer overwritten when the save finishes.
+- The heart on the Following button no longer disappears when you hover over it.
+- Event, organization, series, listing and other single-URL pages, and the sitemaps that list them, no longer tell search engines that language versions exist when they don't. Only the translated landing pages list language alternates.
+
+## [2.15.0] - 2026-09-29
+
+### Added
+
+- **Sign in with Revel (OAuth apps)**: third-party apps can ask to act on your Revel account, shown only when the backend has the OAuth provider switched on.
+  - A consent page at `/oauth/authorize` shows the app, whether it is verified, and the permissions it wants (payment-related ones are marked), with Allow, Deny and a "Switch account" link. Signed-out users sign in and come straight back to the same request.
+  - `/account/connected-apps` lists the apps you have authorized, with their permissions and dates, and lets you remove any of them.
+  - `/account/developer-apps` lets developers register their own apps (public or confidential), view and rotate a client secret that is shown only once, edit details and permissions, upload a logo, deactivate and delete apps.
+- Organizers can give a ticket tier its own check-in window ("Check-in opens" / "Check-in closes"), stored relative to the event start so it survives rescheduling, duplication and recurring series. Tiers without one follow the event's check-in window, and a warning appears if the resulting window is empty.
+- Tier cards and ticket details show an "Entry: …" window in the event's timezone when the tier has its own check-in window.
+
+### Fixed
+
+- Signing in from a Follow, Request invitation, Contact, RSVP, claim-invitation or join link, or from an error page, now returns you to the page you started on (including its query string) instead of the dashboard.
+- Resending the verification email from `/register/check-email` keeps the page you were heading to, so the new link still lands there.
+
+## [2.14.1] - 2026-09-27
+
+### Changed
+- SEO landing pages (Eventbrite alternative, self-hosted, privacy, queer, kink, community and club pages) rewritten in all six languages to match what Revel actually does today: the Eventbrite page now describes the real event and ticket-tier import instead of a CSV attendee import that never existed, claims that weren't true (consent management, Stripe required for self-hosting, potluck dietary handling, auto-approval rules, competitor price figures) are gone, and shipped features like reserved seating, guest checkout, discount codes, waitlists, invoices and VAT, guest-list and address visibility, recurring series and lifetime membership plans are now covered.
+
+## [2.14.0] - 2026-09-27
+
+### Added
+
+- **Credit notes for buyers**: `/account/invoices` lists every credit note issued against an invoice, and each one has its own PDF download.
+- Organizers can record a full or partial refund when cancelling a paid offline or at-the-door ticket. The dialog makes clear they return the money themselves and no payment is moved; the refund counts in the event's revenue figures.
+- The box-office sell panel shows door staff the amount to collect for the chosen seat and tier (the seat's category price where the tier prices it), and confirms the recorded amount once the ticket is issued.
+
+### Changed
+
+- Box-office tickets show how they were sold: comps read "Comp" and door sales read "Door sale" in Manage Tickets and the check-in dialog, instead of the tier's "At the Door".
+- Invoices that were only partly refunded are marked "Partially credited" on the buyer's invoices page.
+
+### Fixed
+
+- Fully refunded invoices no longer disappear from the buyer's invoices page; they stay listed as "Cancelled / credited".
+- A box-office sale on a seat whose price category the tier doesn't price is flagged before submitting, instead of failing after "Issue ticket".
+- Cancelling a paid ticket waits until its refund details have loaded, so the refund option can't be skipped by cancelling too early.
+- Invoice PDF downloads no longer get blocked as pop-ups when the PDF takes a moment to generate.
+- Long names no longer push the org admin Members, Staff, Requests, and Tiers grids wider than the screen on phones.
+
+## [2.13.1] - 2026-09-26
+
+### Changed
+
+- Prices across ticketing and checkout are formatted consistently for your language: tier cards, seat-map and venue labels, cart totals, pay-what-you-can hints, discounts, the VAT preview and referral payouts all show amounts and ranges the same way, instead of a raw `EUR 12.50`.
+- Fee copy is corrected: the fixed platform fee is charged per transaction, not per ticket, and the tier form's net-payout estimate now says it assumes a single-ticket order.
+- Pay-what-you-can tiers lead with their price range, with "Pay What You Can" as the caption.
+- When guest checkout is available, logged-out visitors see "Get Tickets" as the primary button.
+- Org admin tabs wrap onto a second row instead of being cut off on narrow screens, and the seat picker and checkout footers lay out cleanly on phones.
+
+### Fixed
+
+- Having Revel open in several tabs no longer logs you out: two tabs refreshing the session at the same moment could wipe the freshly issued session cookie.
+- Potluck actions now tell you when you don't have permission instead of showing a generic failure, and deleting an item you can't delete no longer pretends to succeed.
+- Admin questionnaire and poll pages show the right error — "not found", "no access", or a temporary server problem — instead of reporting every failure as "not found".
+- Questionnaire answer-distribution bars reflect each answer's share of all responses.
+- Event addresses no longer repeat the city and country.
+- Required questionnaire fields are announced to screen readers.
+
+## [2.13.0] - 2026-09-17
+
+### Added
+
+- **Referral program applications**: a new public `/referral/apply` page where anyone can apply to become a referral partner — a short "how it works" explainer, a form for your email, the code you'd like, and an optional note, and clear outcomes for a code that's already taken, an application you've already filed, or too many attempts from one connection. It's reachable from *Solutions* in the footer and from a section on `/account/profile` for users who aren't referrers yet; people who already have a code are pointed at `/account/referral` instead. The page and both entry points only exist while the backend's referral-applications feature is switched on.
+- Registration links carrying a referral invite (`?referral_invite=…`) now name the code that invited you and prefill the invited email address, which stays fixed so the invite can't be lost by editing it. An invite link that no longer resolves quietly falls back to the ordinary registration form.
+
+### Fixed
+
+- Referral codes keep the capitalisation you typed and are matched case-insensitively. A code like `test-partner` is no longer rewritten to `TESTPARTNER` on registration — where it matched nothing — and iOS no longer capitalises the first letter as you type it.
+
+## [2.12.4] - 2026-09-16
+
+### Fixed
+
+- Duration fields keep the unit you picked while you retype the amount: clearing the box no longer silently flips the picker back to hours, so a refund bracket set to *Days* and retyped as `7` saves 7 days, not 7 hours. The same flip affected the waitlist offer expiry, the questionnaire retake window, and a tier's cancellation deadline. Emptying a refund bracket's amount and clicking away now restores the value you had instead of saving a 0-hour bracket, and a half-typed negative number is no longer read as a cleared field.
+
+## [2.12.3] - 2026-09-15
+
+### Fixed
+
+- Ticket cancellation and refund terms are shown again before you pay: each tier in the checkout sheet states whether the ticket is non-refundable, or its refund brackets, cancellation deadline, and any flat fee. Since the cart checkout rewrite these were only visible *after* purchase, so buyers agreed to a policy they had never seen. Free tiers and tiers with no policy set stay silent, as before.
+
+## [2.12.2] - 2026-09-14
+
+### Fixed
+
+- Numeric fields across the app can be cleared and edited down again, the way the event ticket limit was in 2.12.1: backspacing the last digit of a questionnaire's minimum score or maximum attempts, a question's scoring weight, a file-upload limit, a recurring event's generation window or repeat interval, a seat grid's rows and columns, a seat nudge offset, a sector's curve and stagger, or a duration amount no longer refills the field with the minimum — so a value can be lowered or replaced by typing instead of only appended to. Each field now settles when it loses focus, clamping an out-of-range entry then instead of rewriting it mid-keystroke.
+- Negative seat-nudge offsets and sector geometry values can be entered at all: typing the leading `-` used to be turned into `0` before its digits could follow.
+- Editing a seat grid's rows or columns now creates a single undo point per change instead of one per keystroke.
+
+## [2.12.1] - 2026-09-12
+
+### Fixed
+
+- The event-level "Max Tickets Per User" limit can be edited again: backspacing its last digit no longer refills the field with `1`, so the limit can be lowered or replaced by typing instead of only appended to (setting it to `5` previously meant typing the `5` and then deleting the leading `1`). The value settles when the field loses focus — an empty or zero entry falls back to the minimum of `1`, and a decimal or exponent keeps the number entered (`10.5` becomes `10`) instead of being truncated to `1`.
+
+## [2.12.0] - 2026-09-12
+
+### Changed
+
+- Guest checkout and RSVP refusals now explain what to do next instead of surfacing a bare error: a guest whose email already has an account gets sign-in / create-account buttons with that email prefilled, and a guest cart that is too large to email gets a "Log in" link plus a "Split your purchase" button that returns you to the cart with everything intact. Translated in all six languages.
+
+### Fixed
+
+- Seats picked on the seat map no longer disappear from the cart the moment you confirm the selection — the cart summary bar could vanish entirely, and the seats stayed held server-side until their hold expired, which could later resurface as a spurious "no capacity" error.
+- Apple Wallet and Google Wallet now tell a temporary pass-generation failure apart from a deployment that has no wallet credentials: the first says passes are temporarily unavailable and to try again later, instead of the misleading "not configured for this event".
+- Signing in from a guest checkout or RSVP error now returns you to the page you came from instead of stranding you on the dashboard.
+
+## [2.11.0] - 2026-09-09
+
+### Added
+
+- **Campaign attribution**: `utm_*` tags on a landing URL now travel through browsing and into checkout (event/organization/series cards, listing filters and pagination, and the embed loader all carry them), with zero storage on the visitor's device — and organizers get a "Sales by source" breakdown on the tickets admin page with per-campaign counts and click-to-filter rows.
+
+### Fixed
+
+- Failed saves are no longer silently swallowed as successes across the app: when the backend rejects a change, the ticket-tier editor now keeps the dialog open and shows the error (previously it closed as if saved), bookmark and notification read/unread toggles roll back instead of sticking, dietary preference/restriction edits, Telegram connect (the real reason now shows next to the code field), invitation-request cancellation, and questionnaire-file deletion all surface the failure instead of reporting success.
+
+## [2.10.0] - 2026-09-08
+
+### Added
+
+- **Eventbrite integration**: organizations can connect an Eventbrite account and cross-list their events.
+  - Owner-only Integrations page under org admin (also reachable from the admin dashboard quick actions): connect or reconnect an Eventbrite account, pick which Eventbrite organization to link, toggle auto-sync, and disconnect — with clear landing states after the OAuth round-trip and a translated explanation for every error the connection can hit.
+  - New **Listings** tab in the event editor: create an Eventbrite draft, publish it, push updates, and follow a per-field sync report; while a sync is running the tab polls so status stays live.
+  - Ticket sales visible on both sides: per-tier sold counts from Eventbrite next to Revel's own, with totals in the listing header.
+  - Ticket sales can be paused and resumed per tier — on Eventbrite, and on Revel itself via a new switch on the tier card; paused tiers show a badge, and attendees see honest "sales paused" messaging instead of a generic unavailable state.
+  - Import existing Eventbrite events into Revel as draft events, with per-event progress, failure details, and a link to each created draft.
+
+## [2.9.0] - 2026-09-07
+
+### Added
+
+- "Book a call" button on the landing page (in both the hero and the closing panel) when a demo-booking link is configured on the backend; it opens in a new tab and only appears once the link is set, translated in all six languages.
+
+### Fixed
+
+- Picking a daily/weekly digest in notification preferences no longer immediately shows "Invalid time format" with Save disabled — the send time returned by the API (with seconds) is now accepted as-is.
+- A rate-limited or temporarily failing backend no longer makes public pages (events, organizations, series, questionnaires, polls, join links) report "not found": visitors now get a proper "Just a Moment" temporarily-unavailable page — localized in all six languages — instead of a misleading 404.
+
+## [2.8.2] - 2026-09-06
+
+### Fixed
+
+- Long email addresses (and email-shaped display names) no longer overflow the Submitter Information card on the questionnaire submission review page — they now wrap inside the card.
+
+## [2.8.1] - 2026-09-06
+
+### Fixed
+
+- Signing in no longer appears to succeed and then silently drop back to logged out on self-hosted or containerized deployments where the public API address isn't reachable from inside the frontend container: the session-refresh call — and the potluck endpoints — now go through the internal API address like every other server-side request.
+
+## [2.8.0] - 2026-09-04
+
+### Added
+
+- **Single sign-on (OIDC)**: "Continue with …" buttons on `/login` and `/register` for any identity provider the backend has configured, with a dedicated `/auth/callback` that signs you in and returns you to where you started; failed sign-ins show a translated explanation on the login page. A new "Linked sign-in methods" card on `/account/security` lists your connected providers and lets you unlink one (with confirmation).
+- **Guest invitation links**: on an invitation-link join page for an event that allows attending without an account, anonymous visitors get a "Continue as guest" option; the invitation token then travels with them to the event page — unlocking the invited-only tiers the link grants, and staying attached through guest checkout and guest RSVP (and across reloads via a cookie fallback).
+
+### Fixed
+
+- Guests confirming a checkout or RSVP via email no longer hit a generic "No data returned from confirmation" wall — the page now shows the backend's actual reason (tier not allowed, sale window closed, expired token, …), localized where recognized, and clicking an already-used confirmation link shows the "already confirmed" message instead of an error.
+- Logged-out visitors no longer see an enabled purchase button on ticket tiers they aren't allowed to buy (invited-only or members-only tiers): the card now shows a disabled button with a visible "Not Available" reason.
+
+## [2.7.1] - 2026-09-04
+
+### Added
+
+- **Club membership SEO page**: a new `/club-membership-management` landing page (also under `/de`, `/it`, `/fr`, `/es`, `/pt`) speaks to gyms, yoga studios, dance schools and choirs — memberships, members-only classes with a plain RSVP, series passes as class packs, and Wallet membership cards — with a FAQ, `hreflang` alternates, and a place in the sitemap, footer and use-case grid.
+- **"For clubs & studios" panel** on the home page, between the venues and communities panels, with a membership-card illustration showing a members-only class RSVP.
+
+### Changed
+
+- Home page hero now also rotates "class 🏋️" and describes Revel as the platform "for communities, clubs and independent venues" (all six languages); the features panel gains a fifth "Memberships & passes" card.
+- README and web-app manifest positioning widened from LGBTQ+/community events to communities, clubs and independent venues.
+
+## [2.7.0] - 2026-09-01
+
+### Added
+
+- **Cart checkout**: buying tickets is now one cart-first flow for every buyer type, replacing the per-tier purchase-dialog chain.
+  - Quick-buy +/− steppers directly on tier cards, a sticky summary bar with running total and seat-hold countdown, and a single **Buy** button — one reservation, one payment session, no matter how many tiers are in the cart.
+  - A single (skippable) checkout sheet collects per-ticket names, pay-what-you-can amounts, zone and accessible-seating choices, a cart-level discount code with honest per-tier applicability feedback, a multi-item VAT preview, and billing details.
+  - Seated tiers join the cart via **Pick seats…**; seat holds now live as long as the cart, with a visible countdown, and the venue overview map hands selected seats straight into the cart.
+  - Guests get the same steppers, seat picker, and checkout sheet — including discount codes — with an email-confirmation step for carts that aren't paid online, now supporting multiple tickets across multiple tiers in one confirmation.
+  - Ticket limits are now layered: per-tier availability, the event-wide ticket budget, and your personal cap combine into a clear "N tickets left for you at this event" line.
+
+### Changed
+
+- The seat map no longer auto-opens for visitors who already hold a ticket, and buying additional tickets is now governed by the backend's purchase-eligibility check rather than a dialog-only rule.
+
+### Fixed
+
+- RSVP deadlines are now counted in calendar days in your timezone: a deadline on the day after tomorrow no longer reads "in 1 day", single-step values use the locale's idiom ("tomorrow", "übermorgen"), and deadlines under 24 hours away keep hour-level urgency. Relative timestamps across the app share the same engine, and an unparseable date no longer crashes the page.
+- Invoices with mixed VAT rates (e.g. 22% + 10% items) no longer claim a single VAT rate on `/account/invoices` and the org-admin attendee-invoices view — they now show a rate-less VAT total plus a per-rate breakdown table (rate / net / VAT / gross), matching the invoice PDF.
+- A guest's held seats could be silently released before they clicked their confirmation email, and a stale anonymous hold could survive into checkout and free confirmation-pending seats after a later sign-in — both races are fixed.
+
+## [2.6.0] - 2026-08-18
+
+### Added
+
+- **High-fidelity seat geometry** for seated venues:
+  - Rows can now curve (theater-style arcs), stagger, and align left/center/right, with per-row overrides — no longer just rectangular grids. Every save bakes an explicit position for every seat, so the buyer map renders exactly what the organizer laid out.
+  - The sector editor is now WYSIWYG: seats are shown at their real coordinates, so what you edit is what checkout renders, with a live geometry panel alongside.
+  - A new **Adjust seats** mode allows dragging or arrow-key nudging individual seats, rotating them, appending seats to a row, adding seats anywhere, and removing them — with full session undo/redo (`Cmd/Ctrl+Z`).
+  - Seat rotation is visible to buyers too, rendered as a seat-back notch on the checkout map.
+  - When adjusted seats no longer fit a drawn sector outline, a dialog offers to auto-fit or clear the outline instead of failing the save.
+
+### Changed
+
+- All seat surfaces (designer, editor, checkout map) now share one visual language: dark poster-ink panel, solid price-category color dots, dimmed unavailable seats (the X marks are gone), a circular selection ring, and a clear amber keyboard-focus ring.
+- The organization admin header and tab strip now scroll away with the page instead of staying pinned, leaving only the global navbar fixed — more room for content on every admin page.
+
+### Fixed
+
+- Seats next to an aisle no longer sit one unit apart between the editor and the buyer map: the legacy editor stored aisle-shifted positions with an off-by-one that disagreed with its own aisle rails. Re-saving an existing sector with aisles applies the correction.
+
+## [2.5.1] - 2026-08-12
+
+### Changed
+
+- The **Download PDF** button now looks and behaves identically on tickets, series passes and membership cards. Ticket PDFs are saved in place instead of opening in a new tab (which popup blockers could suppress) and are named after the event (`<event-slug>-ticket.pdf`) rather than a raw ticket UUID.
+
+### Fixed
+
+- Admin tab strips no longer bleed off both edges of a phone screen — on the organization Members and Blacklist pages the first and last tab were pushed outside the viewport and could not be scrolled to.
+- Sticky admin bars no longer stack into each other: page-level bars pinned themselves at a fixed offset that only matched the mobile admin header, so on wider screens they sat *inside* it and the translucent layers smeared together. They now follow the real header height, and on viewports under 640px tall (a landscape phone) the sticky chrome is dropped entirely instead of eating the screen.
+- Two pages no longer scroll sideways on a phone: organization settings (the Stripe action buttons ran past the right edge, and a long contact email now truncates with its full address on hover), and the embed builder (the code snippet now scrolls inside its own box).
+- Ticket PDF download failures now show a translated message instead of hardcoded English.
+- Downloaded PDFs and wallet passes no longer occasionally fail to save in Firefox and Safari, where the download could be cancelled before the browser had read it.
+- Pages no longer appear unstyled after a new deployment on iOS Safari, which had been restoring a cached copy of the old page that referenced assets no longer being served. Long-lived tabs also notice a new deployment and reload fully on the next navigation.
+
+## [2.5.0] - 2026-08-11
+
+### Added
+
+- **Membership cards**: every membership on "My Memberships" now has a "Show card" button that opens the member's card — organization branding, their name and pronouns, tier, member-since date, and a QR code — plus Add to Apple Wallet, Add to Google Wallet and Download PDF where the organization has them configured. The card is an identity credential, not a ticket: it never admits anyone by itself, its validity is checked at the moment it is scanned, and it is shown for paused, cancelled and banned memberships too, each stating in words what a scan of it will report.
+- **Verify a card at the door**: organizations gain a scanner at Members → Verify a card (and from the admin quick actions) that works outside any event — a clubhouse door, a members' night. Each scan shows the member's photo, name, pronouns, tier and true status, with paused, cancelled and banned called out explicitly rather than reported as a failed lookup. The camera stays live between scans, and a manual code field is always available. Requires the "check in attendees" permission.
+- **Membership cards at event check-in**: the event scanner now accepts membership cards as well as tickets and series passes. A member holding exactly one ticket for the event is checked in on the spot; otherwise nothing is checked in and staff get a report showing who the person is, whether their membership is live, and which tickets they hold — each with its own Check in button.
+
+### Changed
+
+- Gender-inclusive wording now applies across all six languages. German follows the gender-star convention consistently — including the SEO landing pages, which a catalog sweep never reached — and drops the ungrammatical `Mitglieder*innen`. French uses neutral rephrasing with the point médian as a fallback; Italian, Spanish and Portuguese use neutral rephrasing only, with no glyphs, since screen readers mangle them.
+
+### Fixed
+
+- Large parts of the German and Italian interface no longer appear in English despite the language being set: 661 German and 589 Italian strings shipped as the untranslated English original and have now been translated, with terminology matched to the wording used in Revel's emails.
+- Download errors on ticket, series-pass and membership PDFs no longer surface raw technical text (for example a network error's `ECONNRESET from upstream`); every failure now shows a translated message.
+- Generated pass and PDF filenames no longer end up with a doubled hyphen when the event or organization name ends in punctuation.
+
+## [2.4.0] - 2026-08-11
+
+### Added
+
+- **Add to Google Wallet**: tickets and series passes gain an "Add to Google Wallet" button alongside the existing Apple Wallet one (ticket list, ticket detail modal, series-pass downloads), using the official badge artwork localized for all six languages. On Android the Google button is listed first, on iOS and desktop the Apple one — nothing is ever hidden.
+- **Organizer refunds**: organizers can refund online (Stripe) ticket payments from the app — full or partial — via a new refund dialog in the tickets admin showing the amount paid, refunds so far, quick amount suggestions, an optional internal reason, and the refund history. Cancelling a ticket can now optionally include a refund, and cancelling an event offers an opt-in "Refund all tickets" background sweep with a per-currency preview against the available Stripe balance and a "Retry refunds" resume button. Refunding no longer implies cancelling: a refunded ticket stays valid, and active tickets can carry a partial-refund badge.
+- **Virtual events and VAT place of supply**: the event form gains a Taxes section with a "Virtual event" checkbox and a VAT-country override (with effective-country readout and a mismatch warning suggesting a tax adviser). For virtual events the address field becomes "Address or meeting link", and a meeting-link address renders as a clickable "Virtual event" row on the public event page instead of leaking a raw URL. Checkout shows a reverse-charge notice for virtual EU B2B buyers and an interim-VAT disclaimer for virtual B2C sales.
+- **Organizer payout transparency**: the landing-page fee calculator gains an "I'm charged VAT on the platform fee" checkbox that folds VAT into the totals, and online ticket tier forms show a "You get: ~€X per ticket" net-payout preview computed from the organization's actual fee rates and VAT treatment.
+- Pending pay-at-the-door tickets now show a "Pending payment confirmation" pill next to their downloads, clarifying that PDFs and wallet passes become valid only once payment is confirmed.
+
+### Changed
+
+- Tickets admin actions were rebalanced: Check In, Confirm payment, Refund payment and Cancel Ticket are inline on each row, while Make member, Manage on Stripe and the rarer actions live in the row's three-dot menu; short data columns no longer wrap.
+
+### Fixed
+
+- Dates and times are now fully localized: month and weekday names follow the UI language everywhere (German previously saw half-English output like "Fr., Okt. 24 • 20:00"), date ranges use locale-aware punctuation, ranges straddling a DST change label each end with its own timezone abbreviation, and Portuguese short dates keep a textual month.
+- Dashboard RSVP and ticket cards, invitation lists, and questionnaire assignments now show times in the event's timezone, matching the event page — previously they silently used the viewer's local clock.
+- The RSVP deadline on the event page no longer doubles its preposition ("RSVP by in 6 days" and equivalents in every language) — the relative time now stands alone under an "RSVP deadline" label, and the exact cutoff date and time is shown beneath it.
+- The announcement composer's event picker is now a searchable typeahead; previously it was a plain dropdown capped at 100 events, so in larger organizations every event past the cap was missing and could never receive an announcement.
+- New events keep the end date and time entered at creation — the create request silently dropped it, so every new draft became a 24-hour event until the next save repaired it. One-off events created from a recurring series' date list are now correctly attached to their series.
+- Opening the paid-ticket checkout no longer fires a failed billing request for buyers who never saved billing details — billing data is only fetched once the "request invoice" section is opened.
+
+## [2.3.3] - 2026-08-05
+
+### Fixed
+
+- The "let's revel." logo now looks the same everywhere and matches the brand styleguide. The navbar, the page footer and the landing page's closing panel each drew it differently: the letter-spacing varied, the full stop was red in one place, amber in another and plain in the third, and the word "revel" was missing its purple-to-crimson brand gradient throughout.
+
+## [2.3.2] - 2026-08-05
+
+### Fixed
+
+- Keyboard focus is now clearly visible on the call-to-action buttons of the SEO landing pages: on the purple poster bands the focus ring used the theme colour and was barely distinguishable from the band, and is now drawn in white over a purple gap, identically in light and dark mode.
+- Status pills (membership, ticket, request and event states) now read correctly in screen readers: their longer descriptions — such as "Membership status: Active" — were silently discarded by assistive technology and are now announced, without the visible label being read twice. The membership pill on the dashboard also announced the raw internal status value instead of the translated label.
+
+## [2.3.1] - 2026-08-05
+
+### Fixed
+
+- Organization logo stickers no longer show decorative heart emoji around the logo (join pages, series page, questionnaire bands), and the event page header no longer shows the organization's logo twice — the "organized by" sticker already carries it.
+
+## [2.3.0] - 2026-08-05
+
+### Changed
+
+- Landing page redesigned as a full-bleed color-block poster: brand-gradient hero with a rotating headline noun, amber pricing panel with direct fee comparison, dedicated panels for communities and for venues/theaters (premium seating), ticket-stub feature stubs, and an open-source panel. Replaces the card-grid landing page.
+
+### Fixed
+
+- On **Create organization**, the "you already own an organization" and "verify your email" notices no longer let the periwinkle header band bleed through their top edge — both now sit on an opaque card like the creation form does.
+
+## [2.2.0] - 2026-08-03
+
+### Added
+
+- **Optional ticket holder names**: organizers can untick a new "Require ticket holder names" setting on ticketed events (in the event editor, the creation wizard, and recurring-event templates). With names off, logged-in checkout shows no holder-name inputs at all, and guest checkout needs only an email address — no first/last name. Holders can be named or renamed after purchase: ticket owners from their ticket in **My tickets**, admins from the event tickets table (blocked once a ticket is checked in or cancelled), and the admin ticket search now matches holder names too.
+
+### Changed
+
+- Returning from a Stripe checkout (tickets, series passes, membership subscriptions) can now travel through opaque, UUID-based URLs that immediately redirect to the usual event, series, or membership page — the backend starts emitting them in an upcoming release. Organization and event names no longer appear in the URLs shared with Stripe. Slug URLs are untouched, and older in-flight checkout sessions keep working.
+
+### Fixed
+
+- Buyers who never set a name on their profile no longer get their email address stamped onto tickets as the holder name (and from there onto the Stripe payment description and invoice). Such tickets now fall back to the localized "Guest" placeholder, and blank holder names render as the purchaser's identity across my-tickets, the admin table, and check-in.
+
+## [2.1.0] - 2026-08-01
+
+### Added
+
+- **Embed builder**: a new **Embed** tab under org admin turns the embeddable-events feature into something you can actually reach. Pick what to embed (the organization's event list, a single event, or a series), set theme, language, frame title and sizing, tune the list filters, and watch a live preview of the real embed as you go. Copy either the loader script or a plain iframe for CMSes that strip `<script>`. Event cards gain an **Embed on your site** action that opens the builder pre-pointed at that event. Only content an anonymous visitor can load is offered, so a copied snippet can't render an error page on your own website.
+
+### Fixed
+
+- The org admin tab strip no longer clips its last tabs on narrower desktop windows — **Settings** was cut off and reachable only by typing its URL. The strip now scrolls.
+
+## [2.0.0] - 2026-07-31
+
+### Added
+
+- **Venue seating**: end-to-end reserved seating, from venue design to seated checkout and the box office.
+  - Interactive seat-map picker for buyers: a positional venue map with pan and zoom, per-seat prices, a price-category legend, a live estimated total, and full keyboard accessibility (roving focus grid). Also available to guests buying without an account.
+  - Selecting a seat places a short server-side hold, so two buyers can never claim the same seat; if someone else grabs it first, the conflict and its reason are shown immediately.
+  - Best-available tiers: buyers pick a price category and quantity, and the venue assigns the best remaining seats.
+  - **Venue designer** for organizers: draw sector blocks, place and rotate the stage, lay out rows and seats, and paint seats with price categories — with a coverage warning listing exactly which seats are still unpainted or unpriced. Buyers viewing a single sector see a stage-direction indicator.
+  - Per-seat-category pricing on ticket tiers: a category price editor in the tier form, server-resolved per-seat prices on the buyer map, and tickets recording the actual price paid.
+  - **Box office**: door sales, comps, reseating, and assigning or overriding seats at check-in, with attendee debt rolled up per order.
+  - Organizers get a notification when a refund cannot be matched to a ticket, with a link that opens the right place to resolve it.
+- **Membership subscriptions**: organizations can sell recurring memberships, and people can hold, pay for, and manage them.
+  - **Tiers and plans** under org admin → **Members**: create and edit membership tiers — each with an optional gating questionnaire and an optional approval requirement — and attach subscription plans to them (monthly, yearly, one-off lifetime, or free).
+  - **Subscribing**: members pick a tier and a plan and pay through Stripe's hosted checkout; free and lifetime plans activate without a payment step. The membership appears as soon as the payment confirms, without needing a refresh.
+  - **My memberships** (`/account/memberships`): every membership you hold, with its plan, status and payment history, plus change-plan, cancel, and rejoin actions.
+  - **Applications**: apply to a tier that requires approval, answering its questionnaire where one is attached; organizers review applications in a **Requests** tab and approve, reject, or force-approve them.
+  - **Organizer visibility**: a subscription metrics strip and a **Subscription payments** tab on the Members admin, membership revenue folded into org financials, staff-side revival of a lapsed membership, and migration of existing subscribers onto a tier.
+- **Public membership page**: memberships have their own `/org/[slug]/membership` page listing every published tier and its plans, instead of sitting on the organization landing page where they pushed events and resources below the fold.
+- **Embeddable events**: organizers can embed Revel on their own website — a filtered event list for an organization, a single event, or an event series — via a one-line loader script or a plain iframe. Embeds honour `?theme=light|dark|auto`, resize themselves to their content, and are also discoverable over oEmbed, so pasting a Revel link into a supporting editor produces a live card. They are server-rendered and ship no application JavaScript to the host page.
+- **Attendance visibility**: a new **Attendance visibility** section in the event wizard, the event editor and recurring-event templates lets organizers decide separately whether guests see the attendee count, the capacity, and the guest list, with one-click **Open** and **Discreet** presets. Anything withheld is now genuinely absent rather than displayed as a zero, and a full event still reads as full.
+- **Membership questionnaires** can finally be authored: the questionnaire type was disabled behind a "Coming soon" badge even though the rest of the flow — the organization default, the per-tier override, and the member-facing fill page — was already in place, so nobody could reach it.
+- **Spanish and European Portuguese**: the whole interface is now available in `es` and `pt`,
+  matching the locales the backend already sends email in. Both are selectable from the language
+  switcher and from your account language setting, and both carry all 7,876 interface strings.
+  The six SEO landing pages have Spanish and Portuguese editions too.
+
+### Changed
+
+- Ticket tiers whose seats have different category prices now advertise their real minimum–maximum price range instead of a single misleading price.
+- The buyer seat map detects when the venue layout has changed and refreshes itself automatically.
+- Ticket tiers with no quantity limit now say "Unlimited" on events that disclose their capacity, instead of showing nothing at all.
+
+### Fixed
+
+- A refused RSVP now explains why it was refused and re-renders the buttons for the step you can actually take, instead of showing an untranslated "No data returned from RSVP".
+- An RSVP the server had just refused could be silently re-submitted as if it had merely been a rejected note. It no longer is.
+- Field-validation errors coming back from the server no longer render as `[object Object]`.
+- Sending event invitations now reports which ticket tiers were rejected, instead of failing with a generic server error.
+- The "show pronoun distribution" opt-in is now saved when creating an event or a recurring-event template — previously it was only honoured when editing an existing event, so switching it on during creation quietly did nothing.
+- Screen readers now announce membership and application load failures instead of leaving a silent spinner, and the "review pending" caveat is part of the questionnaire-submission link's own name, so it survives link-list navigation.
+- Italian and German interfaces no longer fall back to English on roughly 480 strings each —
+  including account deletion, privacy and security settings, invitations, and recurring events,
+  which had been rendering in English to people who had chosen Italian or German. The
+  ineligibility, waitlist and "a spot opened up" messages are covered too.
+- Counted phrases now use each language's real plural forms. They were previously built by
+  tacking an English "s" onto a noun, which produced wrong text in every other language
+  ("3 persona", "3 Platz") and left verbs and adjectives unagreed. Now "3 persone si sono già
+  unite", "3 Plätze", "3 invitaciones".
+- The preferred-language menu on your profile only ever offered English, German and Italian —
+  French was missing since the day it shipped. It now lists every available language.
+- The "Free · Open · Secure" tagline on the home page no longer clips the bottom of letters
+  that dip below the baseline (visible in Spanish and Portuguese as a cut-off "Seguro").
+- The home page welcome now animates its gendered ending in Spanish and Portuguese too, the
+  way it already did in Italian.
+
+### Removed
+
+- The legacy `random` seat-assignment mode for seated events — seat selection is now always explicit (buyer-chosen seats with holds) or best-available by price category.
+
+## [1.69.1] - 2026-07-17
+
+### Fixed
+
+- `robots.txt` no longer exempts search crawlers (Googlebot, Bingbot, and others) from the private-area disallows: per-bot `Allow: /` groups silently replaced the `*` rules, letting those bots crawl `/dashboard`, `/account`, `/api/`, org admin pages, and duplicate-content `?page=` URLs. Crawl policy is now coherent: search crawlers allowed under the shared rules, AI-training bots blocked.
+- Raw Markdown (`#`, `**`, `*`) no longer leaks into search-result and social-share descriptions for events, organizations, and series — descriptions are stripped of Markdown and HTML before being used as meta text.
+
+## [1.69.0] - 2026-07-16
+
+### Added
+
+- **Attendee notes on RSVPs**: organizers can opt in per event ("Accept a note with RSVPs" in the RSVP options, also available on recurring-series templates) to collect an optional note (up to 500 characters) with each RSVP, including guest RSVPs. Attendees see a note dialog when RSVPing and can edit or clear their note by RSVPing again. Organizers see notes in the attendees list, and can add or edit a note when creating or editing an RSVP on an attendee's behalf.
+
+## [1.68.1] - 2026-07-16
+
+### Fixed
+
+- Organization cover images are no longer cropped in the org profile hero: the full image is shown centered, with a blurred copy of itself filling the rest of the banner strip. Non-panoramic covers (e.g. Facebook-format cover art) previously lost most of their height to the crop.
+
+## [1.68.0] - 2026-07-14
+
+### Changed
+
+- **Two-step online checkout**: online (Stripe) purchases — tickets, guest checkout, pay-what-you-can, and season passes — now reserve your spot first and then start payment as a separate step. Interrupted checkouts can be resumed via the existing **Resume Payment** action, expired reservations fall back to a fresh reservation automatically, and a failure to start payment shows a clear, retryable error message in every UI language.
+
+### Fixed
+
+- The membership subscription drawer no longer gets permanently stuck on a loading spinner.
+- The season-pass purchase button is now disabled when the price quote fails to load, instead of remaining clickable.
+- The discount-code edit page shows an error message instead of a blank page when the code fails to load.
+
+## [1.67.0] - 2026-07-13
+
+### Added
+
+- **Org subscription policy editing**: a new "Subscription policy" section on the org admin **Settings** page lets owners set the membership **grace period** (days) and **refund policy** (rich text). Every save round-trips both fields, so editing one setting never silently wipes the others.
+- **Member-facing refund policy**: the organization's membership refund policy is now shown to prospective members in the Request-Membership dialog before they submit.
+- **RSVP on behalf of an attendee**: org admins can create an RSVP for someone directly from an event's attendees list.
+- **Reorderable membership tiers**: membership tiers can now be reordered from the org Members admin.
+- **Multi-select RSVP status filter**: the attendees list can be filtered by several RSVP statuses at once.
+- Richer link previews: a versioned Open Graph share image and a dedicated square `og:logo` mark for social and chat unfurls.
+
+### Fixed
+
+- Reordering ticketing steps now rolls back cleanly when a save fails, instead of leaving the steps in the wrong order.
+- The `/join/org` invitation page no longer crashes during server-side rendering when opening an org invite link.
+- Following an invitation link (`/join/event`, `/join/org`) is more reliable — server-side page loads no longer fail with internal connection errors.
+- Organization and event names containing accented or international characters now render correctly in flash notifications (fixed garbled text).
+- The registration form no longer drops values when the browser autofills fields mid-typing.
+- Dashboard search now cancels superseded queries correctly, preventing stale results from a previous search term.
+- Assorted UI fixes surfaced by end-to-end testing: mobile layout overflow on narrow screens, a notification item showing stale content, focus being stolen on the login and registration forms, and low-contrast status badges.
+
+## [1.66.0] - 2026-07-09
+
+### Added
+
+- **Season passes (series passes)**: buy one pass covering every event in a series, and sell them as an organizer.
+  - Series pages show a "Season passes" section with live pro-rata pricing (struck-through full price once events have passed, "N of M events remaining"), payment-method hints, and a purchase dialog supporting free claims, offline reservation (pay at venue), and Stripe checkout.
+  - New "My passes" page (`/dashboard/passes`) listing held passes with status, coverage progress, a pass QR code, and PDF + Apple Wallet downloads; pass-derived tickets are badged "Season pass" in My tickets.
+  - Series admin dashboard gains a "Passes" tab: create/edit/delete passes (price, pro-rata discount, currency, payment method, visibility, sales window, quantity cap, per-event tier mapping) and a searchable holders dialog with offline payment confirmation and cancel-with-reason.
+  - The event ticket admin list badges season-pass tickets and can filter by source (all / direct purchase / season pass), and the QR check-in scanner accepts season-pass codes.
+
+### Fixed
+
+- Icons and bullets on the landing page's secondary feature cards (Build Community, Flexible Ticketing, Potluck Coordination, Multi-Language Support) are clearly visible again in both light and dark mode after the rebrand left them nearly invisible.
+
+## [1.65.1] - 2026-07-08
+
+### Changed
+
+- German UI text is now gender-inclusive throughout: every person reference uses the gender star (`Teilnehmer*innen`, `Nutzer*innen`, …), replacing masculine generics and unifying the previously mixed participle/colon conventions.
+
+### Fixed
+
+- The language switcher works again — picking a language reloads the page in the chosen language instead of silently doing nothing (regression from a dependency upgrade).
+- The Admin button on the dashboard's "My Organizations" cards no longer overflows the screen on mobile; actions now stack below the organization info.
+- German attendee counts no longer use wrong grammar ("5 Teilnehmern" → "5 Teilnehmer*innen").
+
+## [1.65.0] - 2026-07-08
+
+### Added
+- "See all / Show fewer" toggle on the dashboard organizations section, so you can expand past the first 3 organizations.
+- Share button on event and organization token cards, opening the token share dialog (previously unreachable).
+- Calendar days with exactly one event are now directly clickable, opening that event.
+- Duplicating an event now prefills the new start date from the source event, rolling past start dates forward to the next future date at the same time of day.
+
+### Changed
+- **2026 rebrand — "Bubble" + Nata Sans ships for everyone**: new permanent look with the official brand palette — lavender paper light mode, aubergine club dark mode with a lavender glow primary, crimson heart accent, amber highlight — sticker-round corners, the Nata Sans typeface app-wide, and the "let's revel." lockup replacing the "Revel" wordmark in the header. All color pairs pass WCAG AA contrast and simulated color-blind separation checks; the demo/staging brand switcher is retired.
+- Relative timestamps ("2 hours ago") now use the browser's built-in localization, so they follow the UI language for every locale (including French) instead of only English, German, and Italian.
+- The default social-share card is now the gradient "let's revel" logo, and share titles lead with "Event Management for Communities".
+
+### Fixed
+- Switching the app language now sticks — it no longer reverts on the next page load — and no longer briefly flashes a "500 Server Error" page.
+- Link previews for event and organization pages no longer sometimes show the generic Revel card instead of the event/org cover (duplicate `og:image` tags removed).
+- Event status badges now show "Past" instead of "Full" for events that ended while at capacity.
+- File-upload conditional questions in the questionnaire editor are now created, updated, and deleted correctly (they were silently handled as free-text questions, leaving orphans behind).
+- A file-upload question weight of `0` no longer silently resets to the default `1.0`.
+- The fee calculator no longer shows `Infinity`/`NaN` percentages or negative amounts for empty or invalid ticket prices.
+- Accessibility: the fee-calculator and confirm-payment dialogs now move focus in on open, trap it, close on Escape, and restore focus on close; attendee status filters and invitation selection buttons announce their toggle state; file-upload and poll-form labels now focus their inputs when clicked; required file-upload questions are announced to screen readers; and many visual-only titles across banners, modals, empty states, and menus became real headings.
+
+### Security
+- Upgraded dependencies to patch multiple high-severity vulnerabilities (prototype pollution and denial-of-service issues in form handling, markdown parsing, HTML sanitization, and related libraries).
+- Session token payloads are now validated at runtime; malformed or unexpected tokens are rejected instead of trusted.
+- Removed debug console logging that exposed raw tokens and cookies in the browser console, plus a raw query-state "Debug info" dump on the notification settings page.
+
+## [1.64.0] - 2026-07-01
+
+### Added
+- **Brand identity evaluation (demo/staging only)**: a new opt-in brand switcher, visible on the demo/staging environment and in local development, lets testers preview four candidate 2026 rebrands against the current **Legacy** look — **Gradient** (full-page purple→crimson wash), **Midnight** (near-black with neon accents), **Crimson** (hot, crimson-led), and **Mono** (stark black & white) — each with full light and dark modes. The default stays Legacy, so normal visitors see no change. Foundation only: the new palette (Hearty Purple / Light Crimson / Amber highlight, purple→crimson gradient) and the Nata Sans typeface are wired through the existing design tokens, with the final visual design to follow.
+
+### Changed
+- **New Revel logo & favicon**: the browser tab icon, app icons (apple-touch), and theme color now use the 2026 gradient "R" mark for everyone. On the candidate brand themes the header home button becomes the "let's revel." lockup; Legacy keeps the current "Revel" wordmark.
+
+## [1.63.0] - 2026-06-29
+
+### Changed
+- **Localized dates**: every human-facing date now follows your chosen UI language with textual months everywhere — no more browser-locale numeric dates (`6/7/2026`) or mismatched month names. Native `datetime-local` inputs across admin flows (event/poll duplication, generate-now, record-payment, waitlist cutoff, org-token expiry, recurrence end, schedule editor, admission deadline, and more) now share the `DateTimePicker` with an unambiguous textual readback line.
+- Dashboard **Upcoming RSVPs** list filter is now URL-driven multi-select (`?status=yes,maybe`) with accessible toggle chips (All / Going / Maybe / Not going); the dashboard card links straight to the matching Going + Maybe view, so the count and the list agree.
+
+### Fixed
+- The dashboard **Upcoming RSVPs** count now includes both **Going** and **Maybe** responses (was Going only), so a tentative RSVP you're most likely to forget is no longer hidden.
+- Dates no longer ignore the app language — switching the UI language now updates them (e.g. an app set to English or Italian on a French browser no longer shows `Week of 1 Juin – 7 Juin 2026`). French dates also no longer silently fall back to US English formatting.
+
+## [1.62.1] - 2026-06-28
+
+### Fixed
+- First-time visitors whose browser language is not English no longer see the landing page briefly render in that language and then flip to English; the page now stays in the detected language consistently.
+- The "Welcome to Revel" heading no longer stays stuck in the browser's language while the rest of the page is shown in another language.
+
+## [1.62.0] - 2026-06-22
+
+### Added
+- **Organization financials**: new owner-only Financials page (`/org/{slug}/admin/financials`) showing revenue, refunds, net income, and per-VAT-rate breakdowns by currency and event, with year/quarter/month period filtering, sorting, and a multi-currency switcher.
+  - On-demand revenue & VAT report download (`RevenueReportButton`) scoped to the selected period.
+  - Scheduled report delivery via a `revenue_report_cadence` setting (none/monthly/quarterly) in org settings, requiring a billing email.
+  - Per-event revenue card now shows the same VAT/net-taxable/rate-bucket breakdown.
+- **Event schedule / timeline**: events can display a session timeline (start/end times in the event's timezone, location, description, and a Required badge) on the public page, with an inline editor for organizers to add repeatable sessions.
+- **WYSIWYG description editor**: the raw-markdown editor across all description fields (events, orgs, tiers, questionnaires, polls, resources, venues, profiles, announcements) is now a rich-text editor with a formatting toolbar (bold, italic, strikethrough, headings, lists, blockquote, code), a link-insertion dialog, and a visual/source toggle.
+- **Image cropping for all uploads**: event, organization, and event-series logos and cover/banner images now open a crop-and-reposition modal before upload (previously only profile pictures), so you control the framing instead of the server auto-cropping. Cropped logos preserve PNG transparency.
+- **French (`fr`) language support**: full French translation catalog, language switcher option, and French SEO landing pages.
+- **Top-level org-admin Tickets tab**: ticket management is reachable without drilling into a specific event, via a picker of ticketed events (auto-redirects when there is a single active ticketed event).
+- **Open-ended events**: an explicit "Open-ended event" checkbox replaces the misleading "leave blank" copy; when off, an end time is required. Open-ended events show the start plus an "Open-ended" hint everywhere (detail, header, calendar, admin list, RSVP card, recurring-series templates).
+- **Announcement scheduling**: send-now or scheduled delivery (absolute date/time, or relative to event start/end), a Scheduled admin tab with badges, and an unschedule action.
+- "Also email people who join later" option for event announcements (delta-send to new sign-ups).
+- Guest sign-in prompt (`EventGuestSignInPrompt`) for logged-out event visitors, listing what they unlock (potluck, announcements, who's coming, dietary preferences) instead of showing silent empty states.
+- Manual ticket-code entry fallback in the QR check-in scanner for when the camera fails, plus specific per-error messages and an HTTPS guard.
+- Next/Previous navigation (with "n of m" position) when reviewing questionnaire submissions, respecting the list's current filter/sort.
+- "Total earned" revenue box on the event ticket-admin page, showing gross with a net/refunded sub-line per currency.
+- Sortable ticket list (by tier, price, status, payment method, purchase date) with sort persisted in the URL; mobile sort selector.
+- Per-ticket discount badge in the ticket-admin list showing the applied discount code and amount off.
+- Immediate "you're all set — buy your ticket / RSVP now" confirmation when a questionnaire submission is auto-accepted (no evaluation required), with an "Auto-accepted" status badge for submissions that grant access without review.
+- Audience descriptor on announcement cards (who can see it).
+- "What does membership grant?" collapsible disclosure explaining concrete membership benefits on org member pages and the public request-membership prompt.
+- Attendee-list visibility control surfaced next to the profile photo uploader (auto-saving).
+
+### Changed
+- **Event times now render in the event's timezone** (with the timezone abbreviation and a disclaimer) across event cards, headers, details, eligibility deadlines, and ticket tiers, instead of the viewer's local zone.
+- Feature-flag-gated UI is now hidden when the backend capability is disabled: "Create organization" CTAs/route and Telegram connect cards/fields disappear (with a note) when off.
+- Invite-link expiration now uses a date/time picker (matching the edit form) and prefills from the event start date; coupon validity prefills from a single scoped event. Empty means never expires.
+- Pressing Enter in date/time pickers now commits the value and closes the popup instead of submitting the form.
+- Event announcements moved up directly under Event Details (with a tinted card) for discoverability.
+- Past, closed, and cancelled events can now be edited from the org-admin events list.
+- Notification dropdown: removed the redundant type chip and relaxed the body clamp from 2 to 4 lines.
+- Discount-code admin page fully localized; clearer past-visibility announcement copy distinguishing in-page visibility from emailing.
+- Authenticated landing page now leads with a Dashboard CTA; "Browse Events" is secondary.
+- Discount-code delete now distinguishes hard-deleting unused codes from deactivating used ones, with matching icons, confirm copy, and toasts.
+- Roughly 1,265 previously-hardcoded user-facing strings across the app are now translated (en/de/it/fr).
+- The image cropper now has a draggable zoom slider in place of the +/− zoom buttons, and its rotate controls were removed.
+- The home page's multi-language highlight now lists French alongside English, German, and Italian.
+
+### Fixed
+- The navbar now reflects login immediately after signing in (including 2FA), without needing a manual page refresh.
+- Eliminated the light-mode flash (FOUC) that dark-mode users saw on initial load and navigation in production.
+- Single-ticket checkout no longer fails when the buyer's display name is empty (falls back to a localized "Guest" placeholder).
+- Ticket expiration countdown is now announced to screen-reader and keyboard users (was hover-only).
+- The language picker now closes when you click elsewhere on the page or press Escape, not only via its toggle or selecting a language.
+
+## [1.61.1] - 2026-06-14
+
+### Fixed
+- Restored API calls and backend-served images on deployments pointed at a non-default backend, whose origin was previously blocked by the Content Security Policy.
+
+## [1.61.0] - 2026-06-14
+
+### Changed
+- The API endpoint is now resolved at runtime, so a single build can target any backend (self-hosting); deployments must set `PUBLIC_API_URL` at runtime or the app falls back to `http://localhost:8000`.
+
+### Fixed
+- Cancel-ticket dialog no longer shows contradictory payment notes when the refund is €0, and explains a €0 quote by surfacing the most recent expired refund window.
+- Language switcher now shows ISO codes (`en`/`de`/`it`) instead of country flags.
+
+## [1.60.0] - 2026-06-13
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.59.3] - 2026-06-12
+
+### Fixed
+- Restored login and registration in production, which were failing with a "Field required" error because server-rendered POST request bodies arrived empty at the backend.
+
+## [1.59.2] - 2026-06-10
+
+### Fixed
+- Restored all server-rendered pages, which had stopped loading due to a redirect loop on internal API calls.
+
+## [1.59.1] - 2026-06-10
+
+### Changed
+- Location-based "nearest first" ordering on server-rendered pages now uses the real visitor's IP rather than the server's, improving distance-sorted results, geolocation, and rate-limiting accuracy.
+
+## [1.59.0] - 2026-06-02
+
+### Added
+- **Event cancellation reason**: organizers can attach an optional message when cancelling an event; it's shown to all participants on the public event page and included in the cancellation notification. The cancel flow now uses a proper dialog (replacing the old browser confirm prompt) and is reachable from both the admin events list and the event edit page.
+
+### Fixed
+- Sitemap pages no longer return errors to crawlers (request page size now respects the backend limit).
+
+## [1.58.0] - 2026-05-28
+
+### Added
+- Duplicate a questionnaire or poll from its card or detail header, opening a pre-filled create form.
+
+## [1.57.0] - 2026-05-26
+
+### Added
+- **Bookmark events**: signed-in users can bookmark events from event cards and the event detail page, with a "Bookmarked" filter on the dashboard. The card indicator appears only on already-bookmarked events (top-left, clear of status chips), and bookmarks sync across all views.
+
+## [1.56.0] - 2026-05-25
+
+### Added
+- **Polls**: full admin experience (create/edit with audience, anonymity, and scheduling controls, plus lifecycle actions and a copyable voter link) alongside a public voter page; polls get their own navigation item and dashboard tile.
+
+## [1.55.0] - 2026-05-21
+
+### Added
+- **Advanced waitlist offers**: admins can configure waitlist behavior and issue, revoke, or reactivate offers; the public event page surfaces waitlist position, reserved spots, and an active-offer banner with a live countdown, plus a matching notification.
+- "Calendar" shortcut on the public organization page, linking to that org's events pre-filtered in calendar view.
+
+### Fixed
+- "Confirm Payment" no longer appears on cancelled tickets in the organizer's ticket list.
+- Waitlist offer claim button now disappears once the offer expires.
+
+## [1.54.0] - 2026-05-18
+
+### Added
+- **Self-served email change**: users can change their account email from the security card, with a public confirmation page that supports confirming on a different device.
+
+## [1.53.0] - 2026-05-18
+
+### Changed
+- Series picker and admin series cards now distinguish grouping vs. recurring series with dedicated icons and a corner type badge; the recurring label reads "Automatic".
+
+### Fixed
+- Editing an existing event no longer fails validation when its start time is in the past (organizers can update details after an event has begun).
+
+## [1.52.0] - 2026-05-16
+
+### Added
+- Composite duration picker (number + unit) across four admin forms.
+
+### Changed
+- Subscriptions admin table shows the membership type/tier, and the create-subscription dropdown groups plans by tier.
+
+### Fixed
+- Page tabs no longer became unclickable after creating a subscription.
+
+## [1.51.0] - 2026-05-15
+
+### Added
+- **Staff-managed membership subscriptions (offline)**: admin surfaces to create and manage subscriptions, plus a read-only `/account/memberships` page and a membership card on the public organization page.
+
+### Changed
+- Event series list now leads with a "New recurring series" call to action; the legacy empty-series form moves to a secondary link.
+- Renamed "Private" to "Invitation only" across the event UI (visibility, event type, address visibility, badges, filters); event invitation-message field gains explanatory helper text.
+- Profile first, last, and preferred name are now optional.
+
+### Fixed
+- "Edit template" on the recurring-series dashboard no longer 404s.
+
+## [1.50.2] - 2026-05-11
+
+### Fixed
+- Currency selector in tier and discount-code forms now offers the full set of 30 supported currencies (and drops the unsupported BGN).
+
+## [1.50.1] - 2026-05-09
+
+### Changed
+- Public questionnaire submission redirects back to the event immediately (no artificial delay), keeping the spinner visible until navigation.
+- Event editor: enabling "Allow guest attendance" now warns about incompatible settings, the waitlist toggle gains a "How does the waitlist work?" explainer, and the recurring-event wizard explains what a template event is.
+
+### Fixed
+- On validation failure the event editor scrolls to the first invalid field and shows a toast, instead of leaving the error off-screen.
+- Blacklist and invitation dialogs keep their submit button reachable on small/mobile viewports.
+- Conditional questionnaire sub-questions no longer lose their dependency link when edited.
+
+## [1.50.0] - 2026-05-08
+
+### Added
+- **Organization contact method**: orgs can choose None, an email link, or an in-app contact form (email/form options gated on a verified contact email); a contact button appears on the public org page and the event-detail org card.
+- Technical SEO foundation: structured data (Event, Organization, Series, FAQ, HowTo, etc.) and hreflang across public pages.
+
+## [1.49.0] - 2026-04-25
+
+### Added
+- **User-initiated ticket cancellation & refunds**: buyers see a cancellation preview (refund amount, fees, deadline, remaining windows) and can cancel eligible tickets; the refund policy is shown before payment. Admins get a per-tier refund-policy editor (bracketed refund percentages, flat fee, cancellation toggle and deadline), and ticket tables show refund-status pills.
+- **Recurring events**: a create-recurring-series wizard with an accessible recurrence-rule editor (frequency, weekly/monthly modes, end boundaries) and a live human-readable summary.
+
+## [1.48.1] - 2026-04-17
+
+### Fixed
+- The "Feedback" questionnaire type can now be selected when editing a questionnaire (previously only on creation).
+- Long invitation dialogs (create/edit/bulk) keep header, footer, and submit button reachable on small viewports.
+
+## [1.48.0] - 2026-03-31
+
+### Added
+- **Attendee billing & invoicing**: a reusable billing-profile form in account settings, an `/account/invoices` page (buyer invoice list + PDF download), and a VAT preview during ticket checkout for both authenticated and guest flows. Org admins get an invoicing-mode toggle (none/hybrid/auto) and attendee invoice and credit-note management pages.
+
+### Fixed
+- Pricing card and fee calculator now note that platform fees exclude VAT where applicable.
+
+## [1.47.1] - 2026-03-28
+
+### Fixed
+- PDF ticket downloads and referral payout statement downloads now resolve against the backend origin instead of the frontend, so the files download correctly.
+
+## [1.47.0] - 2026-03-26
+
+### Changed
+- **Refreshed landing hero**: warmer gradient tagline ("Free. Open. Safe."), a subtle radial glow, and an animated shine effect on the "Revel" wordmark (with reduced-motion and unsupported-browser fallbacks); the navbar logo now always links to the home page.
+
+## [1.46.0] - 2026-03-25
+
+### Added
+- **Unlisted events**: a new visibility option for events that are reachable only via direct link and hidden from browse/search; staff and owners still see them in admin views with an "Unlisted" badge.
+
+## [1.45.0] - 2026-03-24
+
+### Added
+- **Tier-linked invitations**: invitations and invitation links can now grant access to specific ticket tiers via multi-select, with tier restrictions for visibility and purchasing; non-purchasable tiers are greyed out on the public event page.
+- Event admins can toggle `public_pronoun_distribution` to choose whether pronoun statistics are visible to all attendees or only to org staff and owners.
+
+### Fixed
+- Reordering questions in the questionnaire editor now persists, and reordering uses arrow buttons instead of drag-and-drop.
+
+## [1.44.0] - 2026-03-23
+
+### Added
+- **Referral program**: referral code entry on registration (auto-filled from `?ref=`), an account referral settings page (Stripe Connect, billing, self-billing), a payouts history page with statement downloads, and referral links in the user menu for referrers.
+- "Show already accepted" toggle on the dashboard invitations page (accepted invitations are hidden by default).
+- Copy-to-clipboard button for each discount code in the admin discount-codes list.
+- `.m4a` audio uploads are now accepted.
+
+### Changed
+- Discount code inputs (purchase and admin creation) now enforce alphanumeric-only characters, including Unicode letters.
+
+### Fixed
+- The event share button now shows a success/error toast when copying the link.
+
+## [1.43.0] - 2026-03-20
+
+### Changed
+- Questionnaire editing: multiple options can be marked correct even when multiple answers are disabled; LLM evaluation guidelines are hidden when evaluation mode is manual.
+- Questionnaire create/edit now defaults to Manual evaluation, with Hybrid and Automatic marked "Coming soon"; save failures surface the backend error detail. Retake-cooldown hints and countdowns were corrected (0 means immediate retake; fixed an erroneous "Available tomorrow").
+
+### Fixed
+- Ticket and tier prices no longer get corrupted on save under non-English browser locales (e.g. `33.33` becoming `33.31`); currency/decimal fields now accept locale-aware input and display.
+- Expired or fully-used invitation links now show a clear "Link No Longer Valid" page instead of a confusing 404.
+- Translated remaining hardcoded English pricing strings on the landing page.
+
+## [1.42.0] - 2026-03-19
+
+### Added
+- Billing name field on the organization billing info form.
+
+### Changed
+- The billing nav badge now blinks only when Stripe is connected, platform fees apply, and billing info is incomplete, and updates immediately after saving.
+
+## [1.41.1] - 2026-03-17
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.41.0] - 2026-03-17
+
+### Fixed
+- Questionnaire max-attempts value now loads correctly when editing (previously reset to 0), and the field was added to the create form.
+
+## [1.40.1] - 2026-03-11
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.40.0] - 2026-03-11
+
+### Added
+- **VAT billing**: organization billing settings (country, VAT rate, address, email), plus invoices and credit notes pages.
+- `requires_evaluation` toggle on questionnaires: when evaluation is off, evaluation mode, min score, LLM guidelines, and related submission UI are hidden.
+
+### Changed
+- Free-text questionnaire answers now allow up to 1000 characters (was 500).
+
+### Fixed
+- The navbar now reflects profile and picture changes immediately without a page refresh.
+- Long custom invitation messages are truncated with a "Show more" toggle.
+
+### Removed
+- Ticket tier selection from invitation create/edit/bulk-edit dialogs and invitation links (tier linking no longer enforced on invitations at this point).
+
+## [1.39.2] - 2026-03-09
+
+### Fixed
+- Claiming an invitation that has an attached questionnaire no longer triggers an infinite loop.
+
+## [1.39.1] - 2026-03-08
+
+### Fixed
+- Audio and video attachments from the API now play correctly (added the missing `media-src` content-security-policy directive).
+
+## [1.39.0] - 2026-03-08
+
+### Changed
+- **Single-page event editor** replaces the multi-step event wizard: essentials first then details on creation, all fields on one page (with tabs for ticketed events) on edit, plus sticky save bars; "Edit Event" and "Ticketing" CTAs added to the tickets and attendees pages.
+
+### Fixed
+- Audio recorded via the browser (WebM) now plays back correctly.
+
+## [1.38.0] - 2026-03-08
+
+### Added
+- Pronoun distribution in the questionnaire summary, and CSV/export buttons (with auto-download) on the questionnaire summary, attendees, and tickets admin pages.
+
+## [1.37.0] - 2026-03-05
+
+### Added
+- **Discount codes**: full admin CRUD under org admin — list page with search, status/type filters, pagination, and inline enable/disable and delete; create and edit pages with code, type, value, currency, validity dates, and usage limits; scope assignment across series, events, and tiers; and per-code usage statistics.
+- Discount-code redemption at checkout: a collapsible "Have a discount code?" field in the ticket confirmation dialog that validates the code and shows the original price struck through alongside the discounted price; a `?discount=CODE` link pre-fills and opens it automatically.
+- Ticket-type filter (Ticketed / Free RSVP) on the events listing sidebar, mobile filter sheet, organization profile, and dashboard.
+
+### Changed
+- Currency selectors are now restricted to EUR, USD, GBP, CHF, and EU member-state currencies.
+
+### Fixed
+- Event info now shows the event type instead of the event's visibility setting.
+
+## [1.36.11] - 2026-03-03
+
+### Fixed
+- Management of tokens that grant staff access is now restricted to organization owners.
+
+## [1.36.10] - 2026-02-27
+
+### Changed
+- The ticket purchase flow now always shows a guest-name field (pre-filled with your display name) to avoid checkout validation errors, and tier buttons use clearer labels (Buy Ticket, Claim Free Ticket, Reserve Ticket, Get Ticket).
+
+### Fixed
+- The navigation bar now clears immediately on logout, and the homepage call-to-action buttons adapt to signed-in versus signed-out state.
+
+## [1.36.9] - 2026-02-25
+
+### Fixed
+- Pay-what-you-can tiers now route to the correct checkout endpoint.
+
+## [1.36.8] - 2026-02-24
+
+### Security
+- Added DOMPurify sanitization and HTML escaping for user-supplied content rendered as HTML (markdown bodies, invitation/whitelist requests, org join page, SEO metadata).
+
+## [1.36.7] - 2026-02-23
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.36.6] - 2026-02-23
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.36.5] - 2026-02-23
+
+### Fixed
+- Restored the production deploy by correcting Content-Security-Policy directives.
+
+## [1.36.4] - 2026-02-23
+
+### Security
+- Hardened the map-embed against XSS and updated dependencies.
+
+## [1.36.3] - 2026-02-17
+
+### Fixed
+- Ticket price display now prioritizes the actual payment amount.
+
+## [1.36.2] - 2026-02-17
+
+### Fixed
+- Guest checkout dialogs now properly surface errors and eligibility states.
+
+## [1.36.1] - 2026-02-17
+
+### Fixed
+- The ticket purchase button no longer stays stuck in a processing state after a non-online pay-what-you-can checkout.
+- Flattened heading sizes in notification bodies for consistent display.
+
+## [1.36.0] - 2026-02-16
+
+### Changed
+- The ticket preview now offers a PDF download instead of a QR-code image download.
+
+## [1.35.3] - 2026-02-16
+
+### Fixed
+- Resolved 401 errors on cold start by moving token refresh into server hooks.
+
+## [1.35.2] - 2026-02-15
+
+### Fixed
+- Ticket tiers now preserve the backend ordering instead of being re-sorted by price.
+
+## [1.35.1] - 2026-02-14
+
+### Fixed
+- Tags now appear on the organization detail page, matching event and series pages.
+
+## [1.35.0] - 2026-02-14
+
+### Added
+- **Pay-what-you-can check-in**: capture `price_paid` for offline / at-the-door PWYC tickets during check-in, with the tier's PWYC range shown and the field pre-filled.
+
+### Changed
+- Event, organization, and series cards now use the high-resolution social preview image for cover art instead of the low-res, blurry thumbnail.
+
+### Fixed
+- Ticket checkout now keeps the confirmation dialog open with a loading spinner until the server responds, instead of closing immediately and leaving no feedback.
+- Questionnaire edit checkboxes no longer revert to stale values after saving.
+
+## [1.34.0] - 2026-02-13
+
+### Added
+- **Questionnaire summary page**: a new admin view with submission/approval stats, status breakdown, score statistics, and multiple-choice answer distributions, with event/series filtering.
+- Per-event toggle on questionnaire create and edit forms (for admission questionnaires).
+- Up/down buttons to reorder ticket tiers, with optimistic updates.
+
+### Fixed
+- Submission stats now use server-side totals instead of only counting the current page of 20 results.
+- Resolved an infinite loop in the questionnaire assignment modal.
+
+## [1.33.0] - 2026-02-10
+
+### Added
+- **Maintenance banner**: a global, severity-styled banner driven by the `/api/version` endpoint, with client-side expiry, per-session dismissal, dark mode, and i18n (en/de/it).
+
+## [1.32.4] - 2026-02-10
+
+### Added
+- "Include past events" checkbox in the questionnaire assignment modal, enabling post-event feedback questionnaires.
+
+## [1.32.3] - 2026-02-08
+
+### Fixed
+- Admin attendees and tickets pages now show RSVPs and tickets for past events instead of empty lists.
+
+## [1.32.2] - 2026-02-08
+
+### Fixed
+- Announcement event picker now shows a "No events available" message instead of an endless spinner when there are no events, and adds an "include past events" option for targeting past events.
+
+## [1.32.1] - 2026-02-05
+
+### Fixed
+- Editing an announcement now loads its full content; previously the body was empty and saving failed with a validation error.
+
+## [1.32.0] - 2026-02-04
+
+### Added
+- Invitation tokens are now auto-claimed on login (not just after signup), with toast notifications naming the organization or event.
+
+### Changed
+- Questionnaire editing workflow improvements: open creation in a new tab, redirect to the edit page after creating, allow editing any questionnaire (not just drafts), explicit Edit/Cancel buttons, stay on the edit page after saving, and a "New Resource" button plus focus-based auto-refresh in resource assignment modals.
+- Footer redesigned into a symmetrical layout with separate frontend/backend version labels; "Send Feedback" moved to the Resources column.
+
+### Fixed
+- Resource descriptions now render markdown (bold, italic, links) instead of raw syntax.
+
+## [1.31.0] - 2026-02-03
+
+### Added
+- **Venue info modal**: a "More info about the venue" link surfaces detailed venue information (address, capacity, Google Maps link, embedded map, markdown description); venue descriptions now support markdown.
+- Info icon next to footer version numbers to signal that hovering reveals release notes.
+
+## [1.30.7] - 2026-02-03
+
+### Added
+- "Waives apply deadline" option in the event invitation modal.
+
+### Fixed
+- Event details (address, map URL, embedded map) now refresh immediately after RSVP so attendee-only fields appear without a manual reload.
+
+## [1.30.6] - 2026-02-03
+
+### Changed
+- Footer polish: Solutions section split into two columns to reduce height, with hover tooltips on version links showing GitHub release notes (fetched lazily and cached).
+
+## [1.30.5] - 2026-02-03
+
+### Changed
+- Creating and claiming a potluck item is now a single atomic action, reducing duplicate notifications.
+
+## [1.30.4] - 2026-02-02
+
+### Fixed
+- Changing the interface language no longer occasionally reverts to the previous language due to a race condition.
+
+## [1.30.3] - 2026-02-01
+
+### Fixed
+- Fixed a 404 from the dietary-preferences link on the profile page.
+- Event creation wizard now scrolls back to the top when changing steps.
+
+## [1.30.2] - 2026-01-30
+
+### Fixed
+- Fixed a crash on step 2 of the event wizard where tooltips on the questionnaires section triggered a missing-context error, leaving UI elements unresponsive.
+
+## [1.30.1] - 2026-01-29
+
+### Fixed
+- The event wizard now validates step 2 before letting you advance to the ticketing step.
+
+## [1.30.0] - 2026-01-27
+
+### Added
+- **Audio recording for questionnaires**: record audio answers directly in the browser for file-upload questions, with an inline player offering 1x/1.5x/2x playback speed (remembered between sessions) in submission review and on your privacy page; supports Chrome, Firefox, and Safari.
+
+### Changed
+- Clearer password strength feedback: unmet requirements now show in red, the label reads "Almost there" until all requirements are met, and the strength label is color-coded to the progress bar.
+
+## [1.29.1] - 2026-01-27
+
+### Fixed
+- Fixed the registration button being stuck disabled on Brave for mobile.
+
+## [1.29.0] - 2026-01-25
+
+### Added
+- **Organization announcements**: organizers can create, edit, save as draft, and send announcements with audience targeting from a new announcements admin page (`/org/[slug]/admin/announcements`), with draft/sent tabs and search; quick "New Announcement" actions are available from the dashboard and pre-filled from an event's sidebar. A `send_announcements` permission gates access.
+- Published announcements appear in a collapsible section on event detail pages and on organization public pages, rendered as markdown.
+
+## [1.28.2] - 2026-01-23
+
+### Changed
+- Minor styling adjustment to the attendee list.
+
+## [1.28.1] - 2026-01-23
+
+### Changed
+- German translations now use the informal "you" (du) throughout instead of the formal form.
+
+## [1.28.0] - 2026-01-21
+
+### Added
+- Admin tickets page can now mark a payment as unconfirmed (reversing a confirmation), with added translations.
+
+## [1.27.0] - 2026-01-21
+
+### Added
+- Event detail sidebar shows effective capacity and warns when a sector's hard limit is exceeded.
+
+### Changed
+- Restructured the location fields in the event creation wizard.
+- The attendee count now shows in the event sidebar even when no capacity limit is set.
+
+### Fixed
+- Per-tier remaining-ticket counts now display correctly.
+- Pay-what-you-can ticket amounts are now validated against the allowed range in real time.
+
+## [1.26.0] - 2026-01-20
+
+### Added
+- Pronoun distribution breakdown on event detail pages, showing a bar chart of attendee pronouns (with counts, percentages, and a "Not specified" category) below the attendee list on mobile and desktop.
+
+## [1.25.4] - 2026-01-19
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.25.3] - 2026-01-19
+
+### Added
+- Image cropper modal when uploading a profile picture, letting you crop before saving.
+
+## [1.25.2] - 2026-01-19
+
+### Fixed
+- After completing your profile, you're now redirected back to the event you came from instead of being left on the profile page.
+
+## [1.25.1] - 2026-01-18
+
+### Changed
+- Profile pictures and organization logos now use optimized thumbnails for faster loading.
+
+## [1.25.0] - 2026-01-18
+
+### Added
+- **Profile picture uploader**, plus a "complete profile required" eligibility gate for events that need a full profile.
+- **File upload questions** in questionnaires, with a new files-management section on your privacy page.
+- **Follow organizations and event series** with customizable notification preferences.
+
+## [1.23.0] - 2026-01-15
+
+### Added
+- **Feedback questionnaires**: post-event surveys can now be created (the "Feedback" questionnaire type is no longer "Coming soon"), and attendees see a feedback call-to-action in the event sidebar after an event they attended has ended.
+- **Admin impersonation**: admins can impersonate another user, with a persistent banner indicating the active impersonation session.
+
+## [1.22.0] - 2026-01-15
+
+### Added
+- Editing UI for draft questionnaires, allowing admins to modify questions on existing questionnaires.
+- Additional quick-action cards (Questionnaires, Resources, Blacklist, Venues) on the organization admin dashboard, improving navigation on mobile where tabs collapse.
+
+## [1.21.1] - 2026-01-14
+
+### Fixed
+- Returning users with "Remember Me" enabled are no longer shown as logged out after their access token expires; the session is now restored automatically from the refresh token.
+
+## [1.21.0] - 2026-01-14
+
+### Changed
+- Pending ticket experience refined: payment instructions now appear only after a ticket is reserved (removed from tier selection and confirmation dialogs), and the pending-ticket status badge shows orange instead of green to match the pending-payment banner.
+
+## [1.20.2] - 2026-01-14
+
+### Fixed
+- Notification items in the dropdown now navigate correctly when clicked, including notifications whose target is an absolute URL.
+
+## [1.20.1] - 2026-01-13
+
+### Added
+- **Blacklist & whitelist management**: organization admins get a dedicated blacklist admin page, plus blacklist entry and whitelist request management, and a "Request whitelist" flow for users.
+
+## [1.19.0] - 2026-01-12
+
+### Added
+- **Maps integration for events**: event addresses become clickable map links, an embedded map can be shown in the event sidebar, and admins can configure a maps link and embed code (with live preview) in the event wizard.
+- "Make Member" action on event admin attendees and ticket-holder pages, letting admins add attendees as organization members directly.
+
+## [1.18.2] - 2026-01-11
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.18.1] - 2026-01-10
+
+### Fixed
+- At check-in, the "Confirm Payment & Check In" button is now enabled for pending tickets that require offline payment confirmation.
+
+## [1.18.0] - 2026-01-10
+
+### Added
+- Support for an `apply_before` deadline that controls until when users can submit questionnaires or invitation requests for an event, surfaced in eligibility messaging and configurable in the event wizard.
+
+### Fixed
+- Language switching on SEO landing pages now navigates to the correct language-prefixed URL and persists the choice; added missing German and Italian translations across event page components.
+
+## [1.17.1] - 2026-01-10
+
+### Changed
+- All notifications are now clickable (falling back to the notifications page when no specific link exists), and a "Mark all as read" button was added to the notification dropdown.
+
+## [1.17.0] - 2026-01-09
+
+### Added
+- **Conditional questions**: questionnaires can now show additional questions or sections based on a selected multiple-choice option.
+- Eligibility now shows a "waiting for invitation approval" state when a user has requested an invitation to a private event.
+
+## [1.16.9] - 2026-01-08
+
+### Fixed
+- `max_tickets_per_user` is now included in event update requests, so the per-user ticket limit saves correctly when editing an event.
+
+## [1.16.8] - 2026-01-07
+
+### Fixed
+- Ticket purchasing now falls back to the event-level per-user ticket limit when a tier's own limit is unset.
+
+## [1.16.7] - 2026-01-07
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.16.6] - 2026-01-07
+
+### Fixed
+- Respect the event-level maximum tickets per user during checkout, instead of falling back to the (much larger) tier quantity.
+- Pay-what-you-can tiers now route to the correct checkout endpoint, including offline PWYC tiers that previously hit the regular checkout.
+- Surface the manual payment instructions field in the ticket tier form when the payment method is offline or at-the-door.
+- Fix a double-toggle bug where clicking a checkbox directly in the questionnaire assignment modals failed to select the item.
+- Make draft questionnaire status more prominent with amber styling on the status card, badge, and list view.
+
+## [1.16.5] - 2026-01-06
+
+### Added
+- **Remember me**: the login checkbox now works — unchecked keeps you signed in only for the browser session, checked persists your login for 30 days.
+- "Already have an account? Log in" link on the homepage, making login reachable on mobile without the burger menu.
+
+### Fixed
+- Make the invitations page tabs wrap and use short labels (Requests, Invitations, Links) so they fit on small screens, with German and Italian translations.
+
+## [1.16.4] - 2026-01-06
+
+### Fixed
+- Resolve an "endless loading" hang on event pages with many potluck items, caused by excessive debug logging during hydration.
+- Prevent browsers (Chromium, Safari) from hanging on the event page by limiting module preload hints.
+
+## [1.16.3] - 2026-01-06
+
+### Fixed
+- Markdown content (headers, lists, spacing, indentation) now renders with correct typographic styling.
+- Past events admin page: fix broken View, Attendees, and Invitations links, and correct cover image display.
+
+## [1.16.2] - 2026-01-06
+
+_Maintenance release — internal, tooling, or dependency changes only._
+
+## [1.16.1] - 2026-01-06
+
+### Fixed
+- Make links inside markdown content visible and clearly interactive (primary color, underline, hover effect).
+
+## [1.16.0] - 2026-01-06
+
+### Changed
+- Restrict the questionnaire type selector to the "Admission" type, with "Coming soon" badges on membership, feedback, and generic types; new questionnaires now default to Admission.
+
+## [1.15.0] - 2026-01-05
+
+### Changed
+- **Questionnaire builder overhaul**: sections with drag-and-drop reordering, drag-and-drop questions within and between sections, and markdown support across questionnaire description, section description, question text, hints, and reviewer notes.
+- Submission and evaluation pages render markdown, and submission detail shows full user info (pronouns, full name, preferred name).
+- New questionnaires now default to manual evaluation.
+
+### Fixed
+- Remove an incorrect rule requiring at least two options for multiple-choice questions.
+
+## [1.14.0] - 2025-12-28
+
+### Added
+- Questionnaire setting to exempt organization members, letting them automatically bypass and pass the questionnaire.
+
+### Changed
+- Render event, organization, potluck, notification, and legal-page text as markdown (matching the backend's switch to sanitized markdown), with previews and SEO meta text derived from the markdown.
+
+### Fixed
+- Potluck item notes now populate correctly when editing an item.
+
+## [1.13.8] - 2025-12-23
+
+### Fixed
+- Clicking "Change RSVP" now actually shows the RSVP buttons instead of only toggling the label.
+
+## [1.13.7] - 2025-12-19
+
+### Added
+- Show your current attendee-list visibility setting in the "Who's Coming" section, with a quick link to manage it in account settings.
+
+### Fixed
+- Allow users holding an active ticket to claim potluck items (previously only legacy RSVP/ticket formats were recognized).
+
+## [1.13.5] - 2025-12-16
+
+### Fixed
+- Add defensive handling for events with missing dates so the event page no longer hangs during server-side rendering.
+
+## [1.13.4] - 2025-12-12
+
+### Added
+- New "Community-First Event Platform" landing page (English, German, Italian) highlighting organizations, membership tiers, member-only events, and potluck coordination.
+
+## [1.13.3] - 2025-12-12
+
+### Added
+- **Guest multi-ticket checkout**: buy multiple tickets in one flow with per-ticket guest names, seat selection (choose-your-seat, random, or none), quantity controls, and total price calculation.
+
+## [1.13.2] - 2025-12-12
+
+### Fixed
+- Replace silent failures and "[object Object]" messages with user-friendly error toasts across all API calls, including network/offline and timeout errors.
+
+## [1.13.1] - 2025-12-12
+
+### Added
+- **SEO landing pages**: 15 audience-targeted landing pages in English, German, and Italian (`/eventbrite-alternative`, `/queer-event-management`, `/kink-event-ticketing`, `/self-hosted-event-platform`, `/privacy-focused-events`), each with FAQ accordions and calls to action, linked from a new footer "Solutions" section and a homepage "Use Cases" section.
+- Social media links (Instagram, Facebook, Bluesky, Telegram) on organization profiles, with matching fields in organization settings.
+- RSS event feed at `/feed.xml` and an OpenSearch browser-integration description at `/opensearch.xml`.
+
+### Changed
+- Richer search-engine and social previews across public pages via JSON-LD structured data (breadcrumbs, event/organization listings, venue/place info), an expanded sitemap, and refined robots rules.
+
+## [1.13.0] - 2025-12-12
+
+### Added
+- **Multi-ticket purchase**: buy several tickets in a single checkout, with a quantity selector and a guest-name field per ticket holder; tickets now display the guest name and seat (venue, sector, seat) details.
+- "Buy More Tickets" and "View All Tickets" actions, plus the ability to cancel a pending ticket reservation.
+- **Venue & seating management**: create, edit, and delete venues and their sectors under a new Venues admin section, with an interactive seat-grid editor supporting drag-to-select, configurable grid size, letter/number row labels, invertible row order, and aisle insertion.
+- Seat-assignment configuration on ticket tiers (none, random, or user-selected) with a venue/sector selector.
+
+## [1.12.1] - 2025-12-02
+
+### Added
+- Spam-folder warnings across email confirmation flows (registration check-email, password reset, and profile email verification) so users know where to look for the message.
+
+### Fixed
+- Hardcoded English strings on the password-reset page now translate properly.
+
+## [1.12.0] - 2025-12-01
+
+### Fixed
+- Logged-in users now see restricted content (private events/organizations and attendees-only resources) on public pages that previously omitted authentication.
+- Changing the interface language as a logged-in user now sticks instead of reverting to the previously saved preference.
+
+## [1.11.0] - 2025-12-01
+
+### Added
+- **Address visibility control** in the event wizard: organizers can restrict who sees an event's address (Public, Members Only, Attendees Only, or Private).
+- Attendees-only visibility option for resources, restricting content to RSVP-yes attendees and ticket holders, with a matching badge and admin filter.
+
+## [1.10.0] - 2025-11-30
+
+### Added
+- **Apple Wallet passes**: download event tickets as `.pkpass` files to Apple Wallet from the event detail page, the dashboard tickets list, and the ticket modal.
+
+### Changed
+- Dashboard ticket cards now wrap long event names instead of truncating and show locale-aware purchase dates.
+
+## [1.9.0] - 2025-11-29
+
+### Added
+- **Event duplication**: duplicate any event from its action menu, pre-filled with "Copy of {name}", landing on the new event's edit page.
+- Inline event slug editing in the wizard with a live URL preview and collision handling.
+
+### Changed
+- Event card actions consolidated into a three-dot menu, keeping primary actions (view, tickets, invitations) visible while grouping cancel, close, and delete.
+
+## [1.8.0] - 2025-11-28
+
+### Added
+- **Calendar view** for both the public events page and the dashboard, with month/week/year modes, navigation controls, filter integration, and a click-through event detail modal.
+
+### Changed
+- Event status model reworked: events can now be Cancelled (visible with a badge but not accepting RSVPs) versus Deleted (permanently removed). The admin events page groups events into Draft, Open, Closed, Cancelled, and Past sections with status-aware actions and color-coded badges.
+
+## [1.7.1] - 2025-11-27
+
+### Changed
+- Lowered platform pricing to 1.5% + 0.25 EUR.
+
+## [1.7.0] - 2025-11-26
+
+### Added
+- Email-collection step for Stripe Connect: organizers confirm a business email in a modal before connecting, the connected email is shown in the status banner, and an interrupted setup is recoverable via the pre-filled field.
+
+## [1.6.0] - 2025-11-26
+
+### Changed
+- Privacy settings consolidated into General Preferences (renamed from "Attendee List Visibility"), removing the duplicate Privacy Settings section from notification preferences.
+
+## [1.5.7] - 2025-11-25
+
+### Fixed
+- Organization admin tabs no longer overlap onto a second row on desktop and landscape mobile.
+
+## [1.5.6] - 2025-11-25
+
+### Fixed
+- Multiple organization-admin mobile layout issues: overlapping org name and "Owner" badge, tabs scrolling out of view, and text cutoff in notice boxes.
+
+## [1.5.5] - 2025-11-25
+
+### Fixed
+- Improved mobile layout of the organization members and staff admin page.
+
+## [1.5.4] - 2025-11-23
+
+### Fixed
+- Social/link previews for the homepage now show the correct Open Graph and Twitter card image.
+
+## [1.5.3] - 2025-11-23
+
+### Fixed
+- Corrected the OpenGraph preview image so shared event and organization links render properly on WhatsApp and other social platforms.
+
+## [1.5.2] - 2025-11-23
+
+### Changed
+- Updated the OpenGraph preview image used for social link sharing.
+
+## [1.5.1] - 2025-11-23
+
+### Fixed
+- Switched the OpenGraph image to PNG so WhatsApp and other social previews display correctly when sharing links.
+
+## [1.5.0] - 2025-11-23
+
+### Added
+- **Learn More page**: new marketing page detailing platform pricing and features, linked from the footer.
+- Password change section in account security settings, including a password-reset request flow.
+
+## [1.4.0] - 2025-11-22
+
+### Added
+- Email verification status badge on the profile, with a one-click option to resend the verification email.
+
+## [1.3.3] - 2025-11-21
+
+### Fixed
+- Resolved a crash on the `/dashboard/rsvps` page caused by missing event logo/cover data.
+- Organization cards and the dashboard now show clean description text instead of raw markdown.
+- Event invitation links created via tokens now correctly carry the "grants invitation" setting.
+- Fixed unexpected logouts caused by a token-refresh race condition.
+- Attendee lists now show the backend-provided display name for each guest.
+
+## [1.3.1] - 2025-11-21
+
+### Fixed
+- Restricted (login-required) events now show a "Login to RSVP" / "Login to Get Tickets" prompt for signed-out users instead of an empty action menu.
+- Editing an event no longer silently resets fields that weren't on the current step (full form state is now preserved on save).
+- Event and invitation descriptions render as formatted HTML with readable line lengths.
+
+## [1.3.0] - 2025-11-20
+
+### Fixed
+- Tags added to or removed from events and organizations in the admin edit form now persist correctly, and the Advanced section auto-expands when tags exist.
+
+## [1.2.1] - 2025-11-20
+
+### Fixed
+- Improved event detail page layout consistency: cover images no longer stretch on ultra-wide screens, description text keeps a readable width, and location metadata is no longer hidden behind the organization badge on mobile.
+
+## [1.2.0] - 2025-11-20
+
+### Added
+- Preview button on draft event cards so admins can view an event before publishing.
+
+### Fixed
+- Enabled secure cookies in production to stop unexpected logouts.
+
+## [1.1.1] - 2025-11-20
+
+### Added
+- Telegram connection is now validated before notifications can be enabled.
+
+### Changed
+- Account creation now enforces password strength requirements (including special-character rules aligned with the backend) before submission.
+
+## [1.1.0] - 2025-11-20
+
+### Fixed
+- Event time edits now preserve the local timezone instead of shifting times.
+- Password fields can now be pasted on iOS Safari mobile browsers.
+- Removed obsolete "free for members" / "free for staff" event options that no longer applied.
+
+## [1.0.2] - 2025-11-20
+
+### Changed
+- Replaced the contact page with a direct mailto link.
+
+### Fixed
+- Email verification resend now works with the updated email-based request.
+
+## [1.0.1] - 2025-11-20
+
+### Fixed
+- The mobile notification dropdown now keeps the "View all notifications" footer button visible while the list scrolls.
+
+## [1.0.0] - 2025-11-19
+
+### Added
+- **Membership tiers & ticket tier restrictions**: organizations can define membership tiers, and ticket tiers can be restricted to specific members — surfaced across org pages, event pages, the dashboard, and member management.
+- **Legal pages & compliance onboarding**: new `/legal/privacy` and `/legal/terms` pages, a terms-and-privacy acceptance checkbox on registration, automatic invitation-token claiming from `?ot=`/`?et=` links, and a cookie notice.
+- Logo and cover-art fallback hierarchy so events without their own artwork inherit images from their event series or organization across cards, headers, invitations, RSVP cards, and ticket cards.
+
+## [0.x] — Initial development (2025-10-27 – 2025-11-18)
+
+The pre-1.0 series established the foundation of the Revel web app.
+
+### Added
+- **Project foundation & design system**: bootstrapped the SvelteKit 5 (Runes) app with shared `PublicLayout`/`AuthLayout` layouts, responsive header, slide-out mobile nav, user menu, light/dark/system theme toggle, skeleton loaders, and accessibility primitives (skip links, focus traps).
+- **Authentication**: full account flow — registration, login with two-factor (2FA) support, password reset, and rotating-JWT refresh handled transparently in server hooks; automatic invitation/ticket token claiming on sign-up.
+- **Account, profile & GDPR**: user profile editing, a settings page with notification and privacy preferences, personal data export, email unsubscribe via tokenized preference links, and a full GDPR account-deletion flow.
+- **Event discovery & detail**: public event listing with search, city filter, and sort controls, plus rich event detail pages showing eligibility state, contextual action buttons, and SEO-optimized social-media previews.
+- **RSVP & attendance**: accessible RSVP flow, attendee lists, potluck coordination (item claiming with constraints/warnings), guest RSVP and ticket-purchase flow for non-logged-in users, and dietary preferences/restrictions.
+- **Ticketing & payments**: complete ticketing system with Stripe Connect onboarding for organizations and an end-to-end checkout flow, multi-currency support, ticket eligibility checks, QR-code check-in scanning, and ticket/invitation management with iCal export.
+- **Questionnaires**: creation and management of event questionnaires plus a participant submission flow with bidirectional event assignment and submission evaluation.
+- **Organizations & admin**: organization public profiles and settings, event creation/management with status actions and image editing, members/staff management with role badges, membership-request handling, invitation management, a resources manager, and a waitlist management system.
+- **Notifications**: in-app notification bell (with mobile support) and notification-request links.
+- **Internationalization**: i18n infrastructure (Paraglide) wired across the app.
+- **Infrastructure & demo mode**: Docker build + CI/CD for production deployment, the auto-generated TypeScript API client, and a demo mode (signup→login redirect, feedback link).

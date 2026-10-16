@@ -1,0 +1,666 @@
+"""Stripe webhook event handlers."""
+
+import functools
+import typing as t
+import uuid
+from decimal import Decimal
+
+import stripe
+import structlog
+from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError, transaction
+from django.db.models import F
+
+from accounts.models import RevelUser
+from common.models import StripeConnectMixin
+from common.service.stripe_config import configure_stripe
+from events.exceptions import InvalidStripeWebhookSignatureError, SessionTotalMismatchError
+from events.models import (
+    HeldSeriesPass,
+    MembershipPayment,
+    MembershipSubscription,
+    MembershipSubscriptionPlan,
+    Organization,
+    Payment,
+    Refund,
+    StripeWebhookEvent,
+    Ticket,
+    TicketTier,
+)
+from events.service.stripe_incidents import record_paid_session_without_payments, record_session_total_mismatch
+from events.service.stripe_webhook_refunds import TicketRefundHandlersMixin
+from events.service.stripe_webhook_subscriptions import SubscriptionWebhookHandlersMixin
+from events.service.waitlist_service import enqueue_waitlist_processing
+from events.utils.currency import to_stripe_amount
+from notifications.signals.series_pass import send_series_pass_purchased
+
+logger = structlog.get_logger(__name__)
+
+
+configure_stripe()
+
+# Placeholder values that must never be treated as real signing secrets.
+_PLACEHOLDER_SECRETS = frozenset({"whsec_...", "whsec_placeholder", ""})
+
+
+def verify_webhook(payload: bytes, signature_header: str) -> stripe.Event:
+    """Validate the ``Stripe-Signature`` header and return the parsed event.
+
+    A two-endpoint Connect setup (platform "Your account" + "Connected
+    accounts") points both endpoints at the same URL, each with its own
+    ``whsec_*`` secret. We can't know up front which endpoint signed a given
+    delivery, so we try each entry of ``settings.STRIPE_WEBHOOK_SECRETS`` in
+    order; the first HMAC match wins. If none match — or no real secret is
+    configured — we fail closed with ``InvalidStripeWebhookSignatureError``
+    (rendered as 403 by the events exception handler).
+    """
+    secrets = [s for s in settings.STRIPE_WEBHOOK_SECRETS if s not in _PLACEHOLDER_SECRETS]
+    if not secrets:
+        logger.warning("stripe_webhook_secret_missing")
+        raise InvalidStripeWebhookSignatureError()
+    last_error: stripe.error.SignatureVerificationError | None = None
+    for secret in secrets:
+        try:
+            return t.cast(stripe.Event, stripe.Webhook.construct_event(payload, signature_header, secret))
+        except stripe.error.SignatureVerificationError as exc:
+            last_error = exc
+            continue
+        except ValueError as exc:
+            # construct_event parses JSON only AFTER the HMAC matched, so the
+            # signature is fine and the body is malformed — retrying other
+            # secrets can't change the verdict. Terminal.
+            logger.warning("stripe_webhook_malformed_json", error=str(exc))
+            raise InvalidStripeWebhookSignatureError() from exc
+    logger.warning("stripe_webhook_signature_failed", error=str(last_error))
+    raise InvalidStripeWebhookSignatureError()
+
+
+@transaction.atomic
+def handle_event(event: stripe.Event) -> None:
+    """Route a verified event to its handler, idempotent on Stripe's event id.
+
+    The ``StripeWebhookEvent`` INSERT is the idempotency token: Stripe
+    redeliveries trip the unique constraint and skip the full handler. The
+    insert runs in a nested atomic block (savepoint) so a duplicate-key
+    violation doesn't poison the outer transaction. If the handler raises, the
+    whole request transaction (ATOMIC_REQUESTS) rolls back including this row,
+    so the next Stripe retry reprocesses the event.
+
+    A duplicate is not a pure no-op: the first delivery's ``on_commit``
+    ``.delay()`` calls ran *after* its commit and may have failed (e.g. broker
+    outage) without rolling anything back, so redelivery is Stripe's retry
+    mechanism for exactly that window — :meth:`StripeEventHandler.replay`
+    re-enqueues the idempotent downstream tasks.
+    """
+    try:
+        with transaction.atomic():
+            record = StripeWebhookEvent.objects.create(
+                event_id=event.id,
+                event_type=event.type,
+                account=getattr(event, "account", "") or "",
+                livemode=bool(getattr(event, "livemode", False)),
+                payload=dict(event),
+            )
+    except IntegrityError, DjangoValidationError:
+        # IntegrityError = DB unique violation (race past full_clean);
+        # ValidationError = TimeStampedModel.save's full_clean caught the
+        # duplicate first. Either way: redelivery — retry the post-commit
+        # task dispatches, then stop.
+        logger.info("stripe_webhook_duplicate", event_id=event.id, event_type=event.type)
+        StripeEventHandler(event).replay()
+        return
+
+    handled = StripeEventHandler(event).handle()
+    record.outcome = StripeWebhookEvent.Outcome.HANDLED if handled else StripeWebhookEvent.Outcome.UNHANDLED
+    record.save(update_fields=["outcome", "updated_at"])
+
+
+class StripeEventHandler(SubscriptionWebhookHandlersMixin, TicketRefundHandlersMixin):
+    """Handles the business logic for different types of Stripe webhook events."""
+
+    def __init__(self, event: stripe.Event):
+        """Initialize the Stripe event handler."""
+        self.event = event
+
+    def handle(self) -> bool:
+        """Route the event to its handler. Returns True if the type is mapped."""
+        handlers: dict[str, t.Callable[[stripe.Event], None]] = {
+            "checkout.session.completed": self.handle_checkout_session_completed,
+            "account.updated": self.handle_account_updated,
+            "charge.refunded": self.handle_charge_refunded,
+            "payment_intent.canceled": self.handle_payment_intent_canceled,
+            # Membership subscriptions (Phases 2-4). Diff-based and idempotent:
+            # the dedup gate skips true redeliveries, these also tolerate the
+            # nightly reconciliation feeding them retrieved payloads.
+            "checkout.session.expired": self.handle_subscription_checkout_expired,
+            "customer.subscription.created": self.handle_customer_subscription_created,
+            "customer.subscription.updated": self.handle_customer_subscription_updated,
+            "customer.subscription.deleted": self.handle_customer_subscription_deleted,
+            "invoice.paid": self.handle_invoice_paid,
+            "invoice.payment_failed": self.handle_invoice_payment_failed,
+            "invoice.payment_action_required": self.handle_invoice_payment_action_required,
+            "subscription_schedule.released": self.handle_subscription_schedule_released,
+        }
+        handler = handlers.get(self.event.type)
+        if handler is None:
+            self.handle_unknown_event(self.event)
+            return False
+        handler(self.event)
+        return True
+
+    def handle_unknown_event(self, event: stripe.Event) -> None:
+        """Log unhandled event types for future development."""
+        logger.info("stripe_webhook_unhandled_event", event_type=event.type, event_id=event.id)
+
+    def replay(self) -> None:
+        """Re-enqueue idempotent downstream tasks for a redelivered event.
+
+        The dedup gate in :func:`handle_event` stops the full handler from
+        re-running, but the first delivery's ``transaction.on_commit``
+        ``.delay()`` calls fired after that commit and may have failed (e.g.
+        broker outage) without rolling the dedup row back. Stripe redelivery
+        is the retry mechanism for that window, so re-enqueue the tasks here;
+        downstream is idempotent and skips work already done.
+        """
+        replayers: dict[str, t.Callable[[stripe.Event], None]] = {
+            "checkout.session.completed": self.replay_checkout_session_completed,
+            "charge.refunded": self.replay_charge_refunded,
+        }
+        replayer = replayers.get(self.event.type)
+        if replayer is not None:
+            replayer(self.event)
+
+    def replay_checkout_session_completed(self, event: stripe.Event) -> None:
+        """Re-enqueue invoice generation for a redelivered checkout completion.
+
+        Mirrors the unconditional enqueue (and its guards) in
+        :meth:`handle_checkout_session_completed` so a ``.delay()`` that
+        failed on the first delivery gets retried.
+        """
+        session = event.data.object
+        session_id = session["id"]
+        if session.get("mode") == "subscription" or (session.get("metadata") or {}).get("membership_subscription_id"):
+            # Subscription checkouts have no Payment rows and no on_commit task
+            # to re-enqueue — instead re-run the (idempotent) link + initial-
+            # invoice backfill so a redelivery self-heals a dropped first
+            # ``invoice.paid`` (link is a no-op when already set; the backfill
+            # skips when a payment row exists).
+            self.handle_subscription_checkout_completed(event)
+            return
+        if session["payment_status"] not in {"paid", "no_payment_required"}:
+            return
+        if not Payment.objects.filter(stripe_session_id=session_id).exists():
+            return
+
+        def _trigger_invoice() -> None:
+            from events.tasks import generate_attendee_invoice_task
+
+            generate_attendee_invoice_task.delay(session_id)
+
+        transaction.on_commit(_trigger_invoice)
+
+    def replay_charge_refunded(self, event: stripe.Event) -> None:
+        """Re-enqueue credit-note generation for a redelivered refund.
+
+        Mirrors the "pure duplicate webhook" branch of
+        :meth:`_schedule_credit_note`: the payments the first delivery
+        refunded are ``refund_status=SUCCEEDED`` by now, so retry the credit
+        note for exactly those.
+        """
+        payment_intent_id = event.data.object.get("payment_intent")
+        if not payment_intent_id:
+            return
+        membership_payment = (
+            MembershipPayment.objects.filter(
+                stripe_payment_intent_id=payment_intent_id,
+                status=MembershipPayment.PaymentStatus.REFUNDED,
+            )
+            .select_related("subscription", "subscription__plan", "subscription__organization")
+            .first()
+        )
+        if membership_payment is not None:
+            # Subscription-refund redelivery: the first delivery terminalized
+            # the row and queued a post-commit best-effort Stripe cancel that
+            # may have failed (the exact window replay exists for, #492). If
+            # the local row is CANCELLED with a live Stripe link, retry the
+            # cancel — idempotent, tolerates an already-canceled Stripe sub.
+            sub = membership_payment.subscription
+            if (
+                sub.status == MembershipSubscription.SubscriptionStatus.CANCELLED
+                and sub.plan.payment_method == MembershipSubscriptionPlan.PaymentMethod.ONLINE
+                and sub.stripe_subscription_id
+            ):
+                from events.service.subscription.stripe.checkout import cancel_stripe_subscription_best_effort
+
+                transaction.on_commit(
+                    functools.partial(cancel_stripe_subscription_best_effort, sub, reason="refund_auto_cancel_replay")
+                )
+            return
+        refunded = list(
+            Payment.objects.filter(
+                stripe_payment_intent_id=payment_intent_id,
+                refund_status=Payment.RefundStatus.SUCCEEDED,
+            )
+        )
+        if not refunded:
+            return
+        sid = refunded[0].stripe_session_id
+        ids = [str(p.id) for p in refunded]
+        # refund_status=SUCCEEDED now also covers partial refunds (#865), so
+        # collect the actual Refund rows rather than assuming full-payment
+        # amounts — the task is amount-aware when refund_ids is given.
+        refund_ids = [
+            str(pk)
+            for pk in Refund.objects.filter(payment__in=refunded, status=Refund.RefundStatus.SUCCEEDED).values_list(
+                "pk", flat=True
+            )
+        ]
+
+        def _retry_credit_note() -> None:
+            from events.tasks import generate_attendee_credit_note_task
+
+            generate_attendee_credit_note_task.delay(sid, ids, refund_ids)
+
+        transaction.on_commit(_retry_credit_note)
+
+    @transaction.atomic
+    def handle_checkout_session_completed(self, event: stripe.Event) -> None:
+        """Handles the successful completion of a checkout session.
+
+        Updates payment and ticket status and triggers confirmation email.
+        Supports both single-ticket and batch ticket purchases. Sessions in
+        ``mode=subscription`` (membership subscriptions) are dispatched to the
+        subscription handler instead — they have no Payment/Ticket rows.
+        """
+        session = event.data.object
+        session_id = session["id"]
+
+        if session.get("mode") == "subscription" or (session.get("metadata") or {}).get("membership_subscription_id"):
+            self.handle_subscription_checkout_completed(event)
+            return
+
+        if session["payment_status"] not in {"paid", "no_payment_required"}:
+            logger.warning(
+                "stripe_session_unresolved_payment",
+                session_id=session_id,
+                payment_status=session["payment_status"],
+            )
+            return
+
+        # Get all payments for this session (supports batch purchases)
+        payments = list(Payment.objects.filter(stripe_session_id=session_id).select_related("ticket"))
+
+        if not payments:
+            self._report_missing_payments(session, session_id)
+            return
+
+        self._reconcile_session_total(session, payments)
+
+        # Always enqueue invoice generation (idempotent downstream).
+        # This must run even on duplicate webhooks so that a previously failed
+        # .delay() call gets retried when Stripe re-delivers the event.
+        def _trigger_invoice() -> None:
+            from events.tasks import generate_attendee_invoice_task
+
+            generate_attendee_invoice_task.delay(session_id)
+
+        transaction.on_commit(_trigger_invoice)
+
+        # Check if already processed (idempotency for payment/ticket updates)
+        if all(p.status == Payment.PaymentStatus.SUCCEEDED for p in payments):
+            logger.info(
+                "stripe_webhook_duplicate_payment_success",
+                session_id=session_id,
+                payment_count=len(payments),
+            )
+            return
+
+        payment_intent_id = session.get("payment_intent")
+        raw_response = dict(event)
+
+        # Series passes first: their backfill locks TicketTier rows, and the ticket
+        # activation below takes Ticket + TicketNumberSequence locks. The canonical lock
+        # order is parent row -> TicketTier (pk) -> Ticket -> TicketNumberSequence
+        # (docs/engineering-notes.md), so tiers must be locked before any numbering.
+        self._activate_series_passes(session_id)
+
+        # Update all payments and tickets
+        for payment in payments:
+            if payment.status == Payment.PaymentStatus.SUCCEEDED:
+                continue  # Already processed
+
+            payment.status = Payment.PaymentStatus.SUCCEEDED
+            payment.stripe_payment_intent_id = payment_intent_id
+            payment.raw_response = raw_response
+            payment.save(update_fields=["status", "stripe_payment_intent_id", "raw_response"])
+
+            ticket = payment.ticket
+            if ticket.status == Ticket.TicketStatus.CANCELLED:
+                # Defense-in-depth: a late payment on a checkout whose ticket was
+                # cancelled in the meantime (e.g. organizer cancelled a pending
+                # series pass) must not resurrect the ticket. Payment bookkeeping
+                # above still runs — the money was captured and needs a refund.
+                logger.warning(
+                    "stripe_session_completed_cancelled_ticket_skipped",
+                    session_id=session_id,
+                    ticket_id=str(ticket.id),
+                )
+                continue
+            ticket.status = Ticket.TicketStatus.ACTIVE
+            ticket.save(update_fields=["status"])
+
+        # Notifications are now handled by Payment post_save signal in notifications/signals/payment.py
+        logger.info(
+            "stripe_payment_success",
+            session_id=session_id,
+            payment_count=len(payments),
+            ticket_ids=[str(p.ticket_id) for p in payments],
+            total_amount=float(sum(p.amount for p in payments)),
+            currency=payments[0].currency,
+        )
+
+    @staticmethod
+    def _report_missing_payments(session: t.Any, session_id: str) -> None:
+        """Grade a session that has no Payment rows to confirm (#750).
+
+        A zero-total session (a free ticket, a fully-discounted cart, a session
+        Stripe expired and re-delivered) is benign noise and stays a warning.
+
+        A session that captured *money* is not: whatever the cause — the expiry
+        sweep having deleted the rows of a checkout whose confirmation kept
+        failing, a reservation reclaimed mid-flight — the buyer has been charged
+        and we hold no record to confirm, refund against, or re-issue from. The
+        handler still returns 200 because a redelivery would find exactly the same
+        nothing; the alert, not the retry, is what recovers the buyer.
+        """
+        amount_total = session.get("amount_total")
+        if not amount_total:
+            logger.warning("stripe_session_no_payments", session_id=session_id)
+            return
+        record_paid_session_without_payments(
+            session_id=session_id,
+            amount_total=int(amount_total),
+            currency=session.get("currency"),
+            payment_intent_id=session.get("payment_intent"),
+        )
+
+    @staticmethod
+    def _reconcile_session_total(session: t.Any, payments: list[Payment]) -> None:
+        """Refuse to confirm a session whose total disagrees with our Payment rows (#739).
+
+        The books-vs-charge check nothing in this path used to do: before per-ticket
+        prices, every Payment in a batch held the same amount and the session was
+        built from that one scalar, so the two could not diverge. They can now, and a
+        divergence means the captured amount, the recorded revenue and the platform
+        fee are all computed off different totals — permanently, and silently.
+
+        Raising rolls the whole webhook transaction back (including the dedup row and
+        the queued invoice ``on_commit``), so Stripe redelivers and the discrepancy
+        stays visible instead of being written into the ledger. ``amount_total`` is
+        optional in the payload: absent, there is nothing to reconcile against.
+
+        Raises:
+            SessionTotalMismatchError: If Stripe's total differs from ``sum(Payment.amount)``.
+        """
+        amount_total = session.get("amount_total")
+        if amount_total is None:
+            return
+        currency = payments[0].currency
+        recorded = to_stripe_amount(sum((p.amount for p in payments), Decimal("0")), currency)
+        if int(amount_total) != recorded:
+            # Emitted *before* the raise: the rollback takes every database trace of
+            # this attempt with it, and the expiry sweep deletes the rows within
+            # minutes, so this is the only surviving record of the incident (#750).
+            record_session_total_mismatch(
+                call_site="webhook",
+                payments=payments,
+                charged_minor_units=int(amount_total),
+                recorded_minor_units=recorded,
+                currency=currency,
+                session_id=session["id"],
+                payment_intent_id=session.get("payment_intent"),
+            )
+            raise SessionTotalMismatchError(
+                f"Stripe charged {amount_total} but recorded Payment total is {recorded} ({currency})"
+            )
+
+    @staticmethod
+    def _activate_series_passes(session_id: str) -> None:
+        """Activate any series pass bought in this session (idempotent).
+
+        ``.update()`` intentionally skips signals — ids are captured beforehand so
+        the purchase notification can be sent explicitly (once, on commit). Each
+        activated pass is then backfilled: the extension task only materializes
+        tickets for ACTIVE holders, so without this a mid-checkout buyer would
+        miss any extension linked while the pass sat PENDING.
+        """
+        # Imported here to avoid a cycle (series_pass_service -> events.tasks -> services).
+        from events.service.series_pass_service import backfill_missing_tickets
+
+        activated_pass_ids = list(
+            HeldSeriesPass.objects.filter(
+                stripe_session_id=session_id, status=HeldSeriesPass.HeldSeriesPassStatus.PENDING
+            ).values_list("id", flat=True)
+        )
+        if not activated_pass_ids:
+            return
+        HeldSeriesPass.objects.filter(id__in=activated_pass_ids).update(
+            status=HeldSeriesPass.HeldSeriesPassStatus.ACTIVE
+        )
+        for held_pass in HeldSeriesPass.objects.filter(id__in=activated_pass_ids).select_related("series_pass", "user"):
+            backfill_missing_tickets(held_pass)
+        for held_pass_id in activated_pass_ids:
+            transaction.on_commit(functools.partial(send_series_pass_purchased, held_pass_id))
+
+    @transaction.atomic
+    def handle_account_updated(self, event: stripe.Event) -> None:
+        """Handle updates to connected Stripe accounts.
+
+        This webhook fires when account details change, including when
+        charges_enabled and details_submitted status change during onboarding.
+        Syncs the status on whichever model owns the account (Organization or RevelUser).
+        """
+        if not getattr(event, "account", None):
+            # account.updated for the platform's OWN account (only possible if
+            # the platform endpoint ever subscribes to it) — nothing to mirror;
+            # host-org binding is managed via the admin action.
+            # warning, not debug: reaching this branch means the platform
+            # endpoint is subscribed to account.updated, which the provisioning
+            # command never does — surface the misconfiguration in prod logs.
+            logger.warning("stripe_account_updated_platform_self_skipped", event_id=event.id)
+            return
+
+        account_data = event.data.object
+        account_id = account_data["id"]
+
+        connectable = self._find_connectable(account_id)
+        if connectable is None:
+            logger.warning("stripe_account_updated_unknown", account_id=account_id)
+            return
+
+        connectable.stripe_charges_enabled = account_data.get("charges_enabled", False)
+        connectable.stripe_details_submitted = account_data.get("details_submitted", False)
+        connectable.save(
+            update_fields=connectable._stripe_update_fields("stripe_charges_enabled", "stripe_details_submitted"),
+        )
+
+        if isinstance(connectable, Organization):
+            logger.info(
+                "stripe_account_updated",
+                organization_slug=connectable.slug,
+                account_id=account_id,
+                charges_enabled=connectable.stripe_charges_enabled,
+                details_submitted=connectable.stripe_details_submitted,
+            )
+        else:
+            logger.info(
+                "stripe_account_updated",
+                user_id=str(connectable.pk),
+                account_id=account_id,
+                charges_enabled=connectable.stripe_charges_enabled,
+                details_submitted=connectable.stripe_details_submitted,
+            )
+
+    @staticmethod
+    def _find_connectable(account_id: str) -> StripeConnectMixin | None:
+        """Look up the model that owns *account_id* (Organization first, then RevelUser)."""
+        try:
+            return Organization.objects.get(stripe_account_id=account_id)
+        except Organization.DoesNotExist:
+            pass
+        try:
+            return RevelUser.objects.get(stripe_account_id=account_id)
+        except RevelUser.DoesNotExist:
+            return None
+
+    @transaction.atomic
+    def handle_charge_refunded(self, event: stripe.Event) -> None:
+        """Route a charge.refunded event to the subscription or ticket refund handler.
+
+        Stripe Payment Intents are per-purchase, so a matching MembershipPayment row
+        means the refund is for a subscription invoice; otherwise it is a ticket refund.
+        """
+        charge_data = event.data.object
+        payment_intent_id = charge_data.get("payment_intent")
+
+        if not payment_intent_id:
+            logger.warning("stripe_refund_missing_intent", charge_id=charge_data.get("id"))
+            return
+
+        # Phase 4: Subscription refunds — handled by subscription.lifecycle.
+        membership_payment = (
+            MembershipPayment.objects.select_for_update().filter(stripe_payment_intent_id=payment_intent_id).first()
+        )
+        if membership_payment is not None:
+            self._handle_subscription_refund(event, membership_payment)
+            return
+
+        self._handle_ticket_refunds(event, payment_intent_id)
+
+    def _resolve_refunds(self, charge_data: dict[str, t.Any]) -> list[dict[str, t.Any]]:
+        """Return the charge's refunds, from the payload or the Stripe API.
+
+        Payloads rendered at API versions >= 2022-11-15 don't embed the
+        charge's refunds list, so any *pinned* webhook endpoint delivers
+        ``charge.refunded`` without it — fetch it outbound in that case.
+        Embedded refunds (old unpinned endpoints) short-circuit without an
+        API call.
+
+        Connected-account events carry ``event.account``; the refunds then
+        live on that account, so the request needs the ``Stripe-Account``
+        header. A failed call raises, rolling the webhook transaction (and the
+        dedup row) back so the Stripe retry reprocesses the event.
+
+        Args:
+            charge_data: The Charge object from the webhook payload.
+
+        Returns:
+            The charge's refunds as dicts. Empty if the charge has none (or
+            the payload carries no charge id).
+        """
+        embedded = charge_data.get("refunds", {}).get("data", []) or []
+        if embedded:
+            return list(embedded)
+        charge_id = charge_data.get("id")
+        if not charge_id:
+            return []
+        params: dict[str, t.Any] = {"charge": charge_id, "limit": 100}
+        if account := getattr(self.event, "account", None):
+            params["stripe_account"] = account
+        # auto_paging_iter walks past the first page (limit is just page size),
+        # so a charge with >100 refunds doesn't silently drop the tail.
+        return [dict(refund) for refund in stripe.Refund.list(**params).auto_paging_iter()]
+
+    @transaction.atomic
+    def handle_payment_intent_canceled(self, event: stripe.Event) -> None:
+        """Handle canceled payment intents.
+
+        This fires when a payment is canceled before being captured.
+        For example, when a checkout session expires without payment.
+        Supports both single-ticket and batch ticket purchases.
+        """
+        payment_intent_data = event.data.object
+        payment_intent_id = payment_intent_data.get("id")
+
+        if not payment_intent_id:
+            logger.warning("stripe_payment_intent_canceled_missing_id")
+            return
+
+        # Find all payments by payment_intent_id (supports batch purchases). Locked
+        # with select_for_update(of=("self",)) — mirroring handle_charge_refunded —
+        # so a concurrent reclaim on the same rows (cleanup_expired_payments,
+        # cancel_pending_checkout) serializes instead of both reading PENDING and
+        # both decrementing the tier from the same unlocked snapshot. No outbound
+        # Stripe call happens in this handler, so holding the lock for its duration
+        # is safe (#632).
+        payments = list(
+            Payment.objects.select_for_update(of=("self",))
+            .filter(stripe_payment_intent_id=payment_intent_id)
+            .select_related("ticket", "ticket__tier")
+        )
+
+        if not payments:
+            # This is expected for sessions that expire naturally before payment
+            logger.debug("stripe_payment_intent_canceled_unknown", payment_intent_id=payment_intent_id)
+            return
+
+        # Only process pending payments
+        pending_payments = [p for p in payments if p.status == Payment.PaymentStatus.PENDING]
+        if not pending_payments:
+            logger.info(
+                "stripe_payment_intent_canceled_no_pending",
+                payment_intent_id=payment_intent_id,
+                payment_count=len(payments),
+            )
+            return
+
+        raw_response = dict(event)
+        canceled_tickets = []
+        affected_event_ids: set[uuid.UUID] = set()
+
+        # Cancel any series pass stranded by the dead checkout FIRST, releasing its
+        # quantity_sold so the buyer can purchase again — pass row before tier rows,
+        # matching SeriesPassPurchaseService.purchase's lock order to avoid
+        # deadlocking against a concurrent purchase on the same pass. Imported here
+        # to avoid a cycle (series_pass_service -> events.tasks -> services).
+        from events.service.series_pass_service import expire_stranded_held_passes
+
+        expire_stranded_held_passes({p.stripe_session_id for p in pending_payments})
+
+        for payment in pending_payments:
+            # Update payment status to failed
+            payment.status = Payment.PaymentStatus.FAILED
+            payment.raw_response = raw_response
+            payment.save(update_fields=["status", "raw_response"])
+
+            # Cancel the ticket
+            ticket = payment.ticket
+            already_cancelled = ticket.status == Ticket.TicketStatus.CANCELLED
+            ticket.status = Ticket.TicketStatus.CANCELLED
+            ticket.save(update_fields=["status"])
+
+            # Restore ticket quantity (guard against underflow if row is already at 0).
+            # Skip if already CANCELLED: a PENDING payment can be paired with an
+            # already-CANCELLED ticket (e.g. cancel_ticket_by_user already released
+            # the slot) whose capacity must not be released a second time. Safe by
+            # invariant today -- a PENDING payment has no payment_intent_id, so this
+            # handler can't match it -- but mirrors handle_charge_refunded's guard for
+            # consistency and defense-in-depth (#632).
+            if not already_cancelled:
+                TicketTier.objects.filter(pk=ticket.tier.pk, quantity_sold__gt=0).update(
+                    quantity_sold=F("quantity_sold") - 1
+                )
+            affected_event_ids.add(ticket.event_id)
+            canceled_tickets.append(ticket)
+
+        # One enqueue per event regardless of how many tickets cancelled inside it.
+        for event_id in affected_event_ids:
+            enqueue_waitlist_processing(event_id)
+
+        logger.info(
+            "stripe_payment_intent_canceled_processed",
+            payment_intent_id=payment_intent_id,
+            payment_count=len(canceled_tickets),
+            ticket_ids=[str(t.id) for t in canceled_tickets],
+        )

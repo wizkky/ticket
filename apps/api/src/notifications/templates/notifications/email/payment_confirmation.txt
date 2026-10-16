@@ -1,0 +1,30 @@
+{% load i18n %}{% trans "Hello" %} {{ user.display_name }},
+
+{% blocktranslate with event=context.event_name %}Thank you! Your payment for {{ event }} has been confirmed. 🎉{% endblocktranslate %}
+
+{% trans "Payment Details:" %}
+💰 {% trans "Amount:" %} {{ context.payment_amount }} {{ context.payment_currency }}
+- {% trans "Payment ID:" %} {{ context.payment_id }}
+- {% trans "Date:" %} {{ context.payment_date }}
+
+{% trans "Event Details:" %}
+📅 {{ context.event_start_formatted }}
+{% if context.event_location %}📍 {{ context.event_location }}{% endif %}
+
+{% trans "Ticket Information:" %}
+- {% trans "Tier:" %} {{ context.tier_name }}
+- {% trans "Status:" %} {% trans "Active" %}
+- {% trans "Ticket ID:" %} {{ context.ticket_id }}
+
+{% trans "Your ticket is now active and attached to this email. Present it at the event entrance." %}
+
+{% if context.apple_wallet_signed_url %}
+{% trans "Add to Apple Wallet:" %} {{ context.apple_wallet_signed_url }}
+{% endif %}{% if context.google_wallet_save_url %}
+{% trans "Add to Google Wallet:" %} {{ context.google_wallet_save_url }}
+{% endif %}
+{% include "notifications/email/_tax_notice.txt" %}
+
+{% trans "View event details:" %} {{ context.event_url }}
+
+{% include "notifications/email/_footer.txt" %}

@@ -1,0 +1,11 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<div class="card">
+    <p>{% blocktranslate with org=context.organization_name %}Your verification request for <strong>{{ org }}</strong> has been approved. You now have full access to view and participate in their events.{% endblocktranslate %}</p>
+</div>
+<center>
+    <a href="{{ context.frontend_url }}" class="button">{% trans "View Organization" %}</a>
+</center>
+{% endblock %}

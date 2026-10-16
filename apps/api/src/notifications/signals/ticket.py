@@ -1,0 +1,432 @@
+"""Signal handlers for ticket notifications."""
+
+import typing as t
+
+import structlog
+from django.db import transaction
+from django.db.models.signals import post_save, pre_save
+from django.dispatch import receiver
+
+from common.models import SiteSettings
+from events.models import Event, Ticket, TicketTier
+from notifications.enums import NotificationType
+from notifications.service.eligibility import get_staff_for_notification
+from notifications.service.notification_helpers import format_event_datetime, notify_org_staff
+from notifications.signals import notification_requested
+
+logger = structlog.get_logger(__name__)
+
+
+def _get_ticket_action_for_payment_method(payment_method: str) -> str | None:
+    """Get action string for ticket creation based on payment method.
+
+    Args:
+        payment_method: Payment method from TicketTier.PaymentMethod
+
+    Returns:
+        Action string for notification, or None for online payments
+    """
+    action_map: dict[str, str] = {
+        TicketTier.PaymentMethod.FREE: "free_ticket_created",
+        TicketTier.PaymentMethod.OFFLINE: "offline_payment_pending",
+        TicketTier.PaymentMethod.AT_THE_DOOR: "at_door_ticket_created",
+    }
+    return action_map.get(payment_method)
+
+
+def _build_base_event_context(event: Event) -> dict[str, t.Any]:
+    """Build common event context fields used across notifications.
+
+    Args:
+        event: Event to build context for
+
+    Returns:
+        Dictionary with event_id, event_name, event_location, event_url, event_start_formatted,
+        organization_id, organization_name, and optionally address_url
+    """
+    event_location = event.full_address()
+    frontend_base_url = SiteSettings.get_solo().frontend_base_url
+    frontend_url = f"{frontend_base_url}/events/{event.id}"
+
+    event_start_formatted = format_event_datetime(event.start, event)
+
+    context: dict[str, t.Any] = {
+        "event_id": str(event.id),
+        "event_name": event.name,
+        "event_location": event_location,
+        "event_url": frontend_url,
+        "event_start_formatted": event_start_formatted,
+        "organization_id": str(event.organization_id),
+        "organization_name": event.organization.name,
+    }
+
+    # Include maps URL if available (ticket holders can always see address)
+    if event.location_maps_url:
+        context["address_url"] = event.location_maps_url
+
+    return context
+
+
+def _build_ticket_created_context(ticket: Ticket) -> dict[str, t.Any]:
+    """Build notification context for TICKET_CREATED."""
+    event = ticket.event
+    base_context = _build_base_event_context(event)
+
+    # Get manual payment instructions if available
+    manual_payment_instructions = None
+    if ticket.tier.manual_payment_instructions:
+        manual_payment_instructions = ticket.tier.manual_payment_instructions
+
+    return {
+        **base_context,
+        "ticket_id": str(ticket.id),
+        "ticket_reference": str(ticket.id),
+        "event_start": event.start.isoformat() if event.start else "",
+        "tier_name": ticket.tier.name,
+        "tier_price": str(ticket.tier.price),
+        "ticket_status": ticket.status,
+        "quantity": 1,  # Single ticket per notification
+        "total_price": str(ticket.tier.price),
+        "frontend_url": base_context["event_url"],  # Alias for backwards compatibility
+        "payment_method": ticket.tier.payment_method,
+        "manual_payment_instructions": manual_payment_instructions,
+    }
+
+
+def _build_ticket_updated_context(ticket: Ticket, old_status: str) -> dict[str, t.Any]:
+    """Build notification context for TICKET_UPDATED."""
+    event = ticket.event
+    base_context = _build_base_event_context(event)
+
+    # Determine action based on status change
+    action = "updated"
+    if old_status == Ticket.TicketStatus.PENDING and ticket.status == Ticket.TicketStatus.ACTIVE:
+        action = "activated"
+    elif ticket.status == Ticket.TicketStatus.CANCELLED:
+        action = "cancelled"
+    elif ticket.status == Ticket.TicketStatus.CHECKED_IN:
+        action = "checked in"
+
+    # Surface the refund amount (set transiently on the instance by the cancellation
+    # service / Stripe webhook handler) so the TICKET_CANCELLED template can report
+    # it in the same notification that announces the cancellation. Without this the
+    # user would only learn the refund amount later, via the TICKET_REFUNDED
+    # notification fired by the Payment signal when the webhook flips the Payment.
+    refund_amount_hint = getattr(ticket, "_refund_amount", "") or ""
+    refund_currency_hint = getattr(ticket, "_refund_currency", "") or ""
+
+    return {
+        **base_context,
+        "ticket_id": str(ticket.id),
+        "ticket_reference": str(ticket.id),
+        "tier_name": ticket.tier.name,
+        "ticket_status": ticket.status,
+        "old_status": old_status,
+        "new_status": ticket.status,
+        "action": action,
+        "cancellation_source": ticket.cancellation_source or "",
+        "cancellation_reason": ticket.cancellation_reason or "",
+        "refund_amount": refund_amount_hint,
+        "payment_currency": refund_currency_hint,
+    }
+
+
+def _send_ticket_created_notifications(ticket: Ticket) -> None:
+    """Send notifications for newly created ticket.
+
+    Notifies both the ticket holder and organization staff/owners.
+    Only sends notifications for offline/free tiers (online payment handled by payment service).
+
+    Args:
+        ticket: The newly created ticket
+    """
+    action = _get_ticket_action_for_payment_method(ticket.tier.payment_method)
+    if not action:
+        return  # Online payment - handled by payment service
+
+    base_context = _build_ticket_created_context(ticket)
+    context = base_context
+    if ticket.status == Ticket.TicketStatus.PENDING:
+        # A pending-payment email carries no attachments — the PDF/pkpass QR
+        # would look like a valid pass before payment. Everything arrives with
+        # the activation email; until then the webapp is the only source.
+        context = {**context, "include_pdf": False, "include_ics": False, "include_pkpass": False}
+
+    # Notify ticket holder
+    notification_requested.send(
+        sender=Ticket,
+        user=ticket.user,
+        notification_type=NotificationType.TICKET_CREATED,
+        context=context,
+    )
+
+    # Notify staff/owners with additional context (staff templates attach nothing)
+    staff_context = {
+        **base_context,
+        "ticket_holder_name": ticket.user.get_display_name(),
+        "ticket_holder_email": ticket.user.email,
+    }
+    notify_org_staff(
+        organization_id=ticket.event.organization_id,
+        notification_type=NotificationType.STAFF_TICKET_CREATED,
+        context=staff_context,
+        sender=Ticket,
+    )
+
+
+def send_batch_ticket_created_notifications(tickets: list[Ticket]) -> None:
+    """Send notifications for a batch of newly created tickets.
+
+    Optimized version of _send_ticket_created_notifications for bulk_create scenarios.
+    Fetches shared data (SiteSettings, staff) once instead of per-ticket.
+
+    Args:
+        tickets: List of tickets created in the same batch (same event and user; a
+            multi-tier cart (#846) means tiers MAY differ per ticket, so every
+            tier-derived value is read from ``ticket.tier`` inside the loop — only
+            the genuinely cart-wide data (SiteSettings, staff, event, and the
+            payment method, which ``validate_cart_shape`` keeps uniform) is hoisted)
+    """
+    # Local import: ``events.service.batch_ticket_service.tickets`` imports this module
+    # at module level, so the events service layer is only reachable from inside the
+    # function body (same pattern as ``notifications.service.templates.ticket_templates``).
+    from events.service.seating.pricing import recorded_or_resolved_price
+
+    if not tickets:
+        return
+
+    first_ticket = tickets[0]
+    action = _get_ticket_action_for_payment_method(first_ticket.tier.payment_method)
+    if not action:
+        return  # Online payment - handled by payment service
+
+    # Fetch shared data ONCE for all tickets
+    event = first_ticket.event
+    frontend_base_url = SiteSettings.get_solo().frontend_base_url
+    frontend_url = f"{frontend_base_url}/events/{event.id}"
+
+    event_start_formatted = format_event_datetime(event.start, event)
+
+    # Build base context once
+    base_context: dict[str, t.Any] = {
+        "event_id": str(event.id),
+        "event_name": event.name,
+        "event_location": event.full_address(),
+        "event_url": frontend_url,
+        "event_start_formatted": event_start_formatted,
+        "organization_id": str(event.organization_id),
+        "organization_name": event.organization.name,
+        "event_start": event.start.isoformat() if event.start else "",
+        # Uniform across the cart by construction (validate_cart_shape rejects a
+        # mixed-payment-method cart); every other tier-derived value is per-ticket.
+        "payment_method": first_ticket.tier.payment_method,
+    }
+
+    if event.location_maps_url:
+        base_context["address_url"] = event.location_maps_url
+
+    # Fetch staff ONCE for all tickets
+    staff_and_owners = list(get_staff_for_notification(event.organization_id, NotificationType.STAFF_TICKET_CREATED))
+
+    # Send notifications for each ticket
+    for ticket in tickets:
+        # What this ticket ACTUALLY cost, not the tier's list price: a PWYC amount,
+        # a discounted unit or a price-category seat all diverge from ``tier.price``,
+        # and the buyer's email must not quote a number they did not pay. Spec §5.5's
+        # read-side rule, via the same helper the refund ceiling and wallet passes use.
+        # Online carts never reach here (``action`` is None for them), so the
+        # ``Payment``-row carve-out that helper documents cannot apply.
+        ticket_price = recorded_or_resolved_price(ticket.tier, ticket.seat, ticket.price_paid)
+        shared_context = {
+            **base_context,
+            "ticket_id": str(ticket.id),
+            "ticket_reference": str(ticket.id),
+            "ticket_status": ticket.status,
+            "quantity": 1,
+            # Tier-derived: a multi-tier cart (#846) spans tiers, so each email
+            # must name ITS ticket's tier, price and payment instructions.
+            "tier_name": ticket.tier.name,
+            "tier_price": str(ticket_price),
+            "manual_payment_instructions": ticket.tier.manual_payment_instructions,
+            "total_price": str(ticket_price),
+            "frontend_url": frontend_url,
+        }
+        ticket_context = dict(shared_context)
+        if ticket.status == Ticket.TicketStatus.PENDING:
+            # Same rule as the single-ticket path: no attachments before payment.
+            ticket_context["include_pdf"] = False
+            ticket_context["include_ics"] = False
+            ticket_context["include_pkpass"] = False
+
+        # Notify ticket holder
+        notification_requested.send(
+            sender=Ticket,
+            user=ticket.user,
+            notification_type=NotificationType.TICKET_CREATED,
+            context=ticket_context,
+        )
+
+        # Notify staff/owners
+        staff_context = {
+            **shared_context,
+            "ticket_holder_name": ticket.user.get_display_name(),
+            "ticket_holder_email": ticket.user.email,
+        }
+        notify_org_staff(
+            organization_id=event.organization_id,
+            notification_type=NotificationType.STAFF_TICKET_CREATED,
+            context=staff_context,
+            sender=Ticket,
+            # Reuse the list hoisted above: one staff query for the whole batch.
+            recipients=staff_and_owners,
+        )
+
+
+def _send_ticket_activated_notification(ticket: Ticket, old_status: str) -> None:
+    """Send notification when ticket is activated.
+
+    Notifies the ticket holder when their ticket status changes to ACTIVE.
+    For online payments (PENDING→ACTIVE), skip this notification as the user
+    already receives PAYMENT_CONFIRMATION from the payment service.
+
+    Args:
+        ticket: The ticket being activated
+        old_status: The previous ticket status
+    """
+    # Skip notification for online payment activations (user gets PAYMENT_CONFIRMATION instead)
+    if old_status == Ticket.TicketStatus.PENDING and ticket.tier.payment_method == TicketTier.PaymentMethod.ONLINE:
+        return
+
+    context = _build_ticket_updated_context(ticket, old_status)
+
+    notification_requested.send(
+        sender=Ticket,
+        user=ticket.user,
+        notification_type=NotificationType.TICKET_UPDATED,
+        context=context,
+    )
+
+
+def _send_ticket_cancelled_notifications(ticket: Ticket, old_status: str) -> None:
+    """Send notifications when ticket is cancelled.
+
+    Notifies both the ticket holder and organization staff/owners about the cancellation.
+
+    Args:
+        ticket: The ticket being cancelled
+        old_status: The previous ticket status
+    """
+    base_context = _build_ticket_updated_context(ticket, old_status)
+    context = {
+        **base_context,
+        # A cancellation email must not carry the ticket files — the PDF/pkpass
+        # QR would still look like a valid pass for a now-dead ticket.
+        "include_pdf": False,
+        "include_ics": False,
+        "include_pkpass": False,
+    }
+
+    # Notify ticket holder
+    notification_requested.send(
+        sender=Ticket,
+        user=ticket.user,
+        notification_type=NotificationType.TICKET_CANCELLED,
+        context=context,
+    )
+
+    # Notify staff/owners with additional context
+    staff_context = {
+        **base_context,
+        "ticket_holder_name": ticket.user.get_display_name(),
+        "ticket_holder_email": ticket.user.email,
+    }
+    notify_org_staff(
+        organization_id=ticket.event.organization_id,
+        notification_type=NotificationType.STAFF_TICKET_CANCELLED,
+        context=staff_context,
+        sender=Ticket,
+    )
+
+
+def _handle_ticket_status_change(ticket: Ticket, old_status: str | None) -> None:
+    """Handle notifications for ticket status changes."""
+    if not old_status or old_status == ticket.status:
+        return
+
+    if ticket.status == Ticket.TicketStatus.ACTIVE:
+        _send_ticket_activated_notification(ticket, old_status)
+
+        # If payment was just completed (PENDING→ACTIVE), notify staff/owners
+        if old_status == Ticket.TicketStatus.PENDING:
+            context = _build_ticket_created_context(ticket)
+            staff_context = {
+                **context,
+                "ticket_holder_name": ticket.user.get_display_name(),
+                "ticket_holder_email": ticket.user.email,
+            }
+            notify_org_staff(
+                organization_id=ticket.event.organization_id,
+                notification_type=NotificationType.STAFF_TICKET_CREATED,
+                context=staff_context,
+                sender=Ticket,
+            )
+    elif ticket.status == Ticket.TicketStatus.CANCELLED:
+        # TICKET_CANCELLED fires for every cancellation. When a Stripe refund is
+        # involved, the cancellation_service / Stripe webhook handler set
+        # `ticket._refund_amount` + `ticket._refund_currency` so the same
+        # notification surfaces the refund amount immediately. The separate
+        # TICKET_REFUNDED notification is fired later from the Payment signal
+        # (notifications/signals/payment.py) once the Stripe webhook flips
+        # Payment.status to REFUNDED.
+        _send_ticket_cancelled_notifications(ticket, old_status)
+
+
+@receiver(pre_save, sender=Ticket)
+def capture_ticket_old_status(sender: type[Ticket], instance: Ticket, **kwargs: t.Any) -> None:
+    """Capture the old status value before save for change detection in post_save.
+
+    NOTE: This pattern uses pre_save to fetch the old instance, which theoretically
+    has a race condition if another transaction modifies the ticket between the read
+    and the save. However, we don't expect concurrent modifications to ticket status
+    in our current use cases, so this simpler approach is preferred over adding
+    django-model-utils dependency for FieldTracker.
+    """
+    if instance.pk:
+        try:
+            old_instance = Ticket.objects.get(pk=instance.pk)
+            if old_instance.status != instance.status:
+                instance._old_status = old_instance.status  # type: ignore[attr-defined]
+        except Ticket.DoesNotExist:
+            logger.debug("ticket_not_found_for_old_status", pk=instance.pk)
+
+
+@receiver(post_save, sender=Ticket)
+def handle_ticket_notifications(sender: type[Ticket], instance: Ticket, created: bool, **kwargs: t.Any) -> None:
+    """Send notifications for ticket lifecycle events.
+
+    Note: This is one of multiple post_save handlers for Ticket model:
+    - events.signals.handle_ticket_visibility_and_potluck: Handles visibility flags + potluck unclaiming
+    - notifications.signals.ticket.handle_ticket_notifications: Sends notifications (this handler)
+    - notifications.signals.waitlist.handle_ticket_waitlist_logic: Manages waitlist removal
+
+    Visibility flags are handled by events.signals to avoid duplication.
+    """
+    if instance.held_pass_id is not None:
+        # Series pass tickets get pass-level notifications instead of per-ticket
+        # created/activated/cancelled ones (see notifications/signals/series_pass.py).
+        # CHECKED_IN isn't handled by this module either way, so nothing is lost here.
+        return
+
+    def send_notifications() -> None:
+        if created:
+            _send_ticket_created_notifications(instance)
+        else:
+            # Check if old status was captured in pre_save
+            if hasattr(instance, "_old_status"):
+                _handle_ticket_status_change(instance, instance._old_status)
+
+    transaction.on_commit(send_notifications)
+
+
+# Note: TICKET_REFUNDED notifications are handled by Payment model signals
+# in the stripe service when a refund is processed, not by Ticket model

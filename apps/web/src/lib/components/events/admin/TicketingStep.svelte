@@ -1,0 +1,462 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { createQuery, createMutation, useQueryClient } from '@tanstack/svelte-query';
+	import {
+		eventadminticketsListTicketTiers,
+		eventadminticketsReorderTicketTiers,
+		eventadminticketsUpdateTicketTier,
+		eventpublicdetailsGetEvent,
+		organizationadminmembersListMembershipTiers
+	} from '$lib/api/generated/sdk.gen';
+	import type { TicketTierDetailSchema } from '$lib/api/generated/types.gen';
+	import { Button } from '$lib/components/ui/button';
+	import { Input } from '$lib/components/ui/input';
+	import { Label } from '$lib/components/ui/label';
+	import { Info, Ticket } from '@lucide/svelte';
+	import TierCard from './TierCard.svelte';
+	import TierForm from './TierForm.svelte';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { reorderByIds, swapAndCollectIds } from '$lib/utils/reorder';
+	import type { PlatformFeeInfo } from '$lib/utils/fees';
+	import { toast } from 'svelte-sonner';
+	import { extractErrorMessage } from '$lib/utils/errors';
+	import { noticesFor, unplacedNotices, type ComplianceStatus } from '$lib/utils/compliance';
+	import ComplianceNotices from '$lib/components/compliance/ComplianceNotices.svelte';
+
+	// Form state fields this step reads/writes. The parent passes a wider event
+	// form object; only these fields are used here.
+	interface EventFormData {
+		max_tickets_per_user?: number | null;
+		venue_id?: string | null;
+		// `datetime-local` values; tier check-in offsets are relative to `start` (#945).
+		start?: string;
+		end?: string | null;
+		check_in_starts_at?: string | null;
+		check_in_ends_at?: string | null;
+	}
+
+	// Shape of a validation error item returned by the backend (loc/msg pairs).
+	interface ValidationErrorDetail {
+		loc?: Array<string | number>;
+		msg?: string;
+	}
+
+	interface Props {
+		eventId: string;
+		organizationSlug: string;
+		organizationStripeConnected: boolean;
+		/** Org platform-fee terms for the tier net-payout preview (null hides it). */
+		platformFees?: PlatformFeeInfo | null;
+		formData: EventFormData;
+		onUpdate: (updates: Partial<EventFormData>) => void;
+		onBack: () => void;
+		onNext: () => void;
+		/** When true (default), renders nav buttons at bottom. When false, parent handles save. */
+		standalone?: boolean;
+	}
+
+	const {
+		eventId,
+		organizationSlug,
+		organizationStripeConnected,
+		platformFees = null,
+		formData,
+		onUpdate,
+		onBack,
+		onNext,
+		standalone = true
+	}: Props = $props();
+
+	const accessToken = $derived(authStore.accessToken);
+
+	// Fetch ticket tiers for this event
+	const tiersQuery = createQuery(() => ({
+		queryKey: ['event-admin', eventId, 'ticket-tiers'],
+		queryFn: () =>
+			eventadminticketsListTicketTiers({
+				path: { event_id: eventId }
+			})
+	}));
+
+	// Fetch membership tiers for the organization
+	const membershipTiersQuery = createQuery(() => ({
+		queryKey: ['organization', organizationSlug, 'membership-tiers'],
+		queryFn: async () => {
+			if (!accessToken) return null;
+			const response = await organizationadminmembersListMembershipTiers({
+				path: { slug: organizationSlug },
+				headers: { Authorization: `Bearer ${accessToken}` }
+			});
+			return response.data;
+		},
+		enabled: !!accessToken
+	}));
+
+	const queryClient = useQueryClient();
+
+	// The event's country rules (#1001). Read from the event detail, not the org:
+	// it follows where the event is held (an AT org's event in Italy is blocked
+	// even though the org card says allowed). Refetched on mount so a venue
+	// change saved on the details tab is reflected here. Fails CLOSED: until it
+	// has loaded, the tier editor treats card payment as unavailable.
+	const complianceQuery = createQuery(() => ({
+		queryKey: ['event-admin', eventId, 'compliance'],
+		queryFn: async () => {
+			const response = await eventpublicdetailsGetEvent({ path: { event_id: eventId } });
+			if (response.error || !response.data) throw new Error('Failed to load event compliance');
+			return response.data.compliance;
+		},
+		refetchOnMount: 'always' as const
+	}));
+	const compliance = $derived(complianceQuery.data ?? null);
+	// An in-flight fetch counts as loading even with cached data: after a venue
+	// change, the cached "allowed" may be stale until the refetch lands.
+	const complianceStatus = $derived<ComplianceStatus>(
+		complianceQuery.isFetching
+			? 'loading'
+			: complianceQuery.isSuccess
+				? 'ready'
+				: complianceQuery.isError
+					? 'error'
+					: 'loading'
+	);
+	const onlineBlocked = $derived(compliance?.online_payment === 'blocked');
+
+	// One-click Revel kill switch from the card. The tier PUT is a partial
+	// update, so `sales_paused` alone is the whole body. One mutation for every
+	// card, so every pause button waits while any pause is in flight.
+	const pauseMutation = createMutation(() => ({
+		mutationFn: async (input: { tierId: string; salesPaused: boolean }) => {
+			const res = await eventadminticketsUpdateTicketTier({
+				path: { event_id: eventId, tier_id: input.tierId },
+				body: { sales_paused: input.salesPaused }
+			});
+			if (res.error) throw res.error;
+			return res.data;
+		},
+		// Resuming a tier the country rules block answers 422 (#1001): keep the
+		// backend's reason on the page next to the tiers, not in a fleeting toast.
+		onError: (error: unknown) => {
+			pauseError = extractErrorMessage(error, m['ticketingStep.genericError']());
+		},
+		onSuccess: () => {
+			pauseError = null;
+		},
+		onSettled: () => {
+			queryClient.invalidateQueries({ queryKey: ['event-admin', eventId, 'ticket-tiers'] });
+		}
+	}));
+
+	// The schema types `id` as optional; a tier without one cannot be addressed.
+	function togglePauseFor(tier: TicketTierDetailSchema): (() => void) | undefined {
+		const tierId = tier.id;
+		if (!tierId) return undefined;
+		return () => pauseMutation.mutate({ tierId, salesPaused: !tier.sales_paused });
+	}
+
+	let pauseError = $state<string | null>(null);
+	let editingTier = $state<TicketTierDetailSchema | null>(null);
+	let showTierForm = $state(false);
+
+	const tiers = $derived(tiersQuery.data?.data?.results ?? []);
+
+	// Normalize the (dynamically-shaped) query error into the fields the template renders.
+	const tiersErrorInfo = $derived.by(
+		(): {
+			message: string | null;
+			detail: string | ValidationErrorDetail[] | null;
+		} => {
+			const err: unknown = tiersQuery.error;
+			if (!err || typeof err !== 'object') {
+				return { message: null, detail: null };
+			}
+			const obj = err as { message?: unknown; detail?: unknown };
+			const message = typeof obj.message === 'string' ? obj.message : null;
+			let detail: string | ValidationErrorDetail[] | null = null;
+			if (typeof obj.detail === 'string') {
+				detail = obj.detail;
+			} else if (Array.isArray(obj.detail)) {
+				detail = obj.detail as ValidationErrorDetail[];
+			}
+			return { message, detail };
+		}
+	);
+	const membershipTiers = $derived(membershipTiersQuery.data ?? []);
+
+	// --- Tier reordering via up/down buttons ---
+	const reorderMutation = createMutation<unknown, unknown, string[]>(() => ({
+		mutationFn: async (tierIds: string[]) => {
+			const response = await eventadminticketsReorderTicketTiers({
+				path: { event_id: eventId },
+				body: { tier_ids: tierIds }
+			});
+			// The generated client does not throw on HTTP errors (ThrowOnError = false),
+			// so surface a structured API error explicitly to trigger onError.
+			if (response.error) {
+				throw new Error(m['ticketingStep.failedToReorderTiers']());
+			}
+			return response.data;
+		},
+		// Snapshot the true previous order FIRST, then apply the optimistic reorder — so a
+		// failed request rolls back to the real original, not an already-swapped copy.
+		onMutate: async (tierIds: string[]) => {
+			await queryClient.cancelQueries({ queryKey: ['event-admin', eventId, 'ticket-tiers'] });
+			const previousData = queryClient.getQueryData(['event-admin', eventId, 'ticket-tiers']) as
+				{ data?: { results?: TicketTierDetailSchema[] } } | undefined;
+			if (previousData?.data?.results) {
+				queryClient.setQueryData(['event-admin', eventId, 'ticket-tiers'], {
+					...previousData,
+					data: { ...previousData.data, results: reorderByIds(previousData.data.results, tierIds) }
+				});
+			}
+			return { previousData };
+		},
+		onSuccess: async () => {
+			toast.success(m['ticketingStep.tierOrderUpdated']());
+			await queryClient.invalidateQueries({
+				queryKey: ['event-admin', eventId, 'ticket-tiers']
+			});
+		},
+		onError: (_err, _vars, context) => {
+			toast.error(m['ticketingStep.failedToReorderTiers']());
+			const ctx = context as { previousData?: unknown } | undefined;
+			if (ctx?.previousData) {
+				queryClient.setQueryData(['event-admin', eventId, 'ticket-tiers'], ctx.previousData);
+			}
+			// Reconcile with server truth after rollback: the request may have applied
+			// server-side before failing (e.g. a lost response), so refetch to be sure.
+			queryClient.invalidateQueries({ queryKey: ['event-admin', eventId, 'ticket-tiers'] });
+		}
+	}));
+
+	function handleMoveTier(index: number, direction: 'up' | 'down') {
+		const swapIndex = direction === 'up' ? index - 1 : index + 1;
+		if (swapIndex < 0 || swapIndex >= tiers.length) return;
+
+		// Swap whole tiers, then collect ids in the new order (bails on a null id). The
+		// optimistic cache write now happens in onMutate, after the snapshot.
+		const tierIds = swapAndCollectIds(tiers, index, swapIndex);
+		if (!tierIds) return;
+
+		reorderMutation.mutate(tierIds);
+	}
+
+	// Max tickets per user - stored as string for input, converted to number (default: 1).
+	// The string is a free-text buffer while the field has focus: empty and "0" are legal
+	// mid-edit states, and clamping only happens on blur. Clamping on every keystroke made
+	// the value impossible to edit — backspacing the last digit refilled the field with "1"
+	// under the caret, so the only possible edit was appending digits to it.
+	let maxTicketsInput = $state(formData.max_tickets_per_user?.toString() ?? '1');
+
+	// A committed limit is always a whole positive number. `type="number"` hands us the
+	// raw text of anything that parses as a floating-point literal, so "1.5" and "1e2"
+	// both arrive verbatim — `parseInt` would silently commit 1 for either.
+	function parseWholeTickets(raw: string): number | null {
+		const trimmed = raw.trim();
+		if (!/^\d+$/.test(trimmed)) return null;
+		const num = Number(trimmed);
+		return Number.isSafeInteger(num) && num > 0 ? num : null;
+	}
+
+	function handleMaxTicketsInput(value: string): void {
+		maxTicketsInput = value;
+		const num = parseWholeTickets(value);
+		if (num !== null) {
+			onUpdate({ max_tickets_per_user: num });
+		}
+		// Anything else (empty, "0", a half-typed decimal, garbage) commits nothing: the
+		// last valid value stands until blur settles the field.
+	}
+
+	function handleMaxTicketsBlur(): void {
+		// Settle whatever is left in the buffer by flooring the number the user actually
+		// entered ("05" -> 5, "10.5" -> 10, "1e2" -> 100) rather than truncating a prefix.
+		// Empty, zero, negative and unparseable values fall back to the minimum of 1.
+		const floored = Math.floor(Number(maxTicketsInput.trim()));
+		const clamped = Number.isSafeInteger(floored) && floored > 0 ? floored : 1;
+		maxTicketsInput = String(clamped);
+		onUpdate({ max_tickets_per_user: clamped });
+	}
+
+	function handleEditTier(tier: TicketTierDetailSchema) {
+		// Following the banner to fix the tier makes the last refusal stale.
+		pauseError = null;
+		editingTier = tier;
+		showTierForm = true;
+	}
+
+	function handleCloseTierForm() {
+		showTierForm = false;
+		editingTier = null;
+	}
+</script>
+
+<div class="space-y-6">
+	<div>
+		<h2 class="text-2xl font-bold">{m['ticketingStep.ticketingConfiguration']()}</h2>
+		<p class="text-muted-foreground">{m['ticketingStep.configureOptions']()}</p>
+	</div>
+
+	<!-- Event-level Ticket Settings -->
+	<div class="rounded-lg border border-border bg-card p-4">
+		<div class="mb-4 flex items-center gap-2">
+			<Ticket class="h-5 w-5 text-primary" aria-hidden="true" />
+			<h3 class="font-semibold">
+				{m['ticketingStep.eventTicketSettings']()}
+			</h3>
+		</div>
+
+		<div class="space-y-4">
+			<div class="space-y-2">
+				<Label for="max-tickets-per-user">
+					{m['ticketingStep.maxTicketsPerUser']()}
+				</Label>
+				<Input
+					id="max-tickets-per-user"
+					type="number"
+					min="1"
+					placeholder={m['ticketingStep.maxTicketsPlaceholder']()}
+					value={maxTicketsInput}
+					oninput={(e) => handleMaxTicketsInput(e.currentTarget.value)}
+					onblur={handleMaxTicketsBlur}
+					class="max-w-xs"
+				/>
+				<div class="mt-2 flex items-start gap-2 text-sm text-muted-foreground">
+					<Info class="mt-0.5 h-4 w-4 shrink-0" />
+					<p>
+						{m['ticketingStep.maxTicketsPerUserHint']()}
+					</p>
+				</div>
+			</div>
+		</div>
+	</div>
+
+	<!-- Ticket Tiers Section -->
+	<div>
+		<h3 class="mb-4 font-semibold">{m['ticketingStep.ticketTiers']()}</h3>
+		<p class="mb-4 text-sm text-muted-foreground">
+			{m['ticketingStep.createDifferentTiers']()}
+		</p>
+		<!-- Sales rules, plus any topic without a dedicated spot (never dropped). -->
+		<ComplianceNotices
+			notices={[
+				...noticesFor(compliance?.notices, 'ticket_sales'),
+				...unplacedNotices(compliance?.notices)
+			]}
+		/>
+	</div>
+
+	{#if pauseError}
+		<div
+			class="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-sm text-foreground"
+			role="alert"
+			data-testid="tier-pause-error"
+		>
+			{pauseError}
+		</div>
+	{/if}
+
+	{#if tiersQuery.isLoading}
+		<div class="flex items-center justify-center py-12">
+			<div class="text-center">
+				<div class="h-8 w-8 animate-spin rounded-full border-b-2 border-primary"></div>
+				<p class="mt-2 text-sm text-muted-foreground">{m['ticketingStep.loadingTiers']()}</p>
+			</div>
+		</div>
+	{:else if tiersQuery.isError}
+		<!-- Dimmed destructive copy stops at /90 — see WaitlistEntriesTable for the
+		     numbers. /80 on this tint is 4.71:1 over the page and 4.40:1 over a
+		     card; /90 is 5.61:1 / 5.18:1 and is audited on both surfaces. -->
+		<div class="rounded-lg border border-destructive bg-destructive/10 p-4" role="alert">
+			<p class="font-medium text-destructive">{m['ticketingStep.errorLoadingTiers']()}</p>
+			<p class="mt-1 text-sm text-destructive/90">
+				{tiersErrorInfo.message || m['ticketingStep.genericError']()}
+			</p>
+			{#if tiersErrorInfo.detail}
+				<div class="mt-2 space-y-1">
+					{#if Array.isArray(tiersErrorInfo.detail)}
+						{#each tiersErrorInfo.detail as detail, i (i)}
+							<p class="text-xs text-destructive/90">
+								• {detail.loc ? detail.loc.join(' → ') + ': ' : ''}{detail.msg}
+							</p>
+						{/each}
+					{:else}
+						<p class="text-xs text-destructive/90">{tiersErrorInfo.detail}</p>
+					{/if}
+				</div>
+			{/if}
+		</div>
+	{:else}
+		<div class="space-y-4">
+			{#each tiers as tier, index (tier.id)}
+				<TierCard
+					{tier}
+					{onlineBlocked}
+					venueCountry={compliance?.venue_country ?? ''}
+					onEdit={() => handleEditTier(tier)}
+					onTogglePause={togglePauseFor(tier)}
+					pausePending={pauseMutation.isPending}
+					onMoveUp={tiers.length >= 2 && index > 0 ? () => handleMoveTier(index, 'up') : undefined}
+					onMoveDown={tiers.length >= 2 && index < tiers.length - 1
+						? () => handleMoveTier(index, 'down')
+						: undefined}
+				/>
+			{/each}
+		</div>
+
+		{#if tiers.length === 0}
+			<div class="rounded-lg border border-dashed border-muted-foreground/25 p-8 text-center">
+				<p class="text-muted-foreground">{m['ticketingStep.noTiersFound']()}</p>
+				<p class="mt-1 text-sm text-muted-foreground">
+					{m['ticketingStep.defaultTierHint']()}
+				</p>
+			</div>
+		{/if}
+	{/if}
+
+	<!-- Add Another Tier Button -->
+	<button
+		type="button"
+		onclick={() => {
+			pauseError = null;
+			editingTier = null;
+			showTierForm = true;
+		}}
+		class="w-full rounded-lg border-2 border-dashed border-muted-foreground/25 p-6 transition-colors hover:border-muted-foreground/50"
+	>
+		<span class="text-lg">{m['ticketingStep.addAnotherTier']()}</span>
+		<p class="mt-1 text-sm text-muted-foreground">
+			{m['ticketingStep.tierExamples']()}
+		</p>
+	</button>
+
+	<!-- Navigation (only in standalone mode) -->
+	{#if standalone}
+		<div
+			class="flex flex-col-reverse gap-3 border-t border-border pt-6 sm:flex-row sm:justify-between"
+		>
+			<Button variant="outline" onclick={onBack}>{m['ticketingStep.back']()}</Button>
+			<Button onclick={onNext}>{m['ticketingStep.saveAndExit']()}</Button>
+		</div>
+	{/if}
+</div>
+
+{#if showTierForm}
+	<TierForm
+		tier={editingTier}
+		{eventId}
+		{organizationSlug}
+		{organizationStripeConnected}
+		{platformFees}
+		{membershipTiers}
+		eventVenueId={formData.venue_id || null}
+		rules={{ compliance, status: complianceStatus, onRetry: () => complianceQuery.refetch() }}
+		eventContext={{
+			start: formData.start ?? '',
+			end: formData.end,
+			checkInStart: formData.check_in_starts_at,
+			checkInEnd: formData.check_in_ends_at
+		}}
+		onClose={handleCloseTierForm}
+	/>
+{/if}

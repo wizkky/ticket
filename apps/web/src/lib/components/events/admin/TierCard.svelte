@@ -1,0 +1,356 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import type { TicketTierDetailSchema } from '$lib/api/generated/types.gen';
+	import { Button } from '$lib/components/ui/button';
+	import PricingCard from '$lib/components/common/PricingCard.svelte';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+	import MarkdownContent from '$lib/components/common/MarkdownContent.svelte';
+	import {
+		Edit,
+		Building2,
+		LayoutGrid,
+		Armchair,
+		ChevronUp,
+		ChevronDown,
+		Pause,
+		Play,
+		Ticket
+	} from '@lucide/svelte';
+	import { formatDateTime } from '$lib/utils/date';
+	import { formatMoney, MONEY_RANGE_SEPARATOR } from '$lib/utils/format';
+	import ComplianceCallout from '$lib/components/compliance/ComplianceCallout.svelte';
+	import { countryName } from '$lib/utils/compliance';
+
+	interface Props {
+		tier: TicketTierDetailSchema;
+		onEdit: () => void;
+		onMoveUp?: () => void;
+		onMoveDown?: () => void;
+		/** Flip `sales_paused` without opening the form; absent = no button. */
+		onTogglePause?: () => void;
+		pausePending?: boolean;
+		/** `event.compliance.online_payment === 'blocked'` (#1001). */
+		onlineBlocked?: boolean;
+		/** `event.compliance.venue_country`, for the banner copy. */
+		venueCountry?: string;
+	}
+
+	const {
+		tier,
+		onEdit,
+		onMoveUp,
+		onMoveDown,
+		onTogglePause,
+		pausePending = false,
+		onlineBlocked = false,
+		venueCountry = ''
+	}: Props = $props();
+
+	// A tier created before the country gate (or switched to card while the
+	// venue was elsewhere) can't sell anymore: say so and offer the way out.
+	const showOnlineBlockedBanner = $derived(onlineBlocked && tier.payment_method === 'online');
+
+	// Platform names live on the org-level connection list, not on the tier;
+	// the key is stable and there is one platform today.
+	const PLATFORM_NAMES: Record<string, string> = { eventbrite: 'Eventbrite' };
+	function platformName(provider: string): string {
+		return PLATFORM_NAMES[provider] ?? provider;
+	}
+
+	function formatDate(dateString: string | null | undefined): string {
+		if (!dateString) return 'Not set';
+		return formatDateTime(dateString);
+	}
+
+	const priceDisplay = $derived.by(() => {
+		const currency = tier.currency || 'EUR';
+		if (tier.payment_method === 'free') return 'Free';
+		if (tier.price_type === 'pwyc') {
+			const min = formatMoney(tier.pwyc_min || 1, currency);
+			const max = tier.pwyc_max ? formatMoney(tier.pwyc_max, currency) : 'any amount';
+			return `${min}${MONEY_RANGE_SEPARATOR}${max}`;
+		}
+		return formatMoney(tier.price || 0, currency);
+	});
+
+	const priceTypeDisplay = $derived.by(() => {
+		if (tier.payment_method === 'free') return 'Free';
+		return tier.price_type === 'pwyc' ? 'Pay What You Can' : 'Fixed Price';
+	});
+
+	const quantityDisplay = $derived.by(() => {
+		if (tier.total_quantity === null) return 'Unlimited';
+		// `?? 0` is safe here and only here: this is a staff-only admin surface, and
+		// organization owners/staff bypass `visibility_settings` entirely (#825), so
+		// `total_available` is never withheld from this reader. On any guest-facing
+		// surface the same expression would render a hidden count as zero.
+		const available = tier.total_available ?? 0;
+		return `${available} of ${tier.total_quantity} remaining`;
+	});
+
+	const paymentMethodDisplay = $derived.by(() => {
+		const methods: Record<string, string> = {
+			free: 'Free',
+			online: 'Online (Stripe)',
+			offline: 'Offline',
+			at_the_door: 'At the Door'
+		};
+		const pm = tier.payment_method ?? 'online';
+		return methods[pm] || pm.replace(/_/g, ' ');
+	});
+
+	const visibilityDisplay = $derived.by(() => {
+		return (tier.visibility ?? 'public').replace(/-/g, ' ');
+	});
+
+	const purchasableByDisplay = $derived.by(() => {
+		const options: Record<string, string> = {
+			public: 'Anyone',
+			members: 'Members Only',
+			invited: 'Invited Only',
+			invited_and_members: 'Invited + Members'
+		};
+		const pb = tier.purchasable_by ?? 'public';
+		return options[pb] || pb.replace(/_/g, ' ');
+	});
+
+	const salesWindowDisplay = $derived.by(() => {
+		const start = formatDate(tier.sales_start_at);
+		const end = formatDate(tier.sales_end_at);
+		if (start === 'Not set' && end === 'Not set') return 'Always available';
+		if (start === 'Not set') return `Until ${end}`;
+		if (end === 'Not set') return `From ${start}`;
+		return `${start} - ${end}`;
+	});
+
+	const seatAssignmentDisplay = $derived.by(() => {
+		const modes: Record<string, string> = {
+			none: m['tierCard.seatAssignment.none'](),
+			best_available: m['tierCard.seatAssignment.bestAvailable'](),
+			user_choice: m['tierCard.seatAssignment.userChoice']()
+		};
+		return modes[tier.seat_assignment_mode] || modes.none;
+	});
+
+	const maxTicketsDisplay = $derived.by(() => {
+		if (tier.max_tickets_per_user === null || tier.max_tickets_per_user === undefined) {
+			return m['tierCard.maxTickets.inherit']();
+		}
+		return String(tier.max_tickets_per_user);
+	});
+</script>
+
+{#snippet badges()}
+	{#if tier.name === 'General Admission'}
+		<StatusBadge tone="info" size="sm" label={m['tierCard.default']()} />
+	{/if}
+	{#if tier.sales_paused}
+		<StatusBadge tone="warning" size="sm" label={m['tierCard.salesPaused']()} />
+	{/if}
+{/snippet}
+
+{#snippet meta()}
+	<!-- Tier details. The price is ALSO promoted to the card's display number
+	     above, but it keeps its labelled `<dt>` row here: this is an organizer's
+	     config summary, where every configured field is expected to be readable
+	     as a labelled pair, and dropping the label orphaned `tierCard.price` /
+	     `tierCard.type`. The display number is the emphasis; the grid is the
+	     record. -->
+	<dl class="grid grid-cols-2 gap-x-6 gap-y-3 text-sm">
+		<!-- Price & Type -->
+		<div>
+			<dt class="text-muted-foreground">{m['tierCard.price']()}</dt>
+			<dd class="font-bold">{priceDisplay}</dd>
+		</div>
+		<div>
+			<dt class="text-muted-foreground">{m['tierCard.type']()}</dt>
+			<dd class="font-bold">{priceTypeDisplay}</dd>
+		</div>
+
+		<!-- Payment Method -->
+		<div>
+			<dt class="text-muted-foreground">{m['tierCard.paymentMethod']()}</dt>
+			<dd class="font-bold">{paymentMethodDisplay}</dd>
+		</div>
+
+		<!-- Quantity -->
+		<div>
+			<dt class="text-muted-foreground">{m['tierCard.quantity']()}</dt>
+			<dd class="font-bold">{quantityDisplay}</dd>
+		</div>
+
+		<!-- Sold elsewhere (per connected platform, from external_sales) -->
+		{#if tier.external_sales && tier.external_sales.length > 0}
+			<div>
+				<dt class="text-muted-foreground">{m['tierCard.soldElsewhere']()}</dt>
+				<dd class="font-bold">
+					{tier.external_sales
+						.map((s) =>
+							m['tierCard.soldOn']({ platform: platformName(s.provider), count: s.quantity_sold })
+						)
+						.join(', ')}
+				</dd>
+			</div>
+		{/if}
+
+		<!-- Visibility -->
+		<div>
+			<dt class="text-muted-foreground">{m['tierCard.visibility']()}</dt>
+			<dd class="font-bold capitalize">{visibilityDisplay}</dd>
+		</div>
+
+		<!-- Available To -->
+		<div>
+			<dt class="text-muted-foreground">{m['tierCard.availableTo']()}</dt>
+			<dd class="font-bold">{purchasableByDisplay}</dd>
+		</div>
+
+		<!-- Sales Window (full width) -->
+		<div class="col-span-2">
+			<dt class="text-muted-foreground">{m['tierCard.salesWindow']()}</dt>
+			<dd class="font-bold">{salesWindowDisplay}</dd>
+		</div>
+
+		<!-- Seat Assignment -->
+		<div>
+			<dt class="text-muted-foreground">
+				<span class="flex items-center gap-1">
+					<Armchair class="h-3 w-3" aria-hidden="true" />
+					{m['tierCard.seatAssignment.label']()}
+				</span>
+			</dt>
+			<dd class="font-bold">{seatAssignmentDisplay}</dd>
+		</div>
+
+		<!-- Max Tickets Per User -->
+		<div>
+			<dt class="text-muted-foreground">
+				{m['tierCard.maxTicketsPerUser']()}
+			</dt>
+			<dd class="font-bold">{maxTicketsDisplay}</dd>
+		</div>
+
+		<!-- Venue/Sector (if configured) -->
+		{#if tier.venue || tier.sector}
+			<div class="col-span-2">
+				<dt class="text-muted-foreground">
+					<span class="flex items-center gap-1">
+						<Building2 class="h-3 w-3" aria-hidden="true" />
+						{m['tierCard.venueAndSector']()}
+					</span>
+				</dt>
+				<dd class="flex flex-wrap items-center gap-2 font-bold">
+					{#if tier.venue}
+						<span class="flex items-center gap-1">
+							<Building2 class="h-4 w-4 text-primary" aria-hidden="true" />
+							{tier.venue.name}
+						</span>
+					{/if}
+					{#if tier.venue && tier.sector}
+						<span class="text-muted-foreground">/</span>
+					{/if}
+					{#if tier.sector}
+						<span class="flex items-center gap-1">
+							<LayoutGrid class="h-4 w-4 text-primary" aria-hidden="true" />
+							{tier.sector.name}
+							{#if tier.sector.code}
+								<span class="text-xs font-normal text-muted-foreground">({tier.sector.code})</span>
+							{/if}
+						</span>
+					{/if}
+				</dd>
+			</div>
+		{/if}
+	</dl>
+
+	<!-- Manual Payment Instructions -->
+	{#if tier.manual_payment_instructions}
+		<div class="mt-3 rounded-md border border-border bg-muted/50 p-2">
+			<p class="text-xs font-bold text-muted-foreground">
+				{m['tierCard.paymentInstructions']()}
+			</p>
+			<MarkdownContent content={tier.manual_payment_instructions} class="mt-1 text-sm" />
+		</div>
+	{/if}
+{/snippet}
+
+{#snippet actions()}
+	<!-- Row on mobile (the card is a single column there), rail on sm+ -->
+	<div class="flex flex-row items-center gap-1 sm:flex-col">
+		{#if onMoveUp || onMoveDown}
+			<div class="flex flex-row sm:flex-col">
+				<Button
+					variant="ghost"
+					size="icon"
+					class="h-7 w-7"
+					onclick={onMoveUp}
+					disabled={!onMoveUp}
+					aria-label="Move {tier.name} up"
+				>
+					<ChevronUp class="h-4 w-4" />
+				</Button>
+				<Button
+					variant="ghost"
+					size="icon"
+					class="h-7 w-7"
+					onclick={onMoveDown}
+					disabled={!onMoveDown}
+					aria-label="Move {tier.name} down"
+				>
+					<ChevronDown class="h-4 w-4" />
+				</Button>
+			</div>
+		{/if}
+		{#if onTogglePause}
+			<Button
+				variant="ghost"
+				size="icon"
+				onclick={onTogglePause}
+				disabled={pausePending}
+				aria-label={tier.sales_paused
+					? m['tierCard.resumeSalesFor']({ name: tier.name })
+					: m['tierCard.pauseSalesFor']({ name: tier.name })}
+				title={tier.sales_paused ? m['tierCard.resumeSales']() : m['tierCard.pauseSales']()}
+			>
+				{#if tier.sales_paused}
+					<Play class="h-4 w-4" />
+				{:else}
+					<Pause class="h-4 w-4" />
+				{/if}
+			</Button>
+		{/if}
+		<Button variant="ghost" size="icon" onclick={onEdit} aria-label="Edit {tier.name}">
+			<Edit class="h-4 w-4" />
+		</Button>
+	</div>
+{/snippet}
+
+<PricingCard
+	name={tier.name}
+	icon={Ticket}
+	price={priceDisplay}
+	priceNote={priceTypeDisplay}
+	{badges}
+	{meta}
+	{actions}
+>
+	{#if showOnlineBlockedBanner}
+		<ComplianceCallout tone="blocked" testId="tier-online-blocked-banner">
+			<p>
+				{m['compliance.tier.legacyOnlineBanner']({
+					country: countryName(venueCountry) || m['compliance.thisCountry']()
+				})}
+			</p>
+			<!-- The tier name rides along as sr-only text AFTER the visible label, so the
+			     accessible name always starts with the visible words (WCAG 2.5.3) in
+			     every locale. -->
+			<Button variant="outline" size="sm" onclick={onEdit}>
+				{m['compliance.tier.changePaymentMethod']()}
+				<span class="sr-only">({tier.name})</span>
+			</Button>
+		</ComplianceCallout>
+	{/if}
+	{#if tier.description}
+		<MarkdownContent content={tier.description} class="text-sm text-muted-foreground" />
+	{/if}
+</PricingCard>

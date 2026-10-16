@@ -1,0 +1,205 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import * as m from '$lib/paraglide/messages.js';
+	import type { EventInvitationRequestSchema } from '$lib/api/generated/types.gen';
+	import { Card } from '$lib/components/ui/card';
+	import { Calendar, MapPin, Ticket, Clock, CheckCircle2, XCircle, Loader2 } from '@lucide/svelte';
+	import { getImageUrl } from '$lib/utils/url';
+	import { formatEventDateRange, formatDate } from '$lib/utils/date';
+	import { createMutation, useQueryClient } from '@tanstack/svelte-query';
+	import { eventpublicdiscoveryDeleteInvitationRequest } from '$lib/api/generated/sdk.gen';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { toast } from 'svelte-sonner';
+	import { extractErrorMessage } from '$lib/utils/errors';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+	import type { Tone } from '$lib/components/common/tones';
+
+	interface Props {
+		request: EventInvitationRequestSchema;
+	}
+
+	const { request }: Props = $props();
+
+	const queryClient = useQueryClient();
+	const accessToken = $derived(authStore.accessToken);
+
+	// Format event date
+	const eventDate = $derived.by(() => {
+		if (!request.event.start) return null;
+		return formatEventDateRange(request.event.start, request.event.start);
+	});
+
+	// Get event location
+	const eventLocation = $derived.by(() => {
+		// venue_name/location are not modeled on the event schema but may be present at runtime
+		const event = request.event as typeof request.event & {
+			venue_name?: string | null;
+			location?: string | null;
+		};
+		return event.venue_name || event.location || null;
+	});
+
+	// Format created date
+	const createdDate = $derived(formatDate(request.created_at));
+
+	// Status display — thin mapper onto the shared StatusBadge tone system
+	// (same visible labels as before, solid-fill tokens instead of hand-picked hues).
+	const statusDisplay = $derived.by((): { label: string; tone: Tone; icon: typeof Clock } => {
+		switch (request.status) {
+			case 'pending':
+				return { label: m['invitationRequestCard.statusPending'](), tone: 'warning', icon: Clock };
+			case 'approved':
+				return {
+					label: m['invitationRequestCard.statusApproved'](),
+					tone: 'success',
+					icon: CheckCircle2
+				};
+			case 'rejected':
+				return {
+					label: m['invitationRequestCard.statusRejected'](),
+					tone: 'danger',
+					icon: XCircle
+				};
+			default:
+				return { label: request.status ?? '', tone: 'neutral', icon: Clock };
+		}
+	});
+
+	// Cancel mutation
+	const cancelMutation = createMutation(() => ({
+		mutationFn: async () => {
+			if (!accessToken || !request.id) {
+				throw new Error('Missing authentication or request ID');
+			}
+			const res = await eventpublicdiscoveryDeleteInvitationRequest({
+				headers: { Authorization: `Bearer ${accessToken}` },
+				path: { request_id: request.id }
+			});
+			if (res.error) throw res.error;
+		},
+		onSuccess: () => {
+			toast.success(m['invitationRequestCard.requestCancelled']());
+			// Invalidate queries to refresh the list
+			queryClient.invalidateQueries({ queryKey: ['my-invitation-requests'] });
+		},
+		onError: (error) => {
+			console.error('Failed to cancel request:', error);
+			toast.error(m['invitationRequestCard.cancelFailed'](), {
+				description: extractErrorMessage(error, m['invitationRequestCard.pleaseTryAgain']())
+			});
+		}
+	}));
+
+	function handleCancel() {
+		if (confirm(m['invitationRequestCard.cancelConfirm']())) {
+			cancelMutation.mutate();
+		}
+	}
+</script>
+
+<Card class="group overflow-hidden transition-shadow hover:shadow-poster-lg">
+	<div class="flex flex-col gap-4 p-4 md:p-6">
+		<!-- Header with Event Info -->
+		<div class="flex items-start gap-4">
+			<!-- Event Logo/Icon (prefer thumbnail for card display) -->
+			<div class="shrink-0">
+				{#if request.event.logo_thumbnail_url || request.event.logo}
+					<img
+						src={getImageUrl(request.event.logo_thumbnail_url || request.event.logo)}
+						alt=""
+						class="h-16 w-16 rounded-lg border object-cover"
+					/>
+				{:else}
+					<div
+						class="flex h-16 w-16 items-center justify-center rounded-lg bg-primary/10 text-primary"
+					>
+						<Ticket class="h-8 w-8" aria-hidden="true" />
+					</div>
+				{/if}
+			</div>
+
+			<!-- Event Details -->
+			<div class="min-w-0 flex-1">
+				<div class="mb-2 flex items-start justify-between gap-2">
+					<div class="min-w-0">
+						<h3 class="truncate text-lg font-bold">
+							<a
+								href={resolve('/(public)/events/[id]', { id: request.event.id })}
+								class="hover:underline focus:underline focus:outline-none"
+							>
+								{request.event.name}
+							</a>
+						</h3>
+					</div>
+					<StatusBadge
+						tone={statusDisplay.tone}
+						label={statusDisplay.label}
+						icon={statusDisplay.icon}
+						size="sm"
+						class="shrink-0"
+					/>
+				</div>
+
+				<!-- Event Metadata -->
+				<ul class="space-y-1.5 text-sm">
+					{#if eventDate}
+						<li class="flex items-center gap-2 text-muted-foreground">
+							<Calendar class="h-4 w-4 shrink-0" aria-hidden="true" />
+							<span class="truncate">{eventDate}</span>
+						</li>
+					{/if}
+					{#if eventLocation}
+						<li class="flex items-center gap-2 text-muted-foreground">
+							<MapPin class="h-4 w-4 shrink-0" aria-hidden="true" />
+							<span class="truncate">{eventLocation}</span>
+						</li>
+					{/if}
+				</ul>
+			</div>
+		</div>
+
+		<!-- User's Message -->
+		{#if request.message}
+			<div class="rounded-md border bg-muted/50 p-3">
+				<p class="text-sm text-muted-foreground">
+					<span class="font-medium">{m['invitationRequestCard.yourMessage']()}</span>
+					"{request.message}"
+				</p>
+			</div>
+		{/if}
+
+		<!-- Footer -->
+		<div
+			class="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-4 text-sm"
+		>
+			<div class="text-muted-foreground">
+				<span class="font-medium">{m['invitationRequestCard.requested']()}</span>
+				{createdDate}
+			</div>
+
+			<div class="flex gap-2">
+				{#if request.status === 'pending'}
+					<button
+						type="button"
+						onclick={handleCancel}
+						disabled={cancelMutation.isPending}
+						class="inline-flex items-center gap-1.5 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+					>
+						{#if cancelMutation.isPending}
+							<Loader2 class="h-4 w-4 animate-spin" aria-hidden="true" />
+							{m['invitationRequestCard.cancelling']()}
+						{:else}
+							{m['invitationRequestCard.cancelRequest']()}
+						{/if}
+					</button>
+				{/if}
+				<a
+					href={resolve('/(public)/events/[id]', { id: request.event.id })}
+					class="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+				>
+					{m['invitationRequestCard.viewEvent']()}
+				</a>
+			</div>
+		</div>
+	</div>
+</Card>

@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+{% load invoice_filters %}
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Invoice {{ invoice_number }}</title>
+  {% include "invoices/_base_styles.html" %}
+  <style>
+    .items-table thead th:nth-child(2) {
+      text-align: right;
+    }
+    .items-table tbody td:nth-child(2) {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+  {% include "invoices/_brand_header.html" %}
+
+  <div class="header">
+    <div class="supplier-info">
+      <div class="supplier-name">{{ platform_business_name }}</div>
+      <div class="supplier-details">
+        {{ platform_business_address }}<br>
+        VAT: {{ platform_vat_id }}
+      </div>
+    </div>
+    <div class="invoice-badge">
+      <div class="invoice-title">INVOICE</div>
+      <div class="invoice-meta">
+        <strong>Number</strong> {{ invoice_number }}<br>
+        <strong>Date</strong> {{ issued_date }}<br>
+        <strong>Period</strong> {{ period_start }} &mdash; {{ period_end }}<br>
+        <strong>Currency</strong> {{ currency }}
+      </div>
+    </div>
+  </div>
+
+  <hr class="divider">
+
+  <div class="bill-to-section">
+    <div class="bill-to-label">Bill To</div>
+    <div class="bill-to-name">{{ org_name }}</div>
+    <div class="bill-to-details">
+      {% if org_address %}{{ org_address }}<br>{% endif %}
+      {% if org_vat_id %}VAT: {{ org_vat_id }}{% endif %}
+    </div>
+  </div>
+
+  <table class="items-table">
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th>Quantity</th>
+        <th>Amount</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if total_tickets %}
+      <tr>
+        <td>Platform fees for ticket sales &mdash; {{ period_label }}</td>
+        <td>{{ total_tickets }}</td>
+        <td>{{ ticket_fee_net|format_currency:currency }}</td>
+      </tr>
+      {% endif %}
+      {% if total_subscription_payments %}
+      <tr>
+        <td>Platform fees for membership subscriptions &mdash; {{ period_label }}</td>
+        <td>{{ total_subscription_payments }}</td>
+        <td>{{ membership_fee_net|format_currency:currency }}</td>
+      </tr>
+      {% endif %}
+    </tbody>
+  </table>
+
+  <div class="totals">
+    <div class="totals-box">
+      <div class="totals-row subtotal">
+        <span>Subtotal</span>
+        <span>{{ fee_net|format_currency:currency }}</span>
+      </div>
+      {% if reverse_charge %}
+      <div class="totals-row vat">
+        <span>VAT</span>
+        <span>Reverse Charge</span>
+      </div>
+      {% else %}
+      <div class="totals-row vat">
+        <span>VAT ({{ fee_vat_rate }}%)</span>
+        <span>{{ fee_vat|format_currency:currency }}</span>
+      </div>
+      {% endif %}
+      <div class="totals-row total">
+        <span>Total</span>
+        <span>{{ fee_gross|format_currency:currency }}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div class="notes">
+      {% if reverse_charge %}
+      <div class="footer-label">Tax Notice</div>
+      <div class="notes-text">
+        Reverse charge: VAT to be accounted for<br>
+        by the recipient of the service.<br>
+        Tax liability transfers to the recipient.
+      </div>
+      {% endif %}
+      <div class="footer-label" {% if reverse_charge %}style="margin-top: 12px;"{% endif %}>Period Summary</div>
+      <div class="notes-text">
+        Total ticket revenue: {{ total_ticket_revenue|format_currency:currency }}<br>
+        Tickets sold: {{ total_tickets }}
+        {% if total_subscription_payments %}<br>
+        Membership subscription fees &mdash; {{ total_subscription_payments }} payment{{ total_subscription_payments|pluralize }}<br>
+        Total subscription revenue: {{ total_subscription_revenue|format_currency:currency }}
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>

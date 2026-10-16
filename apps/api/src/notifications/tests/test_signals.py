@@ -1,0 +1,811 @@
+"""Tests for notification signal handlers."""
+
+import typing as t
+from decimal import Decimal
+from unittest.mock import MagicMock, patch
+
+import pytest
+from django.db import transaction
+
+from accounts.models import RevelUser
+from events.models import EventSeries, HeldSeriesPass, Organization, Payment, SeriesPass, Ticket, TicketTier
+from notifications.enums import DeliveryChannel, NotificationType
+from notifications.models import Notification, NotificationPreference
+from telegram.models import TelegramUser
+from telegram.signals import telegram_account_linked, telegram_account_unlinked
+
+pytestmark = pytest.mark.django_db
+
+
+class TestCreateNotificationPreferences:
+    """Test automatic creation of notification preferences on user creation."""
+
+    def test_creates_preferences_for_regular_user(
+        self,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        """Test that notification preferences are created for regular users.
+
+        Regular users should have both IN_APP and EMAIL channels enabled,
+        with no notification type restrictions (empty notification_type_settings).
+        """
+        # Act - Creating user triggers signal
+        user = django_user_model.objects.create_user(
+            username="test@example.com",
+            email="test@example.com",
+            password="password",
+            guest=False,
+        )
+
+        # Assert - Preferences created automatically
+        assert hasattr(user, "notification_preferences")
+        prefs = user.notification_preferences
+
+        assert prefs is not None
+        assert DeliveryChannel.IN_APP in prefs.enabled_channels
+        assert DeliveryChannel.EMAIL in prefs.enabled_channels
+
+        # Regular users have custom settings for certain notification types:
+        # - 6 potluck notifications (IN_APP only, no email)
+        # - 2 follow-admin notifications (IN_APP only, no email)
+        # - 1 org contact message (IN_APP + TELEGRAM only, no email)
+        assert len(prefs.notification_type_settings) == 9
+
+    def test_creates_preferences_for_guest_user_with_restrictions(
+        self,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        """Test that guest users get restricted notification types.
+
+        Guest users get 22 notification types disabled (only event participation
+        essentials like TICKET_CREATED, EVENT_REMINDER, etc. remain enabled).
+        """
+        # Act
+        user = django_user_model.objects.create_user(
+            username="guest@example.com",
+            email="guest@example.com",
+            password="password",
+            guest=True,
+        )
+
+        # Assert
+        prefs = user.notification_preferences
+
+        # Guest users still get both channels
+        assert DeliveryChannel.IN_APP in prefs.enabled_channels
+        assert DeliveryChannel.EMAIL in prefs.enabled_channels
+
+        # But have 22 notification types disabled
+        assert len(prefs.notification_type_settings) == 22
+
+        # Verify specific disabled types
+        disabled_types = [
+            NotificationType.EVENT_OPEN,
+            NotificationType.POTLUCK_ITEM_CREATED,
+            NotificationType.POTLUCK_ITEM_CREATED_AND_CLAIMED,
+            NotificationType.POTLUCK_ITEM_UPDATED,
+            NotificationType.POTLUCK_ITEM_CLAIMED,
+            NotificationType.POTLUCK_ITEM_UNCLAIMED,
+            NotificationType.QUESTIONNAIRE_SUBMITTED,
+            NotificationType.INVITATION_REQUEST_CREATED,
+            NotificationType.MEMBERSHIP_REQUEST_CREATED,
+            NotificationType.MEMBERSHIP_GRANTED,
+            NotificationType.MEMBERSHIP_PROMOTED,
+            NotificationType.MEMBERSHIP_REMOVED,
+            NotificationType.MEMBERSHIP_CARD_UPDATED,
+            NotificationType.MEMBERSHIP_REQUEST_APPROVED,
+            NotificationType.MEMBERSHIP_REQUEST_REJECTED,
+            NotificationType.ORG_ANNOUNCEMENT,
+        ]
+
+        for notif_type in disabled_types:
+            assert notif_type in prefs.notification_type_settings
+            assert prefs.notification_type_settings[notif_type]["enabled"] is False
+
+    def test_handles_duplicate_signal_with_get_or_create(
+        self,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        """Test that duplicate signal calls don't cause integrity errors.
+
+        The signal uses get_or_create to handle race conditions where
+        the signal might be called multiple times.
+        """
+        # Create user (triggers signal)
+        user = django_user_model.objects.create_user(
+            username="duplicate@example.com",
+            email="duplicate@example.com",
+            password="password",
+        )
+
+        # Manually try to create again (simulating duplicate signal)
+        prefs, created = NotificationPreference.objects.get_or_create(
+            user=user,
+            defaults={
+                "enabled_channels": [DeliveryChannel.IN_APP],
+            },
+        )
+
+        # Should not create duplicate
+        assert created is False
+        assert prefs.user == user
+
+        # Should only have one preference
+        assert NotificationPreference.objects.filter(user=user).count() == 1
+
+
+class TestTelegramChannelSignals:
+    """Test that linking/unlinking Telegram adds/removes the TELEGRAM delivery channel."""
+
+    _next_telegram_id = 100000
+
+    def _create_user_and_tg_user(
+        self, django_user_model: type[RevelUser], username: str
+    ) -> tuple[RevelUser, TelegramUser]:
+        user = django_user_model.objects.create_user(
+            username=username,
+            email=f"{username}@example.com",
+            password="password",
+        )
+        TestTelegramChannelSignals._next_telegram_id += 1
+        tg_user = TelegramUser.objects.create(
+            telegram_id=TestTelegramChannelSignals._next_telegram_id, telegram_username="tguser"
+        )
+        return user, tg_user
+
+    def test_telegram_channel_enabled_on_link(
+        self,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        """Linking a Telegram account adds TELEGRAM to enabled_channels."""
+        user, tg_user = self._create_user_and_tg_user(django_user_model, "link_test")
+        prefs = NotificationPreference.objects.get(user=user)
+        assert DeliveryChannel.TELEGRAM not in prefs.enabled_channels
+
+        telegram_account_linked.send(sender=TelegramUser, user=user, telegram_user=tg_user)
+
+        prefs.refresh_from_db()
+        assert DeliveryChannel.TELEGRAM in prefs.enabled_channels
+
+    def test_telegram_channel_disabled_on_unlink(
+        self,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        """Unlinking a Telegram account removes TELEGRAM from enabled_channels."""
+        user, tg_user = self._create_user_and_tg_user(django_user_model, "unlink_test")
+        prefs = NotificationPreference.objects.get(user=user)
+        prefs.enabled_channels.append(DeliveryChannel.TELEGRAM)
+        prefs.save(update_fields=["enabled_channels"])
+
+        telegram_account_unlinked.send(sender=TelegramUser, user=user, telegram_user=tg_user)
+
+        prefs.refresh_from_db()
+        assert DeliveryChannel.TELEGRAM not in prefs.enabled_channels
+
+    def test_enable_is_idempotent(
+        self,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        """Sending the linked signal twice does not duplicate the channel."""
+        user, tg_user = self._create_user_and_tg_user(django_user_model, "idempotent_enable")
+
+        telegram_account_linked.send(sender=TelegramUser, user=user, telegram_user=tg_user)
+        telegram_account_linked.send(sender=TelegramUser, user=user, telegram_user=tg_user)
+
+        prefs = NotificationPreference.objects.get(user=user)
+        assert prefs.enabled_channels.count(DeliveryChannel.TELEGRAM) == 1
+
+    def test_disable_is_idempotent(
+        self,
+        django_user_model: type[RevelUser],
+    ) -> None:
+        """Sending the unlinked signal when TELEGRAM is not present is a no-op."""
+        user, tg_user = self._create_user_and_tg_user(django_user_model, "idempotent_disable")
+        prefs = NotificationPreference.objects.get(user=user)
+        assert DeliveryChannel.TELEGRAM not in prefs.enabled_channels
+
+        telegram_account_unlinked.send(sender=TelegramUser, user=user, telegram_user=tg_user)
+
+        prefs.refresh_from_db()
+        assert DeliveryChannel.TELEGRAM not in prefs.enabled_channels
+
+
+@pytest.mark.django_db(transaction=True)
+class TestPaymentRefundNotificationAmount:
+    """Tests that refund notifications report payment.refund_amount, not payment.amount."""
+
+    def test_refund_notification_reports_partial_refund_amount(
+        self,
+        public_event: t.Any,
+        member_user: RevelUser,
+    ) -> None:
+        """Refund notification must report payment.refund_amount, not payment.amount."""
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Test Tier",
+            price=Decimal("40.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.ONLINE,
+        )
+        ticket = Ticket.objects.create(
+            guest_name=member_user.get_display_name(),
+            event=public_event,
+            user=member_user,
+            tier=tier,
+            status=Ticket.TicketStatus.ACTIVE,
+        )
+        payment = Payment.objects.create(
+            ticket=ticket,
+            user=member_user,
+            amount=Decimal("40.00"),
+            platform_fee=Decimal("0.00"),
+            currency="EUR",
+            status=Payment.PaymentStatus.SUCCEEDED,
+            stripe_session_id=f"cs_test_{ticket.id}",
+        )
+        payment.refund_amount = Decimal("20.00")
+        with patch("notifications.signals.payment.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                payment.status = Payment.PaymentStatus.REFUNDED
+                payment.save()
+        contexts = [call.kwargs["context"] for call in send_mock.call_args_list]
+        assert any("20.00" in c["refund_amount"] for c in contexts), contexts
+        assert all("40.00" not in c["refund_amount"] for c in contexts), contexts
+
+
+def _make_active_held_pass(organization: Organization, user: RevelUser, slug: str) -> HeldSeriesPass:
+    """A minimal ACTIVE HeldSeriesPass to set as Ticket.held_pass in guard tests.
+
+    Bypasses the purchase/coverage machinery entirely (no tier links, no
+    materialization) since these tests only need ``Ticket.held_pass_id`` to be
+    non-null to exercise the notification guards in isolation.
+    """
+    event_series = EventSeries.objects.create(organization=organization, name=f"Guard Series {slug}", slug=slug)
+    series_pass = SeriesPass.objects.create(
+        event_series=event_series,
+        name="Guard Pass",
+        price=Decimal("0.00"),
+        pro_rata_discount=Decimal("0.00"),
+        currency="EUR",
+        payment_method=TicketTier.PaymentMethod.FREE,
+    )
+    return HeldSeriesPass.objects.create(
+        series_pass=series_pass,
+        user=user,
+        price_paid=Decimal("0.00"),
+        status=HeldSeriesPass.HeldSeriesPassStatus.ACTIVE,
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+class TestSeriesPassTicketNotificationGuard:
+    """Ticket.held_pass_id gates notifications/signals/ticket.py's post_save receiver (#644).
+
+    Guards must suppress per-ticket notifications for pass tickets without
+    over-suppressing them for regular (held_pass=None) tickets.
+    """
+
+    def test_pass_ticket_activation_sends_no_ticket_notifications(
+        self, public_event: t.Any, member_user: RevelUser, organization: Organization
+    ) -> None:
+        held_pass = _make_active_held_pass(organization, member_user, "guard-activation")
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Guard Offline Tier",
+            price=Decimal("10.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.OFFLINE,
+        )
+        ticket = Ticket.objects.create(
+            event=public_event,
+            tier=tier,
+            user=member_user,
+            held_pass=held_pass,
+            status=Ticket.TicketStatus.PENDING,
+            guest_name=member_user.get_display_name(),
+        )
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                ticket.status = Ticket.TicketStatus.ACTIVE
+                ticket.save()
+        send_mock.assert_not_called()
+
+    def test_regular_ticket_activation_still_sends_ticket_notifications(
+        self, public_event: t.Any, member_user: RevelUser
+    ) -> None:
+        """Regression: a REGULAR (non-pass) ticket must still notify on activation."""
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Guard Offline Tier Regular",
+            price=Decimal("10.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.OFFLINE,
+        )
+        ticket = Ticket.objects.create(
+            event=public_event,
+            tier=tier,
+            user=member_user,
+            status=Ticket.TicketStatus.PENDING,
+            guest_name=member_user.get_display_name(),
+        )
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                ticket.status = Ticket.TicketStatus.ACTIVE
+                ticket.save()
+        updated_calls = [
+            call
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_UPDATED
+        ]
+        assert len(updated_calls) >= 1
+
+    def test_pass_ticket_cancellation_sends_no_ticket_notifications(
+        self, public_event: t.Any, member_user: RevelUser, organization: Organization
+    ) -> None:
+        held_pass = _make_active_held_pass(organization, member_user, "guard-cancellation")
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Guard Online Tier",
+            price=Decimal("10.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.ONLINE,
+        )
+        ticket = Ticket.objects.create(
+            event=public_event,
+            tier=tier,
+            user=member_user,
+            held_pass=held_pass,
+            status=Ticket.TicketStatus.ACTIVE,
+            guest_name=member_user.get_display_name(),
+        )
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                ticket.status = Ticket.TicketStatus.CANCELLED
+                ticket.save()
+        send_mock.assert_not_called()
+
+    def test_regular_ticket_cancellation_still_sends_ticket_cancelled(
+        self, public_event: t.Any, member_user: RevelUser
+    ) -> None:
+        """Regression: a REGULAR (non-pass) ticket must still notify on cancellation."""
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Guard Online Tier Regular",
+            price=Decimal("10.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.ONLINE,
+        )
+        ticket = Ticket.objects.create(
+            event=public_event,
+            tier=tier,
+            user=member_user,
+            status=Ticket.TicketStatus.ACTIVE,
+            guest_name=member_user.get_display_name(),
+        )
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                ticket.status = Ticket.TicketStatus.CANCELLED
+                ticket.save()
+        cancelled_calls = [
+            call
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_CANCELLED
+        ]
+        assert len(cancelled_calls) >= 1
+
+
+@pytest.mark.django_db(transaction=True)
+class TestPendingTicketAttachmentFlags:
+    """Pending-payment ticket emails must carry no attachments at all.
+
+    A pending ticket is not valid yet; attaching a scannable PDF/pkpass
+    alongside payment instructions invites door disputes. Everything
+    (including the ICS) arrives with the activation email; before that the
+    webapp is the only source, where the UI states the pending status.
+    """
+
+    def _make_tier(self, public_event: t.Any, payment_method: str, name: str) -> TicketTier:
+        return TicketTier.objects.create(
+            event=public_event,
+            name=name,
+            price=Decimal("10.00"),
+            currency="EUR",
+            payment_method=payment_method,
+        )
+
+    def test_pending_created_context_disables_ticket_files(self, public_event: t.Any, member_user: RevelUser) -> None:
+        tier = self._make_tier(public_event, TicketTier.PaymentMethod.OFFLINE, "Pending Flags Tier")
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                Ticket.objects.create(
+                    event=public_event,
+                    tier=tier,
+                    user=member_user,
+                    status=Ticket.TicketStatus.PENDING,
+                    guest_name=member_user.get_display_name(),
+                )
+
+        holder_calls = [
+            call
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_CREATED
+            and call.kwargs["user"] == member_user
+        ]
+        assert holder_calls
+        for call in holder_calls:
+            context = call.kwargs["context"]
+            assert context["include_pdf"] is False
+            assert context["include_pkpass"] is False
+            assert context["include_ics"] is False
+
+    def test_active_created_context_keeps_ticket_files(self, public_event: t.Any, member_user: RevelUser) -> None:
+        tier = self._make_tier(public_event, TicketTier.PaymentMethod.FREE, "Active Flags Tier")
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                Ticket.objects.create(
+                    event=public_event,
+                    tier=tier,
+                    user=member_user,
+                    status=Ticket.TicketStatus.ACTIVE,
+                    guest_name=member_user.get_display_name(),
+                )
+
+        holder_calls = [
+            call
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_CREATED
+            and call.kwargs["user"] == member_user
+        ]
+        assert holder_calls
+        for call in holder_calls:
+            context = call.kwargs["context"]
+            assert context.get("include_pdf", True) is True
+            assert context.get("include_pkpass", True) is True
+
+    def test_batch_pending_context_disables_ticket_files(self, public_event: t.Any, member_user: RevelUser) -> None:
+        from notifications.signals.ticket import send_batch_ticket_created_notifications
+
+        tier = self._make_tier(public_event, TicketTier.PaymentMethod.OFFLINE, "Batch Pending Tier")
+        ticket = Ticket.objects.create(
+            event=public_event,
+            tier=tier,
+            user=member_user,
+            status=Ticket.TicketStatus.PENDING,
+            guest_name=member_user.get_display_name(),
+        )
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            send_batch_ticket_created_notifications([ticket])
+
+        holder_calls = [
+            call
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_CREATED
+            and call.kwargs["user"] == member_user
+        ]
+        assert holder_calls
+        for call in holder_calls:
+            context = call.kwargs["context"]
+            assert context["include_pdf"] is False
+            assert context["include_pkpass"] is False
+            assert context["include_ics"] is False
+
+
+class TestBatchNotificationsPerTierContext:
+    """A multi-tier cart (#846) sends one email per ticket, each about ITS OWN tier.
+
+    ``send_batch_ticket_created_notifications`` used to hoist the tier name, price and
+    manual payment instructions off ``tickets[0]``; a mixed OFFLINE cart then told every
+    buyer to pay the first tier's price into the first tier's bank details.
+    """
+
+    @staticmethod
+    def _offline_tier(event: t.Any, name: str, price: str, instructions: str) -> TicketTier:
+        return TicketTier.objects.create(
+            event=event,
+            name=name,
+            price=Decimal(price),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.OFFLINE,
+            manual_payment_instructions=instructions,
+        )
+
+    def test_mixed_cart_emails_carry_their_own_tier(self, public_event: t.Any, member_user: RevelUser) -> None:
+        from notifications.signals.ticket import send_batch_ticket_created_notifications
+
+        tier_a = self._offline_tier(public_event, "Standard", "20.00", "Wire 20 EUR to IBAN AAA")
+        tier_b = self._offline_tier(public_event, "VIP", "80.00", "Wire 80 EUR to IBAN BBB")
+        tickets = [
+            Ticket.objects.create(
+                event=public_event,
+                tier=tier,
+                user=member_user,
+                status=Ticket.TicketStatus.PENDING,
+                guest_name=member_user.get_display_name(),
+            )
+            for tier in (tier_a, tier_b)
+        ]
+
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            send_batch_ticket_created_notifications(tickets)
+
+        contexts = {
+            call.kwargs["context"]["ticket_id"]: call.kwargs["context"]
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_CREATED
+            and call.kwargs["user"] == member_user
+        }
+        assert len(contexts) == 2
+
+        for ticket, tier in zip(tickets, (tier_a, tier_b), strict=True):
+            context = contexts[str(ticket.id)]
+            assert context["tier_name"] == tier.name
+            assert context["tier_price"] == str(tier.price)
+            assert context["total_price"] == str(tier.price)
+            assert context["manual_payment_instructions"] == tier.manual_payment_instructions
+        # ...and nothing leaked sideways: the two emails really do differ.
+        assert (
+            contexts[str(tickets[0].id)]["manual_payment_instructions"]
+            != (contexts[str(tickets[1].id)]["manual_payment_instructions"])
+        )
+
+    def test_email_quotes_price_paid_not_the_tier_list_price(self, public_event: t.Any, member_user: RevelUser) -> None:
+        """A PWYC/discounted ticket must be billed at what the buyer owes, not at ``tier.price``.
+
+        ``price_paid`` is purchase-time truth (spec §5.5); the email used to read
+        ``tier.price``, so a PWYC buyer who chose 35 EUR was told to wire the tier's
+        list price and a discounted buyer was over-billed.
+        """
+        from notifications.signals.ticket import send_batch_ticket_created_notifications
+
+        pwyc_tier = self._offline_tier(public_event, "PWYC", "20.00", "Wire what you chose to IBAN AAA")
+        pwyc_tier.price_type = TicketTier.PriceType.PWYC
+        pwyc_tier.save(update_fields=["price_type"])
+        flat_tier = self._offline_tier(public_event, "Flat", "80.00", "Wire 80 EUR to IBAN BBB")
+
+        pwyc_ticket = Ticket.objects.create(
+            event=public_event,
+            tier=pwyc_tier,
+            user=member_user,
+            status=Ticket.TicketStatus.PENDING,
+            guest_name=member_user.get_display_name(),
+            price_paid=Decimal("35.00"),
+        )
+        # No price_paid: a plain sale on a flat tier, where tier.price still reconstructs it.
+        flat_ticket = Ticket.objects.create(
+            event=public_event,
+            tier=flat_tier,
+            user=member_user,
+            status=Ticket.TicketStatus.PENDING,
+            guest_name=member_user.get_display_name(),
+        )
+
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            send_batch_ticket_created_notifications([pwyc_ticket, flat_ticket])
+
+        contexts = {
+            call.kwargs["context"]["ticket_id"]: call.kwargs["context"]
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_CREATED
+            and call.kwargs["user"] == member_user
+        }
+        assert contexts[str(pwyc_ticket.id)]["tier_price"] == "35.00"
+        assert contexts[str(pwyc_ticket.id)]["total_price"] == "35.00"
+        assert contexts[str(flat_ticket.id)]["tier_price"] == str(flat_tier.price)
+
+
+@pytest.mark.django_db(transaction=True)
+class TestTicketCancelledAttachmentFlags:
+    """Cancellation notifications must not request ticket attachments.
+
+    A cancellation email carrying the ticket PDF/pkpass would hand the user a
+    scannable pass for a ticket that is no longer valid.
+    """
+
+    def test_cancellation_context_disables_attachments(self, public_event: t.Any, member_user: RevelUser) -> None:
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Cancel Flags Tier",
+            price=Decimal("10.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.ONLINE,
+        )
+        ticket = Ticket.objects.create(
+            event=public_event,
+            tier=tier,
+            user=member_user,
+            status=Ticket.TicketStatus.ACTIVE,
+            guest_name=member_user.get_display_name(),
+        )
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                ticket.status = Ticket.TicketStatus.CANCELLED
+                ticket.save()
+
+        cancelled_calls = [
+            call
+            for call in send_mock.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.TICKET_CANCELLED
+        ]
+        assert cancelled_calls
+        for call in cancelled_calls:
+            context = call.kwargs["context"]
+            assert context["include_pdf"] is False
+            assert context["include_ics"] is False
+            assert context["include_pkpass"] is False
+
+
+@pytest.mark.django_db(transaction=True)
+class TestSeriesPassRefundNotificationGuard:
+    """Payment.held_pass-ticket refunds skip the per-ticket TICKET_REFUNDED notification (#644).
+
+    The regular-ticket (held_pass=None) case is already covered by
+    ``TestPaymentRefundNotificationAmount`` above, which never sets held_pass and
+    must keep passing unmodified.
+    """
+
+    def test_pass_ticket_refund_sends_no_ticket_refunded(
+        self, public_event: t.Any, member_user: RevelUser, organization: Organization
+    ) -> None:
+        held_pass = _make_active_held_pass(organization, member_user, "guard-refund")
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Guard Refund Tier",
+            price=Decimal("40.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.ONLINE,
+        )
+        ticket = Ticket.objects.create(
+            guest_name=member_user.get_display_name(),
+            event=public_event,
+            user=member_user,
+            tier=tier,
+            held_pass=held_pass,
+            status=Ticket.TicketStatus.ACTIVE,
+        )
+        payment = Payment.objects.create(
+            ticket=ticket,
+            user=member_user,
+            amount=Decimal("40.00"),
+            platform_fee=Decimal("0.00"),
+            currency="EUR",
+            status=Payment.PaymentStatus.SUCCEEDED,
+            stripe_session_id=f"cs_test_{ticket.id}",
+        )
+        with patch("notifications.signals.payment.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                payment.status = Payment.PaymentStatus.REFUNDED
+                payment.save()
+        send_mock.assert_not_called()
+
+
+class TestEventCancelledNotificationReason:
+    """Tests that EVENT_CANCELLED notifications carry the persisted cancellation reason."""
+
+    def _build_eligible(self, recipient: RevelUser) -> t.Any:
+        eligible = MagicMock()
+        eligible.__iter__.return_value = iter([recipient])
+        eligible.count.return_value = 1
+        return eligible
+
+    def test_reason_included_in_context_when_set(
+        self,
+        public_event: t.Any,
+        user: RevelUser,
+        django_capture_on_commit_callbacks: t.Any,
+    ) -> None:
+        """A non-empty cancellation_reason is surfaced in the notification context."""
+        from notifications.signals import event as event_signals
+
+        public_event.cancellation_reason = "Venue flooded"
+
+        with (
+            patch.object(
+                event_signals, "get_eligible_users_for_event_notification", return_value=self._build_eligible(user)
+            ),
+            patch.object(event_signals, "get_event_location_for_user", return_value=("Somewhere", None)),
+            patch("notifications.signals.event.notification_requested.send") as send_mock,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            event_signals._handle_event_cancelled(type(public_event), public_event)
+
+        contexts = [call.kwargs["context"] for call in send_mock.call_args_list]
+        assert contexts, "expected at least one cancellation notification"
+        assert all(c.get("cancellation_reason") == "Venue flooded" for c in contexts), contexts
+
+    def test_reason_omitted_from_context_when_blank(
+        self,
+        public_event: t.Any,
+        user: RevelUser,
+        django_capture_on_commit_callbacks: t.Any,
+    ) -> None:
+        """An empty cancellation_reason leaves the key out of the context entirely."""
+        from notifications.signals import event as event_signals
+
+        public_event.cancellation_reason = ""
+
+        with (
+            patch.object(
+                event_signals, "get_eligible_users_for_event_notification", return_value=self._build_eligible(user)
+            ),
+            patch.object(event_signals, "get_event_location_for_user", return_value=("Somewhere", None)),
+            patch("notifications.signals.event.notification_requested.send") as send_mock,
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            event_signals._handle_event_cancelled(type(public_event), public_event)
+
+        contexts = [call.kwargs["context"] for call in send_mock.call_args_list]
+        assert contexts, "expected at least one cancellation notification"
+        assert all("cancellation_reason" not in c for c in contexts), contexts
+
+    def test_built_context_satisfies_schema_and_creates_notification(
+        self,
+        public_event: t.Any,
+        user: RevelUser,
+        django_capture_on_commit_callbacks: t.Any,
+    ) -> None:
+        """Regression: the cancellation context must satisfy EventCancelledContext.
+
+        ``refund_available`` is a required key on the schema. The signal previously
+        omitted it, so every cancellation notification failed validation inside
+        ``create_notification`` and was silently swallowed by the request handler.
+        This drives the real ``notification_requested`` -> ``create_notification``
+        -> ``validate_notification_context`` path and asserts a row is created.
+        """
+        from notifications.signals import event as event_signals
+
+        public_event.requires_ticket = True
+        public_event.cancellation_reason = "Venue flooded"
+
+        with (
+            patch.object(
+                event_signals, "get_eligible_users_for_event_notification", return_value=self._build_eligible(user)
+            ),
+            patch.object(event_signals, "get_event_location_for_user", return_value=("Somewhere", None)),
+            # Avoid actually dispatching; we only care that the row validates + persists.
+            patch("notifications.tasks.dispatch_notification.delay"),
+            django_capture_on_commit_callbacks(execute=True),
+        ):
+            event_signals._handle_event_cancelled(type(public_event), public_event)
+
+        notifications = Notification.objects.filter(user=user, notification_type=NotificationType.EVENT_CANCELLED)
+        assert notifications.count() == 1, "context failed schema validation and was swallowed"
+        assert notifications.get().context["refund_available"] is True
+
+
+@pytest.mark.django_db(transaction=True)
+class TestStaffNotificationPreferenceGate:
+    """Staff fan-out must respect the recipient's per-type preference.
+
+    Uses transaction=True because the ticket notifications fire from an
+    ``on_commit`` callback, which pytest-django's rollback would otherwise
+    never run.
+    """
+
+    def test_staff_who_disabled_ticket_created_is_not_notified(
+        self, public_event: t.Any, organization: Organization, member_user: RevelUser
+    ) -> None:
+        prefs = organization.owner.notification_preferences
+        prefs.notification_type_settings[NotificationType.STAFF_TICKET_CREATED] = {"enabled": False}
+        prefs.save(update_fields=["notification_type_settings"])
+
+        tier = TicketTier.objects.create(
+            event=public_event,
+            name="Staff Gate Tier",
+            price=Decimal("0.00"),
+            currency="EUR",
+            payment_method=TicketTier.PaymentMethod.FREE,
+        )
+
+        with patch("notifications.signals.ticket.notification_requested.send") as send_mock:
+            with transaction.atomic():
+                Ticket.objects.create(
+                    event=public_event,
+                    tier=tier,
+                    user=member_user,
+                    status=Ticket.TicketStatus.ACTIVE,
+                    guest_name=member_user.get_display_name(),
+                )
+
+        notified_users = [call.kwargs["user"] for call in send_mock.call_args_list]
+        assert member_user in notified_users, "the ticket holder must still be notified"
+        assert organization.owner not in notified_users

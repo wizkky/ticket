@@ -1,0 +1,404 @@
+[project]
+name = "revel"
+version = "2.22.1"
+description = "The Revel Event Manager"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Biagio Distefano", email = "biagio@biagiodistefano.io" }
+]
+keywords = ["event", "manager", "django", "api", "community"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Django :: 5.2",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+requires-python = ">=3.14"
+dependencies = [
+    "aiogram>=3.30.0",
+    "celery>=5.6.3",
+    "cryptography>=50.0.0",
+    "django>=5.2.14,<6.0",
+    "django-celery-beat>=2.9.0",
+    "django-celery-results>=2.6.0",
+    "django-cors-headers>=4.9.0",
+    "django-extensions>=4.1",
+    "django-fernet-encrypted-fields>=0.4.0",
+    "django-google-sso>=10.0.0",
+    "django-ninja>=1.6.2",
+    "django-ninja-extra>=0.31.6",
+    # ninja-jwt 5.4.5 mis-annotates the for_user classmethod (cls: T instead of
+    # type[T]), breaking mypy --strict at every call site — lift when fixed upstream
+    "django-ninja-jwt[crypto]>=5.4.4,<5.4.5",
+    "django-oauth-toolkit>=3.4.1,<4",
+    "django-prometheus>=2.5.0",
+    "django-simple-history>=3.13.0",
+    "django-solo>=2.5.1",
+    "django-unfold>=0.103.0",
+    "flower>=2.0.1",
+    "gunicorn>=26.0.0",
+    "httpx[http2]>=0.28.1",
+    "ics>=0.7.3",
+    "instructor>=1.15.4",
+    "ip2location>=8.11.0",
+    "jinja2>=3.1.6",
+    "markdown>=3.10.2",
+    "markdownify>=1.2.3",
+    "nh3>=0.3.6",
+    "openpyxl>=3.1.5",
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-exporter-otlp>=1.44.0",
+    "opentelemetry-instrumentation-celery>=0.65b0",
+    "opentelemetry-instrumentation-django>=0.65b0",
+    "opentelemetry-instrumentation-psycopg>=0.65b0",
+    "opentelemetry-instrumentation-redis>=0.65b0",
+    "opentelemetry-sdk>=1.44.0",
+    "orjson>=3.11.9",
+    "pillow>=12.3.0",
+    "pillow-heif>=1.5.0",
+    "prometheus-client>=0.26.0",
+    "psycopg[binary]>=3.3.4",
+    "pyclamd>=0.4.0",
+    "pycountry>=26.2.16",
+    "pydantic[email]>=2.13.4",
+    "pyjwt>=2.14.0",
+    "pyotp>=2.10.0",
+    "python-dateutil>=2.9.0.post0",
+    "python-decouple>=3.8",
+    "python-magic>=0.4.27",
+    "qrcode>=8.2",
+    "rapidfuzz>=3.14.5",
+    # kombu caps redis<8.0.0; redis-py 8 (RESP3 default + 5s socket-timeout) unvalidated for the Celery broker
+    "redis>=7.1.0,<8.0.0",
+    "requests>=2.33.1",
+    # stripe 15 is breaking (StripeObject drops dict methods; decimal_string fields
+    # become decimal.Decimal) — migrate in a dedicated PR before lifting the cap
+    "stripe>=14.4.0,<15",
+    "structlog>=26.1.0",
+    "tzfpy>=1.3.1",
+    "weasyprint>=70.0",
+    "whitenoise>=6.12.0",
+]
+
+[dependency-groups]
+dev = [
+    "celery-types>=0.26.0",
+    "django-silk>=5.5.0",
+    "faker>=40.36.0",
+    "coverage>=7.15.3",
+    "django-extensions>=4.1",
+    "django-stubs[compatible-mypy]>=6.1.0",
+    "freezegun>=1.5.5",
+    "locust>=2.46.3",
+    "mkdocs>=1.6.1",
+    "mkdocs-material>=9.7.7",
+    "mkdocs-minify-plugin>=0.8.0",
+    "mypy>=2.3.1",
+    "piexif>=1.1.3",
+    "pre-commit>=4.6.1",
+    "py-spy>=0.4.2",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pytest-django>=4.13.0",
+    "pytest-xdist>=3.8.0",
+    "ruff>=0.16.1",
+    "types-markdown>=3.10.2.20260712",
+    "types-qrcode>=8.2.0.20260518",
+    "types-requests>=2.33.0.20260712",
+    "types-tqdm>=4.70.0.20260805",
+    "bandit>=1.9.4",
+    "tqdm>=4.70.0",
+    "types-openpyxl>=3.1.5.20260724",
+    # licensecheck 2026.x needs rich>=15, which instructor (<=1.15.4) caps at <15
+    "licensecheck>=2025.1.0",
+    "pip-audit>=2.10.1",
+    "pytest-split>=0.10.0",
+    "types-python-dateutil>=2.9.0.20260807",
+]
+sentinel = [
+    # torch 2.8 ships no cp314 wheel (only cp313/cp313t); 2.9+ is required to
+    # resolve under Python 3.14.
+    "torch>=2.9.0",
+    # transformers 5 is a major rewrite and the sentinel path isn't exercised in
+    # CI (group not installed) — validate it in a dedicated PR before lifting
+    "transformers>=4.55.2,<5",
+]
+
+[tool.uv]
+# Security floors for transitive dependencies we don't import directly.
+# aiohttp is pulled in by aiogram and instructor; 3.14.3 fixes a batch of
+# CVEs flagged by pip-audit (CVE-2026-54273..54280, CVE-2026-50269,
+# CVE-2026-59881, CVE-2026-69243, CVE-2026-69244).
+# httplib2 is pulled in by django-google-sso via google-auth-httplib2;
+# 0.32.0 fixes PYSEC-2026-3444.
+# anyio is pulled in by httpx and openai; 4.14.2 fixes GHSA-82r6-8w77-94w6
+# (TLS cert spoofing via IDNA 2003 host matching) and GHSA-5p39-cfhj-2xmp
+# (process-pool stderr deadlock).
+constraint-dependencies = [
+    "aiohttp>=3.14.3",
+    "anyio>=4.14.2",
+    "httplib2>=0.32.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = { find = { where = ["src"] } }
+
+[tool.setuptools.package-data]
+"*" = ["*.html", "*.txt", "*.md", "*.mo", "*.po"]
+
+[tool.ruff]
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "dist",
+    "node_modules",
+    "venv",
+    "*/migrations/*",
+    "_*.py"
+]
+
+# Same as Black.
+line-length = 120
+
+target-version = "py314"
+
+[tool.ruff.lint]
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+preview = true
+
+fixable = ["A", "B", "C", "D", "E", "F", "G", "I", "N", "Q", "S", "T", "W", "ANN", "ARG", "BLE", "COM", "DJ", "DTZ", "EM", "ERA", "EXE", "FBT", "ICN", "INP", "ISC", "NPY", "PD", "PGH", "PIE", "PL", "PT", "PTH", "PYI", "RET", "RSE", "RUF", "SIM", "SLF", "TCH", "TID", "TRY", "UP", "YTT"]
+select = ["C", "D", "E", "F", "I", "PLC2701", "PLR1702", "RUF022", "T201", "W"]
+extend-select = ["I", "W", "E", "D"]
+ignore = ["D100", "D101", "D104", "D105", "D106"]
+unfixable = []
+
+[tool.ruff.lint.per-file-ignores]
+"**/migrations/*.py" = ["D"]
+"**/tests/*.py" = ["D"]
+"**/admin.py" = ["D102"]
+"**/admin/*.py" = ["D102"]
+"conftest.py" = ["D"]
+"benchmark/**" = ["T201"]  # load-test scripts report to the console by design
+
+[tool.ruff.lint.mccabe]
+# Unlike Flake8, default to a complexity level of 10.
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pylint]
+max-nested-blocks = 4
+
+[tool.ruff.format]
+
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+[tool.mypy]
+mypy_path = ["./src",]
+# ignore_missing_imports = true  # sympy is not and there are no stubs
+plugins = ["pydantic.mypy", "mypy_django_plugin.main"]
+# exclude uses regex patterns: match migration files and files starting with underscore
+exclude = ["(?x)(^.*/migrations/.*\\.py$|^.*/_[^/]*\\.py$)"]
+# stripe-python ships py.typed but leaves its exception constructors (stripe._error)
+# and ``Webhook.construct_event`` (stripe._webhook) untyped; skip exactly those two
+# modules instead of ignoring per call site.
+untyped_calls_exclude = ["stripe._error", "stripe._webhook"]
+
+[[tool.mypy.overrides]]
+module = "django_google_sso.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "django_celery_beat.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "simple_history.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "decouple.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "unfold.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pyclamd.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "IP2Location.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "encrypted_fields.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "piexif.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "ics.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "weasyprint.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "transformers.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pillow_heif"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "oauth2_provider.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "oauthlib.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "jwcrypto.*"
+ignore_missing_imports = true
+
+[tool.django-stubs]
+django_settings_module = "revel.settings"
+disable_error_code = ["django-manager-missing"]
+
+[tool.pydantic-mypy]
+# Type-check keyword arguments to model/schema ``__init__`` calls; without this the
+# pydantic plugin synthesises an all-``Any`` signature and --strict sees nothing.
+init_typed = true
+
+[tool.pytest.ini_options]
+pythonpath = "src"
+DJANGO_SETTINGS_MODULE = "revel.settings"
+testpaths = ["src"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: slow tests that hit real external services (LLM, etc.) — run explicitly with pytest -m integration",
+]
+norecursedirs = [
+    ".*",
+    "build",
+    "dist",
+    "CVS",
+    "_darcs",
+    "{arch}",
+    "*.egg",
+    "venv",
+    ".venv",
+    "node_modules",
+]
+
+
+[tool.bandit]
+exclude_dirs = ["src/*/tests", "src/*/tests/*", "src/conftest.py"]
+skips = [
+    "B101",  # assert_used - ubiquitous in tests
+    "B308",  # mark_safe blacklist - redundant with B703 (Django-specific check)
+    "B703",  # mark_safe in admin display methods - all controlled data, staff-only
+]
+
+[tool.licensecheck]
+# `zero = true` is what makes CI actually fail on an incompatible license.
+# Without it, licensecheck prints the finding and exits 0 (see cli.py line 203 in the package).
+zero = true
+# Walk the dev dependency-group (PEP 735) in addition to [project.dependencies].
+# The uv-based resolver picks this up via `uv pip compile --group dev`.
+groups = ["dev"]
+# Hybrid deny-list: hard-fail known copyleft / source-available families.
+# Unknown SPDX identifiers warn but don't fail — keeps us from churning on every
+# obscure-but-permissive license that shows up transitively.
+fail_licenses = [
+    "GPL-2.0*", "GPL-3.0*",
+    "AGPL-3.0*", "AGPL*",
+    "SSPL*", "SSPL-1.0*",
+    "BUSL*", "Business Source License*",
+    "Commons-Clause", "Commons Clause*",
+]
+# Grandfathered packages: add here with a rationale comment.
+# Use when licensecheck's default matrix flags a permissive-but-non-MIT license
+# that has no actual compatibility concern.
+ignore_packages = [
+    # Zope Public License — BSD-like permissive, OSI-approved. Transitive via
+    # gevent (dev-only, pulled in by locust). No real incompatibility.
+    "zope-event",
+    "zope-interface",
+    # django-solo: upstream declares `License-Expression: CC-BY-3.0`. CC-BY is
+    # attribution-only (no copyleft) and is compatible with MIT redistribution as
+    # long as the upstream NOTICE/attribution is preserved (we ship it via the
+    # installed dist-info). Library is ~400 LOC implementing the singleton model
+    # pattern; no viable drop-in replacement. Re-evaluate if upstream relicenses.
+    "django-solo",
+    # pillow-heif: metadata's `License:` field is BSD-3-Clause (the Python binding
+    # itself), but a legacy trove classifier declares GPLv2 to cover the case
+    # where the wrapped libheif links against x265 (GPL). Our container builds
+    # libheif against libde265/aom (non-GPL), so our effective linkage is BSD/
+    # LGPL. Revisit if we swap decoder backends or distribute binaries bundling x265.
+    "pillow-heif",
+]
+
+[tool.coverage.run]
+# `source` makes the gate count files that no test ever imports as 0%, matching
+# the behaviour of the old in-process `pytest --cov=src` report after the test
+# suite was split into shards combined by a separate `coverage report` process.
+source = ["src"]
+omit = [
+    "src/manage.py",
+    "src/revel/asgi.py",
+    "src/revel/wsgi.py",
+    "src/revel/settings/*.py",
+    "src/revel/settings.py",
+    "src/revel/admin_dashboard.py",
+    "src/*/admin.py",
+    "src/*/admin/**",
+    "src/*/management/**",
+    "src/*/migrations/**",
+]

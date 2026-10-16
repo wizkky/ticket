@@ -1,0 +1,880 @@
+"""Attendee invoice service: validation, generation, editing, delivery, credit notes.
+
+Handles the full lifecycle of attendee invoices issued on behalf of organizers.
+"""
+
+import typing as t
+from decimal import ROUND_HALF_UP, Decimal
+from email.utils import formataddr, parseaddr
+
+import structlog
+from django.conf import settings
+from django.core.files.base import ContentFile
+from django.db import transaction
+from django.db.models import OuterRef, QuerySet, Subquery
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from ninja.errors import HttpError
+
+from common.constants import EU_MEMBER_STATES
+from common.service.invoice_utils import get_next_sequential_number, render_pdf
+from common.utils import apex_email_domain, is_reserved_mailbox
+from events.compliance import BuyerContext, Decision
+from events.compliance import enforcement as compliance
+from events.compliance.base import ALL_NEXUS
+from events.models.attendee_invoice import (
+    AttendeeInvoice,
+    AttendeeInvoiceCreditNote,
+    BuyerBillingSnapshot,
+    InvoiceLineItemDict,
+)
+from events.models.organization import Organization
+from events.models.refund import Refund
+from events.models.skipped_fiscal_document import SkippedFiscalDocument
+from events.models.ticket import Payment
+from events.service import skipped_fiscal_document_service
+from notifications.service.org_sender import org_reply_to
+
+if t.TYPE_CHECKING:
+    from uuid import UUID
+
+logger = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Org opt-in validation
+# ---------------------------------------------------------------------------
+
+
+def validate_invoicing_prerequisites(org: Organization) -> None:
+    """Validate that an organization meets all requirements for attendee invoicing.
+
+    Raises:
+        HttpError 422: If any prerequisite is not met.
+    """
+    missing: list[str] = []
+
+    if not org.vat_country_code or org.vat_country_code not in EU_MEMBER_STATES:
+        missing.append(str(_("Organization must be EU-based (valid EU VAT country code required)")))
+
+    if not org.vat_id_validated:
+        missing.append(str(_("VAT ID must be validated via VIES")))
+
+    if not org.billing_name:
+        missing.append(str(_("Billing name (legal entity name) is required")))
+
+    if not org.billing_address:
+        missing.append(str(_("Billing address is required")))
+
+    if missing:
+        raise HttpError(422, "; ".join(missing))
+
+
+def set_invoicing_mode(org: Organization, mode: Organization.InvoicingMode) -> Organization:
+    """Set the invoicing mode for an organization.
+
+    Setting to NONE is always allowed. HYBRID or AUTO requires validation and a
+    country whose compliance policy allows Revel-issued attendee invoices.
+
+    Raises:
+        CountryComplianceError: If the organization's country blocks attendee invoicing.
+        HttpError 422: If any other prerequisite is not met.
+    """
+    if mode != Organization.InvoicingMode.NONE:
+        compliance.assert_attendee_invoicing_allowed(org)
+        validate_invoicing_prerequisites(org)
+
+    org.invoicing_mode = mode
+    org.save(update_fields=["invoicing_mode", "updated_at"])
+    return org
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Invoice generation
+# ---------------------------------------------------------------------------
+
+
+def _build_line_items(payments: list[Payment]) -> list[InvoiceLineItemDict]:
+    """Build line item dicts from Payment records."""
+    items: list[InvoiceLineItemDict] = []
+    for payment in payments:
+        ticket = payment.ticket
+        event_name = ticket.event.name if ticket.event else "Unknown Event"
+        tier_name = ticket.tier.name if ticket.tier else "Unknown Tier"
+        # A blank holder name is legal since #845 — skip the segment rather than
+        # leave a trailing separator on the invoice line.
+        description = " — ".join(part for part in (event_name, tier_name, ticket.guest_name.strip()) if part)
+        items.append(
+            InvoiceLineItemDict(
+                description=description,
+                unit_price_gross=str(payment.amount),
+                discount_amount=str(ticket.discount_amount or Decimal("0.00")),
+                net_amount=str(payment.net_amount or payment.amount),
+                vat_amount=str(payment.vat_amount or Decimal("0.00")),
+                vat_rate=str(payment.vat_rate or Decimal("0.00")),
+            )
+        )
+    return items
+
+
+def _refund_vat_portion(row: Refund) -> Decimal:
+    """Pro-rate a refund row's VAT using its payment's VAT ratio, half-up to cents."""
+    payment = row.payment
+    if not payment.vat_amount or not payment.amount:
+        return Decimal("0.00")
+    return (row.amount * payment.vat_amount / payment.amount).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _build_refund_line_items(refund_rows: list[Refund]) -> list[InvoiceLineItemDict]:
+    """Build line item dicts from Refund rows (amount-aware, pro-rata VAT)."""
+    items: list[InvoiceLineItemDict] = []
+    for row in refund_rows:
+        payment = row.payment
+        ticket = payment.ticket
+        event_name = ticket.event.name if ticket.event else "Unknown Event"
+        tier_name = ticket.tier.name if ticket.tier else "Unknown Tier"
+        description = " — ".join(part for part in (event_name, tier_name, ticket.guest_name.strip()) if part)
+        label = "Partial refund" if row.amount < payment.amount else "Refund"
+        vat_amount = _refund_vat_portion(row)
+        items.append(
+            InvoiceLineItemDict(
+                description=f"{label} — {description}",
+                unit_price_gross=str(row.amount),
+                discount_amount=str(Decimal("0.00")),
+                net_amount=str(row.amount - vat_amount),
+                vat_amount=str(vat_amount),
+                vat_rate=str(payment.vat_rate or Decimal("0.00")),
+            )
+        )
+    return items
+
+
+def _sanitize_org_slug(org: Organization, max_len: int) -> str:
+    """Sanitize and truncate org slug for use in document number prefixes.
+
+    Removes hyphens, uppercases, and truncates so the full document number
+    (prefix + year + sequence) fits within the CharField max_length.
+    """
+    return org.slug.upper().replace("-", "")[:max_len]
+
+
+# Invoice number: {SLUG}-{YEAR}-{SEQ:06d} → suffix is 12 chars → max slug = 38
+_INVOICE_SLUG_MAX = 38
+# Credit note: {SLUG}-CN-{YEAR}-{SEQ:06d} → suffix is 15 chars → max slug = 35
+_CREDIT_NOTE_SLUG_MAX = 35
+
+
+def _get_org_invoice_prefix(org: Organization) -> str:
+    """Get the invoice number prefix for an organization."""
+    return f"{_sanitize_org_slug(org, _INVOICE_SLUG_MAX)}-"
+
+
+def generate_attendee_invoice(stripe_session_id: str) -> AttendeeInvoice | None:
+    """Generate an attendee invoice for a completed checkout session.
+
+    Args:
+        stripe_session_id: The Stripe checkout session ID.
+
+    Returns:
+        The created (or already existing) AttendeeInvoice, or None if conditions aren't met.
+    """
+    # Idempotency first: a retry for a session that already has its invoice returns it, even if
+    # the compliance gate below would now refuse (e.g. the event's VAT country changed since).
+    # The in-transaction check further down still guards the concurrent-creation race.
+    if existing := AttendeeInvoice.objects.filter(stripe_session_id=stripe_session_id).first():
+        return existing
+    # Likewise, a session whose invoice was already skipped stays skipped (#1091).
+    if SkippedFiscalDocument.objects.filter(
+        stripe_session_id=stripe_session_id, kind=SkippedFiscalDocument.Kind.INVOICE
+    ).exists():
+        return None
+
+    payments = list(
+        Payment.objects.filter(
+            stripe_session_id=stripe_session_id,
+            status=Payment.PaymentStatus.SUCCEEDED,
+        )
+        .select_related(
+            "ticket__event__organization__city",
+            "ticket__event__venue__city",
+            "ticket__event__city",
+            "ticket__tier",
+            "ticket__discount_code",
+        )
+        .order_by("created_at")
+    )
+
+    if not payments:
+        return None
+
+    # Check: buyer billing info was provided
+    first_payment = payments[0]
+    billing_snapshot: BuyerBillingSnapshot | None = first_payment.buyer_billing_snapshot
+    if not billing_snapshot:
+        return None
+
+    # Check: org has invoicing enabled
+    org = first_payment.ticket.event.organization
+    if not org or org.invoicing_mode == Organization.InvoicingMode.NONE:
+        return None
+
+    event = first_payment.ticket.event
+    # The buyer (VAT-ID prefix + checkout VIES outcome) decides the BE/PL domestic-B2B case.
+    buyer = BuyerContext.from_billing_snapshot(billing_snapshot)
+    decision = compliance.attendee_invoicing_for_sale(compliance.sale_nexus(org, [event]), buyer)
+    if not decision.allowed:
+        # Defense in depth for orgs that enabled invoicing before the gate, moved
+        # country, or sell into a restricted country (EU layer 1, #1057-#1067).
+        # Recorded so the organizer knows to issue it from its own system (#1091).
+        skipped_fiscal_document_service.record_skipped_invoice(payments, _build_line_items(payments), decision)
+        logger.warning("attendee_invoice_skipped_country_compliance", org_slug=org.slug, session_id=stripe_session_id)
+        return None
+
+    # Determine initial status based on invoicing mode
+    initial_status = (
+        AttendeeInvoice.InvoiceStatus.ISSUED
+        if org.invoicing_mode == Organization.InvoicingMode.AUTO
+        else AttendeeInvoice.InvoiceStatus.DRAFT
+    )
+
+    line_items = _build_line_items(payments)
+
+    # Aggregate totals from payments
+    total_gross = sum(p.amount for p in payments)
+    total_net = sum(p.net_amount or p.amount for p in payments)
+    total_vat = sum(p.vat_amount or Decimal("0.00") for p in payments)
+
+    # Dominant VAT rate (from first payment). A multi-tier cart (#846) can mix
+    # rates; the rendered totals label then drops the rate entirely
+    # (``AttendeeInvoice.has_mixed_vat_rates``) rather than claim this one.
+    vat_rate = first_payment.vat_rate or Decimal("0.00")
+
+    # Reverse charge: use the authoritative decision from checkout, not re-inferred
+    reverse_charge = bool(billing_snapshot.get("reverse_charge", False))
+
+    # Discount info
+    discount_codes = {p.ticket.discount_code.code for p in payments if p.ticket.discount_code}
+    discount_amount_total = sum(p.ticket.discount_amount or Decimal("0.00") for p in payments)
+
+    with transaction.atomic():
+        # Idempotency: check inside transaction to prevent race conditions
+        existing = AttendeeInvoice.objects.filter(stripe_session_id=stripe_session_id).first()
+        if existing:
+            return existing
+
+        prefix = _get_org_invoice_prefix(org)
+        year = timezone.now().year
+        invoice_number = get_next_sequential_number(AttendeeInvoice, prefix, year, "invoice_number")
+
+        invoice = AttendeeInvoice.objects.create(
+            organization=org,
+            event=event,
+            user=first_payment.user,
+            stripe_session_id=stripe_session_id,
+            invoice_number=invoice_number,
+            status=initial_status,
+            total_gross=total_gross,
+            total_net=total_net,
+            total_vat=total_vat,
+            vat_rate=vat_rate,
+            currency=first_payment.currency,
+            reverse_charge=reverse_charge,
+            discount_code_text=", ".join(sorted(discount_codes)),
+            discount_amount_total=discount_amount_total,
+            line_items=line_items,
+            # Seller snapshot. Physical admission is taxed where the event takes
+            # place, so the event's VAT country drives the invoice country; a
+            # virtual event is supplied from the org's establishment (#869).
+            seller_name=org.billing_name or org.name,
+            seller_vat_id=org.vat_id,
+            seller_vat_country=org.vat_country_code.upper() if event.is_virtual else event.effective_vat_country,
+            seller_address=org.billing_address,
+            seller_email=org.billing_email or org.contact_email or "",
+            # Buyer snapshot
+            buyer_name=billing_snapshot.get("billing_name", ""),
+            buyer_vat_id=billing_snapshot.get("vat_id", ""),
+            buyer_vat_country=billing_snapshot.get("vat_country_code", ""),
+            buyer_address=billing_snapshot.get("billing_address", ""),
+            buyer_email=billing_snapshot.get("billing_email", ""),
+            issued_at=timezone.now() if initial_status == AttendeeInvoice.InvoiceStatus.ISSUED else None,
+        )
+
+    # Generate PDF outside transaction (WeasyPrint is slow)
+    _generate_and_save_pdf(invoice)
+
+    logger.info(
+        "attendee_invoice_generated",
+        invoice_number=invoice.invoice_number,
+        status=invoice.status,
+        org_slug=org.slug,
+        session_id=stripe_session_id,
+    )
+
+    return invoice
+
+
+def invoice_compliance_decision(invoice: AttendeeInvoice) -> Decision:
+    """Whether the country policies still allow issuing (or crediting) this existing invoice.
+
+    For invoices that predate the gate: HYBRID drafts awaiting issue and issued invoices
+    about to receive a credit note.
+    """
+    org, event = invoice.organization, invoice.event
+    if org is None:  # organization deleted: only the seller country snapshot is left
+        reach = {invoice.seller_vat_country.upper(): ALL_NEXUS}
+    else:
+        # The event's venue, or the seller-country snapshot when the event is gone.
+        reach = compliance.sale_nexus(org, [event] if event else [], [] if event else [invoice.seller_vat_country])
+    return compliance.attendee_invoicing_for_sale(reach, _invoice_buyer(invoice))
+
+
+_NOT_ANNOTATED = object()
+
+
+def _invoice_buyer(invoice: AttendeeInvoice) -> BuyerContext:
+    """The buyer of an existing invoice, with the checkout VIES outcome when it still applies.
+
+    A draft's buyer VAT ID can be edited after checkout; the recorded VIES status only
+    belongs to the ID it was taken for, so an edited ID is read from its prefix alone.
+    """
+    annotated = getattr(invoice, "checkout_billing_snapshot", _NOT_ANNOTATED)  # set by with_issue_context
+    if annotated is not _NOT_ANNOTATED:
+        snapshot: t.Mapping[str, t.Any] = t.cast("t.Mapping[str, t.Any] | None", annotated) or {}
+    else:
+        payment = (
+            Payment.objects.filter(stripe_session_id=invoice.stripe_session_id).only("buyer_billing_snapshot").first()
+        )
+        snapshot = (payment.buyer_billing_snapshot if payment else None) or {}
+    if snapshot.get("vat_id") != invoice.buyer_vat_id:
+        snapshot = {"vat_id": invoice.buyer_vat_id}
+    return BuyerContext.from_billing_snapshot(snapshot)
+
+
+def with_issue_context(qs: QuerySet[AttendeeInvoice]) -> QuerySet[AttendeeInvoice]:
+    """Select what :func:`issue_blocked_reason` reads, so listing invoices costs no per-row query."""
+    snapshot = Payment.objects.filter(stripe_session_id=OuterRef("stripe_session_id")).values("buyer_billing_snapshot")
+    return qs.select_related("organization__city", "event__venue__city", "event__city", "event__organization").annotate(
+        checkout_billing_snapshot=Subquery(snapshot[:1])
+    )
+
+
+def issue_blocked_reason(invoice: AttendeeInvoice) -> str:
+    """Why a draft can no longer be issued under the country policies (#1091); empty otherwise."""
+    if invoice.status != AttendeeInvoice.InvoiceStatus.DRAFT:
+        return ""
+    return invoice_compliance_decision(invoice).reason
+
+
+# ---------------------------------------------------------------------------
+# Phase 4/5: PDF generation
+# ---------------------------------------------------------------------------
+
+
+def _is_export(invoice: AttendeeInvoice) -> bool:
+    """Check if the invoice was issued as a non-EU export (historical rendering only).
+
+    Admission is never zero-rated as an export (#868), so no new invoice is
+    created with this treatment. The ``total_vat == 0`` gate keeps the export
+    wording on historical zero-rated documents (which must re-render as issued)
+    while new non-EU invoices — which now carry full VAT — render normally.
+    """
+    buyer_country = invoice.buyer_vat_country.upper() if invoice.buyer_vat_country else ""
+    return bool(
+        buyer_country
+        and buyer_country not in EU_MEMBER_STATES
+        and not invoice.reverse_charge
+        and invoice.total_vat == 0
+    )
+
+
+def _is_virtual_interim(invoice: AttendeeInvoice) -> bool:
+    """Whether the invoice carries the virtual-event EU B2C interim treatment (#869).
+
+    A cross-border EU B2C buyer of a virtual event legally owes their own
+    country's VAT via OSS; we charge the seller's rate as the interim treatment
+    and disclose that on the document.
+    """
+    event = invoice.event
+    buyer_country = invoice.buyer_vat_country.upper() if invoice.buyer_vat_country else ""
+    return bool(
+        event is not None
+        and event.is_virtual
+        and not invoice.reverse_charge
+        and invoice.total_vat > 0
+        and buyer_country
+        and buyer_country in EU_MEMBER_STATES
+        and buyer_country != invoice.seller_vat_country.upper()
+    )
+
+
+def _generate_and_save_pdf(invoice: AttendeeInvoice) -> None:
+    """Render the invoice PDF and save it to the invoice's pdf_file field."""
+    template = "invoices/attendee_invoice.html"
+    context = {
+        "invoice": invoice,
+        "is_draft": invoice.status == AttendeeInvoice.InvoiceStatus.DRAFT,
+        "is_export": _is_export(invoice),
+        "is_virtual_interim": _is_virtual_interim(invoice),
+    }
+    pdf_bytes = render_pdf(template, context)
+    filename = f"{invoice.invoice_number}.pdf"
+    invoice.pdf_file.save(filename, ContentFile(pdf_bytes), save=True)
+
+
+def ensure_pdf_exists(invoice: AttendeeInvoice) -> None:
+    """Generate the invoice PDF if it doesn't exist (on-demand).
+
+    Edits to draft invoices invalidate the PDF; this regenerates it
+    when the user requests a download.
+    """
+    if not invoice.pdf_file:
+        _generate_and_save_pdf(invoice)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Email delivery
+# ---------------------------------------------------------------------------
+
+
+def _send_org_branded_email(
+    invoice: AttendeeInvoice,
+    subject: str,
+    body: str,
+    attachment_path: str,
+    attachment_filename: str,
+    html_body: str | None = None,
+) -> bool:
+    """Send an email branded with the org's billing identity.
+
+    Resolves recipient, reply-to, and BCC from the invoice/org. Sent synchronously
+    (not ``.delay()``) so the calling retryable task owns retries and can record a
+    successful delivery only after the email actually went out (issue #616).
+
+    Returns:
+        ``True`` if the email was sent, ``False`` if there was no recipient (a
+        permanent failure — retrying won't help). An SMTP failure propagates so
+        the caller's Celery task retries.
+    """
+    from common.tasks import send_email
+
+    org = invoice.organization
+    org_slug = org.slug if org else "unknown"
+    org_billing_name = invoice.seller_name
+
+    to_email = invoice.buyer_email
+    if not to_email and invoice.user:
+        to_email = invoice.user.email
+    if not to_email:
+        logger.warning("attendee_invoice_no_recipient", invoice_number=invoice.invoice_number)
+        return False
+
+    # Reply-To only ever points at a verified contact address (#1036). The BCC copy
+    # goes to the owner-only billing_email, else the verified contact.
+    reply_to = org_reply_to(org) if org else []
+    bcc = [org.billing_email] if org and org.billing_email else reply_to
+
+    send_email(
+        to=to_email,
+        subject=subject,
+        body=body,
+        html_body=html_body,
+        from_email=_invoice_from_address(org_billing_name, org_slug),
+        reply_to=reply_to or None,
+        bcc=bcc or None,
+        attachment_storage_path=attachment_path,
+        attachment_filename=attachment_filename,
+    )
+
+    logger.info("attendee_invoice_email_sent", subject=subject, invoice_number=invoice.invoice_number)
+    return True
+
+
+def deliver_attendee_invoice(invoice: AttendeeInvoice) -> None:
+    """Send the invoice PDF via email to the buyer.
+
+    Self-heals a missing PDF (regenerates on demand) so the recovery sweep can
+    recover a document that exhausted its delivery retries, whether it lost the
+    PDF or only the email (issue #616). Records the delivery on success.
+    """
+    from django.template.loader import render_to_string
+
+    from common.models import SiteSettings
+
+    ensure_pdf_exists(invoice)
+    if not invoice.pdf_file.name:
+        logger.warning("attendee_invoice_no_pdf", invoice_number=invoice.invoice_number)
+        return
+
+    event_name = invoice.event.name if invoice.event else "Event"
+    email_ctx = {
+        "invoice_number": invoice.invoice_number,
+        "event_name": event_name,
+        "frontend_base_url": SiteSettings.get_solo().frontend_base_url,
+    }
+    sent = _send_org_branded_email(
+        invoice=invoice,
+        subject=f"Invoice {invoice.invoice_number} — {event_name}",
+        body=render_to_string("events/emails/attendee_invoice_email.txt", email_ctx),
+        html_body=render_to_string("events/emails/attendee_invoice_email.html", email_ctx),
+        attachment_path=invoice.pdf_file.name,
+        attachment_filename=f"{invoice.invoice_number}.pdf",
+    )
+    if sent:
+        invoice.mark_email_sent()
+    else:
+        invoice.mark_email_undeliverable(AttendeeInvoice.DeliveryFailureReason.NO_RECIPIENT)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Credit notes
+# ---------------------------------------------------------------------------
+
+
+class _CreditNoteBuild(t.NamedTuple):
+    """Computed fields ready to hand to ``AttendeeInvoiceCreditNote.objects.create()``."""
+
+    amount_gross: Decimal
+    amount_net: Decimal
+    amount_vat: Decimal
+    line_items: list[InvoiceLineItemDict]
+    payments: t.Collection[Payment]
+    refund_rows: list[Refund] | None
+
+
+def _build_from_payments(
+    refunded_payments: list[Payment], existing_cns: list[AttendeeInvoiceCreditNote]
+) -> AttendeeInvoiceCreditNote | _CreditNoteBuild | None:
+    """Legacy payment-keyed path: full payment amounts, exact-set idempotency on payment ids."""
+    already_credited_ids: set["UUID"] = set()
+    for existing_cn in existing_cns:
+        already_credited_ids.update(p.id for p in existing_cn.payments.all())
+
+    # Exact-match idempotency: if this exact set was already credited, return it
+    refunded_id_set = {p.id for p in refunded_payments}
+    for existing_cn in existing_cns:
+        if {p.id for p in existing_cn.payments.all()} == refunded_id_set:
+            # Regenerate PDF if a previous attempt failed after DB commit
+            ensure_credit_note_pdf_exists(existing_cn)
+            return existing_cn
+
+    # Exclude payments already credited (prevents double-credit from superset retries)
+    refunded_payments = [p for p in refunded_payments if p.id not in already_credited_ids]
+    if not refunded_payments:
+        return None
+
+    return _CreditNoteBuild(
+        amount_gross=sum((p.amount for p in refunded_payments), Decimal("0.00")),
+        amount_net=sum((p.net_amount or p.amount for p in refunded_payments), Decimal("0.00")),
+        amount_vat=sum((p.vat_amount or Decimal("0.00") for p in refunded_payments), Decimal("0.00")),
+        line_items=_build_line_items(refunded_payments),
+        payments=refunded_payments,
+        refund_rows=None,
+    )
+
+
+def _build_from_refund_rows(
+    refund_rows: list[Refund], existing_cns: list[AttendeeInvoiceCreditNote]
+) -> AttendeeInvoiceCreditNote | _CreditNoteBuild | None:
+    """Amount-aware, refund-row-keyed path: pro-rata VAT, exact-set idempotency on refund ids.
+
+    Legacy CNs have an empty ``refunds`` M2M; they cover their full ``payments``
+    set instead. A refund row whose payment already has a legacy CN is treated
+    as fully credited and skipped.
+    """
+    already_credited_refund_ids: set["UUID"] = set()
+    legacy_credited_payment_ids: set["UUID"] = set()
+    for existing_cn in existing_cns:
+        cn_refund_ids = {r.id for r in existing_cn.refunds.all()}
+        if cn_refund_ids:
+            already_credited_refund_ids.update(cn_refund_ids)
+        else:
+            legacy_credited_payment_ids.update(p.id for p in existing_cn.payments.all())
+
+    # Exact-match idempotency on the refund-id set
+    requested_refund_id_set = {r.id for r in refund_rows}
+    for existing_cn in existing_cns:
+        if {r.id for r in existing_cn.refunds.all()} == requested_refund_id_set:
+            ensure_credit_note_pdf_exists(existing_cn)
+            return existing_cn
+
+    refund_rows = [
+        r
+        for r in refund_rows
+        if r.id not in already_credited_refund_ids and r.payment_id not in legacy_credited_payment_ids
+    ]
+    if not refund_rows:
+        return None
+
+    amount_gross = sum((r.amount for r in refund_rows), Decimal("0.00"))
+    amount_vat = sum((_refund_vat_portion(r) for r in refund_rows), Decimal("0.00"))
+    return _CreditNoteBuild(
+        amount_gross=amount_gross,
+        amount_net=amount_gross - amount_vat,
+        amount_vat=amount_vat,
+        line_items=_build_refund_line_items(refund_rows),
+        payments={r.payment for r in refund_rows},
+        refund_rows=refund_rows,
+    )
+
+
+def _load_refunded(
+    stripe_session_id: str, refunded_payment_ids: list["UUID"], refund_ids: list["UUID"] | None
+) -> tuple[list[Refund], list[Payment]] | None:
+    """The refund rows (amount-aware path) or refunded payments (legacy path) to credit; None when none match."""
+    if refund_ids:
+        refund_rows = list(
+            Refund.objects.filter(
+                pk__in=refund_ids,
+                status=Refund.RefundStatus.SUCCEEDED,
+                payment__stripe_session_id=stripe_session_id,
+            ).select_related("payment__ticket__event", "payment__ticket__tier")
+        )
+        return (refund_rows, []) if refund_rows else None
+    refunded_payments = list(
+        Payment.objects.filter(
+            id__in=refunded_payment_ids,
+            stripe_session_id=stripe_session_id,
+        ).select_related("ticket__event", "ticket__tier")
+    )
+    return ([], refunded_payments) if refunded_payments else None
+
+
+def _record_skipped_credit_note(
+    source: AttendeeInvoice | SkippedFiscalDocument,
+    decision: Decision,
+    refund_rows: list[Refund],
+    refunded_payments: list[Payment],
+) -> None:
+    """Record the credit note a policy refused, once per refund (or legacy payment) set (#1091).
+
+    Refunds already credited by a Revel credit note, or already in an earlier skipped
+    record for ``source``, are left out: a retry records nothing twice, and a superset retry
+    records only its new refunds.
+    """
+    with transaction.atomic():
+        # Serialize concurrent retries on the document being corrected.
+        source = type(source).objects.select_for_update().get(pk=source.pk)
+        prior = list(source.skipped_credit_notes.prefetch_related("payments", "refunds"))
+        existing_cns = (
+            list(AttendeeInvoiceCreditNote.objects.filter(invoice=source).prefetch_related("payments", "refunds"))
+            if isinstance(source, AttendeeInvoice)
+            else []
+        )
+        # A record without refund rows (legacy path) covers its payments in full.
+        covered_payment_ids = {p.id for doc in prior if not doc.refunds.all() for p in doc.payments.all()}
+        build: AttendeeInvoiceCreditNote | _CreditNoteBuild | None = None
+        if refund_rows:
+            covered_refund_ids = {r.id for doc in prior for r in doc.refunds.all()}
+            rows = [
+                r for r in refund_rows if r.id not in covered_refund_ids and r.payment_id not in covered_payment_ids
+            ]
+            build = _build_from_refund_rows(rows, existing_cns) if rows else None
+        else:
+            covered_payment_ids |= {p.id for doc in prior for p in doc.payments.all()}
+            payments = [p for p in refunded_payments if p.id not in covered_payment_ids]
+            build = _build_from_payments(payments, existing_cns) if payments else None
+        if isinstance(build, _CreditNoteBuild):
+            skipped_fiscal_document_service.record_skipped_credit_note(
+                source=source,
+                decision=decision,
+                line_items=build.line_items,
+                payments=build.payments,
+                refunds=build.refund_rows,
+            )
+
+
+def _record_credit_note_for_skipped_invoice(
+    stripe_session_id: str, refunded_payment_ids: list["UUID"], refund_ids: list["UUID"] | None
+) -> None:
+    """A refund on a sale whose invoice was skipped: its credit note is skipped too, for the same reason."""
+    parent = SkippedFiscalDocument.objects.filter(
+        stripe_session_id=stripe_session_id, kind=SkippedFiscalDocument.Kind.INVOICE
+    ).first()
+    if parent is None or (loaded := _load_refunded(stripe_session_id, refunded_payment_ids, refund_ids)) is None:
+        return
+    decision = Decision.block(parent.reason, code=parent.reason_code, country=parent.policy_country)
+    _record_skipped_credit_note(parent, decision, *loaded)
+    logger.warning("attendee_credit_note_skipped_invoice_skipped", session_id=stripe_session_id)
+
+
+def generate_attendee_credit_note(
+    stripe_session_id: str,
+    refunded_payment_ids: list["UUID"],
+    refund_ids: list["UUID"] | None = None,
+) -> AttendeeInvoiceCreditNote | None:
+    """Generate a credit note for refunded payments on an invoiced session.
+
+    A draft invoice is deleted instead of credited. When a country policy refuses
+    Revel-issued documents (EU layer 1), or the sale's invoice was itself skipped, no
+    credit note is issued and the skip is recorded instead (#1091): the organizer
+    corrects the sale in its own compliant system.
+
+    Args:
+        stripe_session_id: The Stripe session ID of the original purchase.
+        refunded_payment_ids: IDs of the refunded Payment records. Used as-is
+            (full payment amount) when ``refund_ids`` is falsy (``None`` or
+            ``[]``), for backward compatibility with callers that predate
+            per-refund amounts (e.g. in-flight Celery messages).
+        refund_ids: IDs of SUCCEEDED Refund rows. When given and non-empty,
+            the credit note is keyed on these rows instead of whole payments:
+            amounts come from each row's ``amount`` (with pro-rata VAT), and
+            idempotency is checked against the refund-id set rather than the
+            payment-id set — so two partial refunds on the same payment each
+            get their own credit note. An empty list is treated the same as
+            ``None`` (falls back to the payment-keyed path) rather than
+            silently matching zero rows and returning ``None``.
+
+    Returns:
+        The created credit note, or None if no invoice exists.
+    """
+    invoice = AttendeeInvoice.objects.filter(stripe_session_id=stripe_session_id).first()
+    if not invoice:
+        _record_credit_note_for_skipped_invoice(stripe_session_id, refunded_payment_ids, refund_ids)
+        return None
+
+    if invoice.status == AttendeeInvoice.InvoiceStatus.DRAFT:
+        # Imported here, not at module scope: the draft module imports
+        # _generate_and_save_pdf from this one, so a top-level import would close
+        # the cycle. Same pattern as issue_and_deliver's task import.
+        from events.service.attendee_invoice_draft_service import delete_draft_invoice
+
+        delete_draft_invoice(invoice)
+        return None
+
+    loaded = _load_refunded(stripe_session_id, refunded_payment_ids, refund_ids)
+    if loaded is None:
+        return None
+    refund_rows, refunded_payments = loaded
+
+    decision = invoice_compliance_decision(invoice)
+    if not decision.allowed:
+        logger.warning("attendee_credit_note_skipped_country_compliance", invoice_number=invoice.invoice_number)
+        _record_skipped_credit_note(invoice, decision, refund_rows, refunded_payments)
+        return None
+
+    with transaction.atomic():
+        # Lock the invoice row to serialize concurrent credit note creation
+        invoice = AttendeeInvoice.objects.select_for_update().get(pk=invoice.pk)
+
+        # Collect existing credit notes so both idempotency paths below can
+        # compare against what's already been credited.
+        existing_cns = list(
+            AttendeeInvoiceCreditNote.objects.filter(invoice=invoice).prefetch_related("payments", "refunds")
+        )
+
+        build = (
+            _build_from_refund_rows(refund_rows, existing_cns)
+            if refund_ids
+            else _build_from_payments(refunded_payments, existing_cns)
+        )
+        if build is None:
+            return None
+        if isinstance(build, AttendeeInvoiceCreditNote):
+            return build
+
+        org = invoice.organization
+
+        cn_prefix = f"{_sanitize_org_slug(org, _CREDIT_NOTE_SLUG_MAX)}-CN-" if org else "CN-"
+        year = timezone.now().year
+        credit_note_number = get_next_sequential_number(
+            AttendeeInvoiceCreditNote, cn_prefix, year, "credit_note_number"
+        )
+
+        credit_note = AttendeeInvoiceCreditNote.objects.create(
+            invoice=invoice,
+            credit_note_number=credit_note_number,
+            amount_gross=build.amount_gross,
+            amount_net=build.amount_net,
+            amount_vat=build.amount_vat,
+            line_items=build.line_items,
+            issued_at=timezone.now(),
+        )
+        credit_note.payments.set(build.payments)
+        if build.refund_rows is not None:
+            credit_note.refunds.set(build.refund_rows)
+
+        # Check if fully credited → mark invoice as CANCELLED
+        total_credited = sum(cn.amount_gross for cn in invoice.credit_notes.all())
+        if total_credited >= invoice.total_gross:
+            invoice.status = AttendeeInvoice.InvoiceStatus.CANCELLED
+            invoice.save(update_fields=["status", "updated_at"])
+
+    # Generate credit note PDF
+    _generate_credit_note_pdf(credit_note)
+
+    logger.info(
+        "attendee_credit_note_generated",
+        credit_note_number=credit_note.credit_note_number,
+        invoice_number=invoice.invoice_number,
+    )
+
+    return credit_note
+
+
+def _generate_credit_note_pdf(credit_note: AttendeeInvoiceCreditNote) -> None:
+    """Render the credit note PDF and save it.
+
+    The credit note intentionally renders seller/buyer info from the parent
+    invoice (the issued snapshot) rather than maintaining its own copy.
+    """
+    template = "invoices/attendee_credit_note.html"
+    invoice = credit_note.invoice
+    context = {
+        "credit_note": credit_note,
+        "invoice": invoice,
+        "is_export": _is_export(invoice),
+        "is_virtual_interim": _is_virtual_interim(invoice),
+    }
+    pdf_bytes = render_pdf(template, context)
+    filename = f"{credit_note.credit_note_number}.pdf"
+    credit_note.pdf_file.save(filename, ContentFile(pdf_bytes), save=True)
+
+
+def ensure_credit_note_pdf_exists(credit_note: AttendeeInvoiceCreditNote) -> None:
+    """Generate the credit note PDF if it doesn't exist (on-demand)."""
+    if not credit_note.pdf_file:
+        _generate_credit_note_pdf(credit_note)
+
+
+def deliver_credit_note(credit_note: AttendeeInvoiceCreditNote) -> None:
+    """Send the credit note PDF via email.
+
+    Self-heals a missing PDF and records the delivery on success so the recovery
+    sweep can recover an undelivered credit note (issue #616).
+    """
+    from django.template.loader import render_to_string
+
+    from common.models import SiteSettings
+
+    ensure_credit_note_pdf_exists(credit_note)
+    invoice = credit_note.invoice
+    if not credit_note.pdf_file.name:
+        logger.warning("attendee_credit_note_no_pdf", credit_note_number=credit_note.credit_note_number)
+        return
+
+    event_name = invoice.event.name if invoice.event else "Event"
+    email_ctx = {
+        "credit_note_number": credit_note.credit_note_number,
+        "invoice_number": invoice.invoice_number,
+        "event_name": event_name,
+        "frontend_base_url": SiteSettings.get_solo().frontend_base_url,
+    }
+    sent = _send_org_branded_email(
+        invoice=invoice,
+        subject=f"Credit Note {credit_note.credit_note_number} — {event_name}",
+        body=render_to_string("events/emails/attendee_credit_note_email.txt", email_ctx),
+        html_body=render_to_string("events/emails/attendee_credit_note_email.html", email_ctx),
+        attachment_path=credit_note.pdf_file.name,
+        attachment_filename=f"{credit_note.credit_note_number}.pdf",
+    )
+    if sent:
+        credit_note.mark_email_sent()
+    else:
+        credit_note.mark_email_undeliverable(AttendeeInvoiceCreditNote.DeliveryFailureReason.NO_RECIPIENT)
+
+
+def _invoice_from_address(billing_name: str, org_slug: str) -> str:
+    """``"<billing name>" <slug@apex>``, or the system address for role-mailbox slugs (RFC 2142)."""
+    if is_reserved_mailbox(org_slug):
+        return formataddr((billing_name, parseaddr(settings.DEFAULT_FROM_EMAIL)[1]))
+    return formataddr((billing_name, f"{org_slug}@{apex_email_domain()}"))

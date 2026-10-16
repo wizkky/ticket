@@ -1,0 +1,378 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import type {
+		VenueDetailSchema,
+		VenueCreateSchema,
+		CitySchema
+	} from '$lib/api/generated/types.gen';
+	import { createMutation, useQueryClient } from '@tanstack/svelte-query';
+	import {
+		organizationadminvenuesCreateVenue,
+		organizationadminvenuesUpdateVenue
+	} from '$lib/api/generated/sdk.gen';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { ChevronDown, ChevronRight, Map, HelpCircle } from '@lucide/svelte';
+	import * as Dialog from '$lib/components/ui/dialog';
+	import CityAutocomplete from '$lib/components/forms/CityAutocomplete.svelte';
+	import MarkdownEditor from '$lib/components/forms/MarkdownEditor.svelte';
+	import { toast } from 'svelte-sonner';
+	import { extractMapEmbedUrl } from '$lib/utils/maps';
+
+	interface Props {
+		venue: VenueDetailSchema | null;
+		organizationSlug: string;
+		onClose: () => void;
+		onSuccess: () => void;
+	}
+
+	const { venue, organizationSlug, onClose, onSuccess }: Props = $props();
+
+	const isEditing = $derived(!!venue);
+	const accessToken = $derived(authStore.accessToken);
+	const queryClient = useQueryClient();
+
+	// Form state
+	let name = $state(venue?.name ?? '');
+	let description = $state(venue?.description ?? '');
+	let capacity = $state<number | undefined>(venue?.capacity ?? undefined);
+	let cityId = $state<number | undefined>(venue?.city?.id ?? undefined);
+	let selectedCity = $state<CitySchema | null>(venue?.city ?? null);
+	let address = $state(venue?.address ?? '');
+	let locationMapsUrl = $state(venue?.location_maps_url ?? '');
+	let locationMapsEmbed = $state(venue?.location_maps_embed ?? '');
+
+	// Maps section collapsed state - auto-expand if there's data
+	const hasMapsData = $derived(!!locationMapsUrl || !!locationMapsEmbed);
+	let mapsExpanded = $state(false);
+
+	// Auto-expand maps section when data exists on load
+	$effect(() => {
+		if (hasMapsData && !mapsExpanded) {
+			mapsExpanded = true;
+		}
+	});
+
+	function handleMapsEmbedInput(e: Event) {
+		const target = e.target as HTMLTextAreaElement;
+		locationMapsEmbed = extractMapEmbedUrl(target.value) ?? '';
+	}
+
+	// Helper to extract error message from API response
+	function getErrorMessage(error: unknown): string {
+		if (error && typeof error === 'object') {
+			if ('detail' in error && error.detail) {
+				const detail = error.detail;
+				if (typeof detail === 'string') return detail;
+				if (Array.isArray(detail)) {
+					return detail
+						.map((d: unknown) => {
+							if (d && typeof d === 'object') {
+								if ('msg' in d && d.msg) return String(d.msg);
+								if ('message' in d && d.message) return String(d.message);
+							}
+							return String(d);
+						})
+						.join(', ');
+				}
+			}
+			if ('message' in error && error.message) return String(error.message);
+		}
+		return m['orgAdmin.venues.toast.genericError']();
+	}
+
+	// Create mutation
+	const createMutationFn = createMutation(() => ({
+		mutationFn: async (data: VenueCreateSchema) => {
+			const response = await organizationadminvenuesCreateVenue({
+				path: { slug: organizationSlug },
+				body: data,
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				throw response.error;
+			}
+
+			return response.data;
+		},
+		onSuccess: () => {
+			toast.success(m['orgAdmin.venues.toast.created']());
+			queryClient.invalidateQueries({ queryKey: ['organization-venues'] });
+			onSuccess();
+		},
+		onError: (error) => {
+			const message = getErrorMessage(error);
+			toast.error(m['orgAdmin.venues.toast.createError']() + ': ' + message);
+		}
+	}));
+
+	// Update mutation
+	const updateMutationFn = createMutation(() => ({
+		mutationFn: async (data: VenueCreateSchema) => {
+			if (!venue?.id) throw new Error('No venue ID');
+
+			const response = await organizationadminvenuesUpdateVenue({
+				path: { slug: organizationSlug, venue_id: venue.id },
+				body: data,
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				throw response.error;
+			}
+
+			return response.data;
+		},
+		onSuccess: () => {
+			toast.success(m['orgAdmin.venues.toast.updated']());
+			queryClient.invalidateQueries({ queryKey: ['organization-venues'] });
+			onSuccess();
+		},
+		onError: (error) => {
+			const message = getErrorMessage(error);
+			toast.error(m['orgAdmin.venues.toast.updateError']() + ': ' + message);
+		}
+	}));
+
+	const isPending = $derived(createMutationFn.isPending || updateMutationFn.isPending);
+
+	function handleSubmit(e: Event) {
+		e.preventDefault();
+
+		const data: VenueCreateSchema = {
+			name: name.trim(),
+			description: description.trim() || undefined,
+			capacity: capacity || undefined,
+			city_id: cityId || undefined,
+			address: address.trim() || undefined,
+			location_maps_url: locationMapsUrl.trim() || undefined,
+			location_maps_embed: locationMapsEmbed.trim() || undefined
+		};
+
+		if (isEditing) {
+			updateMutationFn.mutate(data);
+		} else {
+			createMutationFn.mutate(data);
+		}
+	}
+
+	function handleCitySelect(city: CitySchema | null) {
+		cityId = city?.id ?? undefined;
+		selectedCity = city;
+	}
+
+	// The parent mounts this component only while the modal should be shown, so
+	// the dialog opens on mount and every close path funnels through onClose().
+	let open = $state(true);
+
+	function handleOpenChange(next: boolean) {
+		if (!next) {
+			// Gate dismissal like the Cancel button: closing mid-flight would drop
+			// the pending mutation's outcome (PriceCategoryModal semantics).
+			if (isPending) {
+				open = true;
+				return;
+			}
+			onClose();
+		}
+	}
+</script>
+
+<Dialog.Root bind:open onOpenChange={handleOpenChange}>
+	<Dialog.Content
+		class="flex max-h-[90vh] flex-col sm:max-w-lg"
+		escapeKeydownBehavior={isPending ? 'ignore' : 'close'}
+		interactOutsideBehavior={isPending ? 'ignore' : 'close'}
+	>
+		<Dialog.Header>
+			<Dialog.Title>
+				{isEditing
+					? m['orgAdmin.venues.form.editTitle']()
+					: m['orgAdmin.venues.form.createTitle']()}
+			</Dialog.Title>
+		</Dialog.Header>
+
+		<!-- Form -->
+		<form onsubmit={handleSubmit} class="min-h-0 flex-1 overflow-y-auto">
+			<div class="space-y-4">
+				<!-- Name -->
+				<div>
+					<label for="venue-name" class="mb-1.5 block text-sm font-medium">
+						{m['orgAdmin.venues.form.nameLabel']()}
+					</label>
+					<input
+						id="venue-name"
+						type="text"
+						bind:value={name}
+						placeholder={m['orgAdmin.venues.form.namePlaceholder']()}
+						required
+						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					/>
+				</div>
+
+				<!-- Description -->
+				<div>
+					<MarkdownEditor
+						bind:value={description}
+						id="venue-description"
+						label={m['orgAdmin.venues.form.descriptionLabel']()}
+						placeholder={m['orgAdmin.venues.form.descriptionPlaceholder']()}
+						rows={4}
+					/>
+				</div>
+
+				<!-- Capacity -->
+				<div>
+					<label for="venue-capacity" class="mb-1.5 block text-sm font-medium">
+						{m['orgAdmin.venues.form.capacityLabel']()}
+					</label>
+					<input
+						id="venue-capacity"
+						type="number"
+						min="0"
+						bind:value={capacity}
+						placeholder={m['orgAdmin.venues.form.capacityPlaceholder']()}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					/>
+					<p class="mt-1 text-xs text-muted-foreground">
+						{m['orgAdmin.venues.form.capacityHelp']()}
+					</p>
+				</div>
+
+				<!-- City -->
+				<div>
+					<CityAutocomplete
+						value={selectedCity}
+						onSelect={handleCitySelect}
+						label={m['orgAdmin.venues.form.cityLabel']()}
+						description=""
+					/>
+				</div>
+
+				<!-- Address -->
+				<div>
+					<label for="venue-address" class="mb-1.5 block text-sm font-medium">
+						{m['orgAdmin.venues.form.addressLabel']()}
+					</label>
+					<input
+						id="venue-address"
+						type="text"
+						bind:value={address}
+						placeholder={m['orgAdmin.venues.form.addressPlaceholder']()}
+						class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					/>
+				</div>
+
+				<!-- Maps Integration (collapsible) -->
+				<div class="rounded-lg border border-border">
+					<button
+						type="button"
+						onclick={() => (mapsExpanded = !mapsExpanded)}
+						class="flex w-full items-center justify-between p-3 text-left transition-colors hover:bg-accent/50"
+						aria-expanded={mapsExpanded}
+						aria-controls="venue-maps-section"
+					>
+						<span class="flex items-center gap-2 text-sm font-medium">
+							<Map class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+							{m['locationSection.mapsSection']()}
+						</span>
+						{#if mapsExpanded}
+							<ChevronDown class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+						{:else}
+							<ChevronRight class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+						{/if}
+					</button>
+
+					{#if mapsExpanded}
+						<div id="venue-maps-section" class="space-y-4 border-t p-3">
+							<!-- Maps URL -->
+							<div>
+								<label for="venue-maps-url" class="mb-1.5 block text-sm font-medium">
+									{m['locationSection.mapsUrl']()}
+								</label>
+								<input
+									id="venue-maps-url"
+									type="url"
+									bind:value={locationMapsUrl}
+									placeholder="https://maps.google.com/..."
+									class="w-full rounded-md border border-input bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+								/>
+								<p class="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+									<HelpCircle class="h-3 w-3" aria-hidden="true" />
+									{m['locationSection.mapsUrlHint']()}
+								</p>
+							</div>
+
+							<!-- Maps Embed -->
+							<div>
+								<label for="venue-maps-embed" class="mb-1.5 block text-sm font-medium">
+									{m['locationSection.mapsEmbed']()}
+								</label>
+								<textarea
+									id="venue-maps-embed"
+									value={locationMapsEmbed}
+									oninput={handleMapsEmbedInput}
+									placeholder="<iframe src=&quot;https://www.google.com/maps/embed?...&quot;>"
+									rows="3"
+									class="w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+								></textarea>
+								<p class="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+									<HelpCircle class="h-3 w-3" aria-hidden="true" />
+									{m['locationSection.mapsEmbedHint']()}
+								</p>
+							</div>
+
+							<!-- Map Preview -->
+							{#if locationMapsEmbed}
+								<div>
+									<p class="mb-2 text-sm font-medium">
+										{m['locationSection.mapsPreview']()}
+									</p>
+									<div class="overflow-hidden rounded-lg border">
+										<iframe
+											src={locationMapsEmbed}
+											width="100%"
+											height="200"
+											style="border:0;"
+											sandbox="allow-scripts"
+											loading="lazy"
+											referrerpolicy="no-referrer-when-downgrade"
+											title={m['venueModal.mapPreviewTitle']()}
+										></iframe>
+									</div>
+								</div>
+							{/if}
+						</div>
+					{/if}
+				</div>
+			</div>
+
+			<!-- Actions -->
+			<div class="mt-6 flex justify-end gap-3">
+				<button
+					type="button"
+					onclick={onClose}
+					disabled={isPending}
+					class="rounded-md border border-input px-4 py-2 text-sm font-medium transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50"
+				>
+					{m['orgAdmin.venues.form.cancel']()}
+				</button>
+				<button
+					type="submit"
+					disabled={isPending || !name.trim()}
+					class="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:opacity-50"
+				>
+					{#if isPending}
+						{isEditing ? m['orgAdmin.venues.form.saving']() : m['orgAdmin.venues.form.creating']()}
+					{:else}
+						{isEditing ? m['orgAdmin.venues.form.save']() : m['orgAdmin.venues.form.create']()}
+					{/if}
+				</button>
+			</div>
+		</form>
+	</Dialog.Content>
+</Dialog.Root>

@@ -1,0 +1,182 @@
+<script lang="ts">
+	/**
+	 * Cart-lifetime seat-hold owner for ONE seated cart group (#853 PR 3).
+	 * Mounted per group by `CartSeatHolds`, keyed on `group.tier.id`. Instantiates
+	 * the tier's `SeatHoldController` — must happen at component init, it calls
+	 * `createQuery`/`useQueryClient` — and registers it into the page-level
+	 * registry so the seat picker dialog, the checkout sheet, and the
+	 * confirm-time best-available hold (later tasks) all drive the SAME
+	 * controller instead of a second one that doesn't know about the first's
+	 * holds.
+	 *
+	 * `user_choice` groups additionally keep `cart`'s `seatIds` in sync with
+	 * the controller's live holds — this effect is the ONLY writer of
+	 * `seatIds` besides the host's expiry sweep (`CartSeatHolds`).
+	 * `best_available` groups get a controller too (availability/zones for the
+	 * sheet, `holdBestAvailable` at confirm time) but never touch `seatIds`
+	 * here — best-available seats aren't picked, they're assigned at confirm.
+	 */
+	import { onDestroy } from 'svelte';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import type { VenueChartSchema } from '$lib/api/generated/types.gen';
+	import type { CartGroup, EventCart } from './cart.svelte';
+	import type { CartSeatHoldRegistry } from './cart-seat-registry.svelte';
+	import {
+		SeatHoldController,
+		type SeatHoldControllerOptions
+	} from './seat-hold-controller.svelte';
+	import { holdConflictMessage } from './purchase-error';
+	import { shouldSyncSeatIds } from './cart-seat-sync';
+	import { toast } from 'svelte-sonner';
+
+	interface Props {
+		cart: EventCart;
+		registry: CartSeatHoldRegistry;
+		eventId: string;
+		group: CartGroup;
+	}
+
+	const { cart, registry, eventId, group }: Props = $props();
+
+	// The tier this instance owns is fixed for its lifetime (keyed `#each`
+	// remounts on tier change), so capturing it once at init is deliberate.
+	// svelte-ignore state_referenced_locally
+	const tier = group.tier;
+	const isUserChoice = tier.seat_assignment_mode === 'user_choice';
+
+	// The seats this group ALREADY claims at mount (#918), written in the same
+	// flush by whichever writer created the group: the picker's Done
+	// (`SeatPickerDialog.handleDone`) or the picker-free venue-overview
+	// hand-off (the event page's `handleSelectTier`, which adopts seats the
+	// overview map already holds). Captured once, deliberately, for the same
+	// reason `tier` is: it's the hand-off payload, not a value to track.
+	// Copied so a later `setSeatIds` can't retroactively change what the seed
+	// was told. Fed to `seedFromAvailability` so a warm but PRE-hold
+	// availability snapshot can't make the controller disown them, and
+	// compared against `myHolds` below so a PARTIAL resolution can't make the
+	// live sync write a shrunken list.
+	// svelte-ignore state_referenced_locally
+	const initialSeatIds: string[] = isUserChoice ? [...group.seatIds] : [];
+
+	// Declared ahead of `options` (explicit type annotation) so `getQuantity`
+	// can close over it without a circular type-inference error — it's only
+	// ever CALLED after the assignment below, never read synchronously.
+	let controller: SeatHoldController;
+
+	// The event is fixed for a mounted page instance, so capturing eventId's
+	// initial value here is deliberate (mirrors SeatAssignmentSection).
+	// svelte-ignore state_referenced_locally
+	const options: SeatHoldControllerOptions = {
+		eventId,
+		// user_choice has no independent stepper (Task 6): the tap-driven
+		// controller IS the counter, so feeding it back its own hold count
+		// keeps the grow-on-tap check a harmless pass-through instead of
+		// fighting the live-sync effect below. best_available keeps the
+		// cart's stepper-driven quantity.
+		getQuantity: () => (isUserChoice ? controller.myHolds.length : cart.quantityFor(tier.id)),
+		getMaxQuantity: () => cart.maxQuantity(tier),
+		onAutoGrowQuantity: (next) => {
+			// user_choice: the live-sync effect derives quantity from
+			// controller.myHolds via cart.setSeatIds — nothing more to do here.
+			if (isUserChoice) return;
+			cart.setQuantity(tier, next);
+		},
+		// Live now (#853 PR 4) rather than hardcoded true: this host still only
+		// mounts in the authed block (Task 5 widens that), but reading the real
+		// token here — rather than assuming — is what arms the controller's
+		// anonymous-hold sessionStorage bookkeeping once it does.
+		isAuthenticated: () => !!authStore.accessToken,
+		onConflict: (_seatIds, reason) => {
+			toast.error(holdConflictMessage(reason));
+		}
+	};
+
+	// Must be constructed during component init (createQuery/useQueryClient).
+	controller = new SeatHoldController(options);
+
+	// Registering into the page-level registry is a one-time init step for
+	// this instance's fixed tier, not a reactive read of `registry` itself.
+	// svelte-ignore state_referenced_locally
+	registry.set(tier.id, controller);
+
+	onDestroy(() => {
+		registry.delete(tier.id);
+		// Tickets now own the seats — releasing them would hand them back.
+		if (registry.handedOffToCheckout) return;
+		if (controller.myHolds.length === 0) return;
+		void controller.release(controller.myHolds);
+	});
+
+	/** Active seat ids in this tier's sector (mirrors SeatAssignmentSection's
+	 * collectValidSeatIds — all seated sectors when the tier has none). */
+	function validSeatIdsFor(chart: VenueChartSchema): Set<string> {
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- not reactive state: built fresh per call and consumed synchronously
+		const ids = new Set<string>();
+		const sectorId = tier.sector?.id ?? null;
+		for (const sector of chart.sectors ?? []) {
+			if ((sector.kind ?? 'seated') === 'standing') continue;
+			if (sectorId && sector.id !== sectorId) continue;
+			for (const seat of sector.seats ?? []) {
+				if (seat.is_active !== false) ids.add(seat.id);
+			}
+		}
+		return ids;
+	}
+
+	// Adopt the caller's server-side holds once chart + availability are
+	// loaded. The venue-overview map (or an earlier picker session on this
+	// same registered controller) can have placed holds server-side before
+	// THIS controller instance's availability query has resolved them — the
+	// first pass seeds from the snapshot, later passes adopt anything that
+	// landed after (adoptServerHolds' own docstring covers this hand-off).
+	// `$state`, not a plain flag: the live-sync effect below reads it to
+	// gate its own re-runs, so the write here must be reactively visible.
+	let seeded = $state(false);
+	$effect(() => {
+		if (!isUserChoice) return;
+		const chart = controller.chartQuery.data;
+		const availability = controller.availabilityQuery.data;
+		if (!chart || !availability) return;
+		if (!seeded) {
+			seeded = true;
+			// Same-sector cross-adoption (#853 final-review fix 5): a sector can
+			// be legally sold by BOTH a user_choice tier and a best_available
+			// tier. Both controllers' availability queries share the SAME
+			// identity-wide `['seating-availability', eventId]` cache entry, so
+			// `availability.my_holds` mixes holds from every tier the buyer has
+			// touched — seeding straight off the sector's seat ids would happily
+			// adopt the best_available group's already-held block as this
+			// group's own seats. Excluding every OTHER registered controller's
+			// current holds keeps each group's adoption in its own lane.
+			const validIds = validSeatIdsFor(chart);
+			for (const id of registry.otherHolds(tier.id)) validIds.delete(id);
+			controller.seedFromAvailability(validIds, initialSeatIds);
+			return;
+		}
+		controller.adoptServerHolds();
+	});
+
+	// Live sync: the controller's held seats become the group's seatIds. NOT an
+	// additive writer — `cart.setSeatIds` REPLACES the list (and `[]` REMOVES
+	// the group) — so the gate's whole job is to withhold any write that would
+	// be worse than what the group already claims. `myHolds` can be empty
+	// (queries in flight, or a seed off a warm-but-pre-hold snapshot — #918)
+	// or PARTIAL (a claimed seat the warm chart doesn't list, so neither the
+	// seed's union nor any later adopt can resolve it — #918 review). Writing
+	// the first deletes the group and unmounts the only component that could
+	// have repaired it; writing the second drops a seat from the buyer's cart
+	// with no symptom at all. Shrinking and emptying belong to the writers
+	// that do it explicitly: the picker, the venue-overview hand-off, and the
+	// host's expiry sweep. See cart-seat-sync.ts for the (unit-tested) gate.
+	//
+	// `initialSeatIds` is a plain array, so the only reactive dependency this
+	// adds is `controller.myHolds` — which the effect already tracked. Reading
+	// `group.seatIds` here instead would make the effect depend on its own
+	// write and loop.
+	$effect(() => {
+		const held = controller.myHolds;
+		const unresolvedClaims = initialSeatIds.filter((id) => !held.includes(id)).length;
+		if (!shouldSyncSeatIds(isUserChoice, seeded, held.length, unresolvedClaims)) return;
+		cart.setSeatIds(tier, held);
+	});
+</script>

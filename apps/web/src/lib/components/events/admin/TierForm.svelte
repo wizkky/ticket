@@ -1,0 +1,748 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import * as m from '$lib/paraglide/messages.js';
+	import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query';
+	import {
+		eventadminticketsCreateTicketTier,
+		eventadminticketsUpdateTicketTier,
+		eventadminticketsDeleteTicketTier,
+		organizationadminvenuesListVenues,
+		eventpublicseatingGetChart
+	} from '$lib/api/generated/sdk.gen';
+	import type {
+		TicketTierDetailSchema,
+		TicketTierCreateSchema,
+		TicketTierUpdateSchema,
+		MembershipTierSchema,
+		VenueDetailSchema,
+		VenueChartSchema,
+		SeatAssignmentMode,
+		RefundPolicy
+	} from '$lib/api/generated/types.gen';
+	import { Dialog, DialogContent, DialogHeader, DialogTitle } from '$lib/components/ui/dialog';
+	import { Button } from '$lib/components/ui/button';
+	import { Input } from '$lib/components/ui/input';
+	import { Label } from '$lib/components/ui/label';
+	import MarkdownEditor from '$lib/components/forms/MarkdownEditor.svelte';
+	import { DurationInput } from '$lib/components/forms';
+	import RefundPolicyEditor from './RefundPolicyEditor.svelte';
+	import TierFormPricingSection from './TierFormPricingSection.svelte';
+	import TierFormAvailabilitySection from './TierFormAvailabilitySection.svelte';
+	import TierFormSeatingSection from './TierFormSeatingSection.svelte';
+	import TierFormCheckInSection from './TierFormCheckInSection.svelte';
+	import TierFormPaymentMethodSection from './TierFormPaymentMethodSection.svelte';
+	import {
+		checkInOffsetsPayload,
+		checkInPicksValid,
+		initialCheckInPicks,
+		type TierCheckInEventContext
+	} from './check-in-offset';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { extractErrorMessage, extractFieldErrors, markSilent } from '$lib/utils/errors';
+	import { tierFieldLabel } from './tier-field-labels';
+	import {
+		CURRENCY_SYMBOLS,
+		isBillingInfoRequiredError,
+		toDatetimeLocal,
+		toTimezoneAwareISO,
+		normalizeDecimalInput
+	} from './tier-form-helpers';
+	import {
+		buildCategoryPricesPayload,
+		buildTierSeatingFields,
+		retainedSectorIdForMode
+	} from './tier-seating-payload';
+	import { Undo2 } from '@lucide/svelte';
+	import type { EventRules } from '$lib/utils/compliance';
+	import { formatDateTimeReadback } from '$lib/utils/date';
+	import type { PlatformFeeInfo } from '$lib/utils/fees';
+
+	interface Props {
+		tier: TicketTierDetailSchema | null; // null = create new
+		eventId: string;
+		organizationSlug: string;
+		organizationStripeConnected: boolean;
+		/** Org platform-fee terms for the net-payout preview (null hides it). */
+		platformFees?: PlatformFeeInfo | null;
+		membershipTiers?: MembershipTierSchema[];
+		eventVenueId?: string | null; // Pre-fill venue from event
+		/** The event form's start/end/check-in window the tier offsets are relative to. */
+		eventContext?: TierCheckInEventContext;
+		/** The event's country rules (#1001) and whether they've loaded (fails closed). */
+		rules?: EventRules;
+		onClose: () => void;
+	}
+
+	const {
+		tier,
+		eventId,
+		organizationSlug,
+		organizationStripeConnected,
+		platformFees = null,
+		membershipTiers = [],
+		eventVenueId = null,
+		eventContext = { start: '' },
+		rules = { compliance: null, status: 'ready' },
+		onClose
+	}: Props = $props();
+
+	const accessToken = $derived(authStore.accessToken);
+
+	const queryClient = useQueryClient();
+
+	// Form state
+	let name = $state(tier?.name ?? '');
+	let description = $state(tier?.description ?? '');
+	let paymentMethod = $state<'free' | 'offline' | 'at_the_door' | 'online'>(
+		(tier?.payment_method as 'free' | 'offline' | 'at_the_door' | 'online') ?? 'free'
+	);
+	let priceType = $state<'fixed' | 'pwyc'>((tier?.price_type as 'fixed' | 'pwyc') ?? 'fixed');
+	let price = $state(tier?.price ? String(tier.price) : '0');
+	let pwycMin = $state(tier?.pwyc_min ? String(tier.pwyc_min) : '1');
+	let pwycMax = $state(tier?.pwyc_max ? String(tier.pwyc_max) : '');
+	let currency = $state(tier?.currency ?? 'EUR');
+	let vatRateOverride = $state(tier?.vat_rate != null ? String(tier.vat_rate) : '');
+	let manualPaymentInstructions = $state(tier?.manual_payment_instructions ?? '');
+	let totalQuantity = $state<string>(
+		tier?.total_quantity !== null && tier?.total_quantity !== undefined
+			? String(tier.total_quantity)
+			: ''
+	);
+	let salesStartAt = $state(toDatetimeLocal(tier?.sales_start_at));
+	let salesEndAt = $state(toDatetimeLocal(tier?.sales_end_at));
+	let salesPaused = $state(tier?.sales_paused ?? false);
+	// Per-tier check-in window (#945): picked times ↔ offsets from event start.
+	const checkInPicks = $state(initialCheckInPicks(eventContext.start, tier));
+	// Unambiguous textual readbacks for the native datetime inputs; '' when the
+	// value is empty or unparseable, so each hint is gated on the rendered text.
+	const salesStartReadback = $derived(formatDateTimeReadback(salesStartAt));
+	const salesEndReadback = $derived(formatDateTimeReadback(salesEndAt));
+	let visibility = $state<'public' | 'private' | 'members-only' | 'staff-only'>(
+		(tier?.visibility as 'public' | 'private' | 'members-only' | 'staff-only') ?? 'public'
+	);
+	let purchasableBy = $state<'public' | 'members' | 'invited' | 'invited_and_members'>(
+		(tier?.purchasable_by as 'public' | 'members' | 'invited' | 'invited_and_members') ?? 'public'
+	);
+	let restrictedToMembershipTiersIds = $state<string[]>(
+		tier?.restricted_to_membership_tiers?.map((t) => t.id).filter((id): id is string => !!id) ?? []
+	);
+	let restrictVisibilityToLinkedInvitations = $state(
+		tier?.restrict_visibility_to_linked_invitations ?? false
+	);
+	let restrictPurchaseToLinkedInvitations = $state(
+		tier?.restrict_purchase_to_linked_invitations ?? false
+	);
+
+	// Cancellation & refund policy state
+	let allowUserCancellation = $state(tier?.allow_user_cancellation ?? false);
+	let cancellationDeadlineHours = $state<number | null>(
+		tier?.cancellation_deadline_hours !== null && tier?.cancellation_deadline_hours !== undefined
+			? tier.cancellation_deadline_hours
+			: null
+	);
+	let refundPolicy = $state<RefundPolicy | null>(tier?.refund_policy ?? null);
+	let refundPolicyValid = $state(true);
+
+	// Switching to a free tier removes the entire refund policy — backend ignores it.
+	$effect(() => {
+		if (paymentMethod === 'free' && allowUserCancellation) {
+			allowUserCancellation = false;
+		}
+	});
+
+	// Auto-reset restriction toggles when parent condition no longer applies
+	$effect(() => {
+		if (visibility !== 'private') {
+			restrictVisibilityToLinkedInvitations = false;
+		}
+	});
+	$effect(() => {
+		if (purchasableBy !== 'invited' && purchasableBy !== 'invited_and_members') {
+			restrictPurchaseToLinkedInvitations = false;
+		}
+	});
+
+	// Venue and seating state
+	let seatAssignmentMode = $state<SeatAssignmentMode>(tier?.seat_assignment_mode ?? 'none');
+	let maxTicketsPerUser = $state<string>(
+		tier?.max_tickets_per_user !== null && tier?.max_tickets_per_user !== undefined
+			? String(tier.max_tickets_per_user)
+			: ''
+	);
+	// Pre-fill venue: use tier's venue if editing, else fall back to event's venue
+	// Venue is read-only - it always comes from the event
+	const venueId = $state<string | null>(tier?.venue?.id ?? eventVenueId ?? null);
+
+	// Check if event has a venue configured
+	const hasEventVenue = $derived(!!eventVenueId);
+
+	// Seat assignment modes other than 'none' require an event venue
+	const canUseSeatAssignment = $derived(hasEventVenue);
+	let sectorId = $state<string | null>(tier?.sector?.id ?? null);
+
+	// Per-category prices — the single pricing mechanism for BOTH seated modes
+	// (pricing convergence). The baseline is what the server stored; the payload
+	// builder sends the map ONLY when it diverges from this (PUT + three-way
+	// write semantics: omit = untouched, {} = clear, non-empty = replace), so an
+	// unrelated edit can't wipe prices.
+	const initialCategoryPrices: Record<string, string> = Object.fromEntries(
+		Object.entries(tier?.category_prices ?? {}).map(([id, value]) => [id, String(value)])
+	);
+	let categoryPrices = $state<Record<string, string>>({ ...initialCategoryPrices });
+
+	// Fetch venues for the organization (fetch when seat assignment is not 'none' OR when we have a venue pre-selected)
+	const venuesQuery = createQuery<VenueDetailSchema[]>(() => ({
+		queryKey: ['organization-venues', organizationSlug],
+		queryFn: async () => {
+			const response = await organizationadminvenuesListVenues({
+				path: { slug: organizationSlug },
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				throw new Error('Failed to load venues');
+			}
+
+			return response.data?.results || [];
+		},
+		enabled: !!accessToken && (seatAssignmentMode !== 'none' || !!venueId)
+	}));
+
+	// Fetch the venue seating chart — price categories only exist on the chart.
+	// Public endpoint; the Bearer header lets admins of draft/private events resolve it.
+	const chartQuery = createQuery<VenueChartSchema>(() => ({
+		queryKey: ['seating-chart', eventId],
+		queryFn: async () => {
+			const response = await eventpublicseatingGetChart({
+				path: { event_id: eventId },
+				headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined
+			});
+
+			if (response.error !== undefined || !response.data) {
+				throw new Error('Failed to load seating chart');
+			}
+
+			return response.data;
+		},
+		enabled: !!venueId
+	}));
+
+	// A seated tier of EITHER mode requires a sector (pricing convergence: the
+	// removed price-category FK used to supply the venue for best_available).
+	const sectorRequired = $derived(seatAssignmentMode !== 'none');
+	// When sector is required, both venue and sector must be selected
+	const sectorValid = $derived(!sectorRequired || (!!venueId && !!sectorId));
+
+	const priceCategories = $derived(chartQuery.data?.price_categories ?? []);
+
+	// Standing sectors can't back a user_choice tier — their "spots" are never
+	// holdable server-side. VenueSectorSchema has no `kind`, so join against the
+	// chart (which does) to know which sectors to hide from the picker.
+	const standingSectorIds = $derived(
+		new Set((chartQuery.data?.sectors ?? []).filter((s) => s.kind === 'standing').map((s) => s.id))
+	);
+
+	// Get sectors from the selected venue (minus standing ones once the chart is loaded)
+	const selectedVenueSectors = $derived.by(() => {
+		if (!venueId || !venuesQuery.data) return [];
+		const venue = venuesQuery.data.find((v) => v.id === venueId);
+		const sectors = venue?.sectors || [];
+		if (standingSectorIds.size === 0) return sectors;
+		return sectors.filter((s) => !s.id || !standingSectorIds.has(s.id));
+	});
+
+	// The inverse pool: standing sectors CAN back a GA (none) tier — linking one
+	// turns its capacity into a hard sale-time cap. Empty until the chart loads.
+	const standingVenueSectors = $derived.by(() => {
+		if (!venueId || !venuesQuery.data) return [];
+		const venue = venuesQuery.data.find((v) => v.id === venueId);
+		return (venue?.sectors || []).filter((s) => !!s.id && standingSectorIds.has(s.id));
+	});
+
+	// The venue matching the pre-filled venueId (read-only display in the seating section)
+	const selectedVenue = $derived(venuesQuery.data?.find((v) => v.id === venueId));
+
+	// Keep the sector consistent with venue, mode and sector kind: standing
+	// sectors are only valid on GA (none) tiers, seated ones on user_choice.
+	// Only clear once venues AND the chart are loaded — standing-ness comes from
+	// the chart — so the edit-mode prefill (incl. a GA tier's standing sector)
+	// survives the fetches.
+	$effect(() => {
+		if (!venueId) {
+			sectorId = null;
+			return;
+		}
+		if (sectorId === null || !venuesQuery.data || !chartQuery.data) return;
+		const retained = retainedSectorIdForMode(seatAssignmentMode, sectorId, standingSectorIds);
+		if (retained !== sectorId) {
+			sectorId = retained;
+			return;
+		}
+		// Sector must still belong to the current venue.
+		const pool = seatAssignmentMode === 'none' ? standingVenueSectors : selectedVenueSectors;
+		if (!pool.some((s) => s.id === sectorId)) {
+			sectorId = null;
+		}
+	});
+
+	// Categories offered in the pricing editor (both seated modes): those
+	// painted on an active seat of the selected sector, plus any category the
+	// tier already prices (stale extras stay editable/clearable instead of
+	// vanishing). On user_choice a non-empty map must cover every painted
+	// category; on best_available the priced subset DEFINES the sellable zones.
+	const sectorPricingCategories = $derived.by(() => {
+		if (seatAssignmentMode === 'none' || !sectorId || !chartQuery.data) return [];
+		const sector = (chartQuery.data.sectors ?? []).find((s) => s.id === sectorId);
+		// eslint-disable-next-line svelte/prefer-svelte-reactivity -- not reactive state: built fresh per derivation and consumed synchronously
+		const painted = new Set<string>();
+		for (const seat of sector?.seats ?? []) {
+			if (seat.is_active !== false && seat.price_category_id) {
+				painted.add(seat.price_category_id);
+			}
+		}
+		return priceCategories.filter(
+			(category) =>
+				!!category.id && (painted.has(category.id) || (categoryPrices[category.id] ?? '') !== '')
+		);
+	});
+
+	// Get current currency symbol for display
+	const currencySymbol = $derived(CURRENCY_SYMBOLS[currency] || currency);
+
+	// The generated client resolves with `{ error }` on HTTP errors instead of
+	// rejecting (ThrowOnError = false), so each mutationFn must throw the error
+	// body itself — otherwise a 400/422 lands in onSuccess and closes the dialog
+	// without ever showing the error panel below. `markSilent` keeps the global
+	// "Action failed" toast from duplicating that panel (the RefundTicketDialog
+	// convention); the body is thrown unwrapped so extractFieldErrors still
+	// sees the pydantic detail array.
+	// Last save's HTTP status: a plain-detail 422 is a country-rule refusal (#1001).
+	let saveStatus = $state<number | undefined>(undefined);
+
+	const tierCreateMutation = createMutation(() => ({
+		mutationFn: async (data: TicketTierCreateSchema) => {
+			const res = await eventadminticketsCreateTicketTier({
+				path: { event_id: eventId },
+				body: data
+			});
+			saveStatus = res.response?.status;
+			if (res.error) throw markSilent(res.error);
+			return res.data;
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['event-admin', eventId, 'ticket-tiers'] });
+			onClose();
+		}
+	}));
+
+	const tierUpdateMutation = createMutation(() => ({
+		mutationFn: async (data: TicketTierUpdateSchema) => {
+			if (!tier?.id) throw new Error('Cannot update tier without an id');
+			const res = await eventadminticketsUpdateTicketTier({
+				path: { event_id: eventId, tier_id: tier.id },
+				body: data
+			});
+			saveStatus = res.response?.status;
+			if (res.error) throw markSilent(res.error);
+			return res.data;
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['event-admin', eventId, 'ticket-tiers'] });
+			onClose();
+		}
+	}));
+
+	const tierDeleteMutation = createMutation(() => ({
+		mutationFn: async () => {
+			if (!tier?.id) throw new Error('Cannot delete tier without an id');
+			const res = await eventadminticketsDeleteTicketTier({
+				path: { event_id: eventId, tier_id: tier.id }
+			});
+			if (res.error) throw markSilent(res.error);
+			return res.data;
+		},
+		onSuccess: () => {
+			queryClient.invalidateQueries({ queryKey: ['event-admin', eventId, 'ticket-tiers'] });
+			onClose();
+		}
+	}));
+
+	// Card + unknown rules: hold the save. Known-blocked legacy card tiers still save (J29.3).
+	const onlineSaveHeld = $derived(rules.status !== 'ready' && paymentMethod === 'online');
+
+	function handleSubmit(e: Event) {
+		e.preventDefault();
+		if (onlineSaveHeld) return;
+
+		// Determine the price value based on payment method and price type
+		// Normalize all decimal values to ensure dots (not commas) as decimal separator
+		let finalPrice: string;
+		if (paymentMethod === 'free') {
+			finalPrice = '0';
+		} else if (priceType === 'pwyc') {
+			// For PWYC (especially with Stripe), use minimum price as the price field
+			finalPrice = normalizeDecimalInput(pwycMin || '1');
+		} else {
+			// Fixed price
+			finalPrice = normalizeDecimalInput(price);
+		}
+
+		// Build the data object, omitting null values for pwyc fields
+		const baseData: TicketTierCreateSchema = {
+			name: name.trim(),
+			description: description.trim() || null,
+			payment_method: paymentMethod,
+			price_type: priceType,
+			price: finalPrice,
+			currency: currency as TicketTierCreateSchema['currency'],
+			manual_payment_instructions: manualPaymentInstructions.trim() || null,
+			total_quantity: totalQuantity ? parseInt(totalQuantity) : null,
+			sales_start_at: salesStartAt ? toTimezoneAwareISO(salesStartAt) : null,
+			sales_end_at: salesEndAt ? toTimezoneAwareISO(salesEndAt) : null,
+			sales_paused: salesPaused,
+			...checkInOffsetsPayload(eventContext.start, checkInPicks, tier),
+			visibility,
+			purchasable_by: purchasableBy,
+			restricted_to_membership_tiers_ids:
+				restrictedToMembershipTiersIds.length > 0 ? restrictedToMembershipTiersIds : null,
+			restrict_visibility_to_linked_invitations:
+				visibility === 'private' ? restrictVisibilityToLinkedInvitations : false,
+			restrict_purchase_to_linked_invitations:
+				purchasableBy === 'invited' || purchasableBy === 'invited_and_members'
+					? restrictPurchaseToLinkedInvitations
+					: false,
+			// VAT rate override (optional, cleared for free tiers)
+			vat_rate:
+				paymentMethod === 'free'
+					? null
+					: vatRateOverride !== ''
+						? parseFloat(normalizeDecimalInput(vatRateOverride))
+						: null,
+			// Venue and seating configuration
+			seat_assignment_mode: seatAssignmentMode,
+			max_tickets_per_user: maxTicketsPerUser ? parseInt(maxTicketsPerUser) : null,
+			// Per-mode venue/sector nulling mirrors server validation
+			// (see tier-seating-payload.ts).
+			...buildTierSeatingFields(seatAssignmentMode, venueId, sectorId),
+			// Cancellation & refund policy (only meaningful for paid tiers)
+			allow_user_cancellation: paymentMethod === 'free' ? false : allowUserCancellation,
+			cancellation_deadline_hours:
+				paymentMethod !== 'free' && allowUserCancellation && cancellationDeadlineHours !== null
+					? cancellationDeadlineHours
+					: null,
+			refund_policy: paymentMethod !== 'free' && allowUserCancellation ? refundPolicy : null
+		};
+
+		// Sent ONLY when dirty (omit = leave the stored map untouched, {} =
+		// clear, non-empty = replace) — see buildCategoryPricesPayload.
+		const categoryPricesPayload = buildCategoryPricesPayload(
+			seatAssignmentMode,
+			initialCategoryPrices,
+			categoryPrices
+		);
+		if (categoryPricesPayload !== undefined) {
+			baseData.category_prices = categoryPricesPayload;
+		}
+
+		// Only include pwyc fields if price_type is 'pwyc' and they have values
+		if (priceType === 'pwyc') {
+			if (pwycMin) {
+				baseData.pwyc_min = normalizeDecimalInput(pwycMin);
+			}
+			if (pwycMax) {
+				baseData.pwyc_max = normalizeDecimalInput(pwycMax);
+			}
+		}
+
+		if (!tier) {
+			// Create new tier
+			tierCreateMutation.mutate(baseData);
+		} else {
+			// Update existing tier
+			tierUpdateMutation.mutate(baseData as TicketTierUpdateSchema);
+		}
+	}
+
+	function handleDelete() {
+		if (!tier) return;
+		if (!confirm(m['tierForm.deleteConfirm']({ name: tier.name }))) return;
+		tierDeleteMutation.mutate();
+	}
+
+	const isPending = $derived(
+		tierCreateMutation.isPending || tierUpdateMutation.isPending || tierDeleteMutation.isPending
+	);
+	const error = $derived(
+		tierCreateMutation.error || tierUpdateMutation.error || tierDeleteMutation.error
+	);
+</script>
+
+<Dialog open onOpenChange={onClose}>
+	<DialogContent class="max-h-[90vh] overflow-y-auto sm:max-w-[600px]">
+		<DialogHeader>
+			<DialogTitle
+				>{tier ? m['tierForm.editTicketTier']() : m['tierForm.createTicketTier']()}</DialogTitle
+			>
+		</DialogHeader>
+
+		<form onsubmit={handleSubmit} class="space-y-4">
+			<!-- Tier Name -->
+			<div>
+				<Label for="tier-name">
+					{m['tierForm.tierNameLabel']()} <span class="text-destructive">*</span>
+				</Label>
+				<Input
+					id="tier-name"
+					bind:value={name}
+					required
+					maxlength={150}
+					placeholder={m['tierForm.tierNamePlaceholder']()}
+					disabled={isPending}
+				/>
+			</div>
+
+			<!-- Description -->
+			<div>
+				<MarkdownEditor
+					id="tier-description"
+					label={m['tierForm.descriptionOptional']()}
+					bind:value={description}
+					rows={3}
+					placeholder={m['tierForm.whatsIncludedPlaceholder']()}
+					disabled={isPending}
+				/>
+			</div>
+
+			<TierFormPaymentMethodSection
+				bind:paymentMethod
+				{isPending}
+				{organizationStripeConnected}
+				compliance={rules.compliance}
+				complianceStatus={rules.status}
+				onRetryCompliance={rules.onRetry}
+			/>
+
+			<!-- Price Settings (if not free) -->
+			{#if paymentMethod !== 'free'}
+				<TierFormPricingSection
+					bind:priceType
+					bind:currency
+					bind:price
+					bind:pwycMin
+					bind:pwycMax
+					{currencySymbol}
+					{isPending}
+					{platformFees}
+					showNetPayout={paymentMethod === 'online'}
+				/>
+			{/if}
+
+			<!-- VAT Rate Override (for paid tiers) -->
+			{#if paymentMethod !== 'free'}
+				<div>
+					<Label for="vat-rate-override">{m['tierForm.vatRateOverride']()}</Label>
+					<Input
+						id="vat-rate-override"
+						type="text"
+						inputmode="decimal"
+						value={vatRateOverride}
+						oninput={(e) => {
+							vatRateOverride = normalizeDecimalInput((e.currentTarget as HTMLInputElement).value);
+						}}
+						placeholder={m['tierForm.vatRateOverridePlaceholder']()}
+						disabled={isPending}
+					/>
+					<p class="mt-1 text-xs text-muted-foreground">
+						{m['tierForm.vatRateOverrideHelp']()}
+					</p>
+				</div>
+			{/if}
+
+			<!-- Manual Payment Instructions (for offline/at_the_door payments) -->
+			{#if paymentMethod === 'offline' || paymentMethod === 'at_the_door'}
+				<div>
+					<MarkdownEditor
+						id="payment-instructions"
+						label={m['tierForm.paymentInstructions']()}
+						bind:value={manualPaymentInstructions}
+						rows={3}
+						placeholder={m['tierForm.paymentInstructionsPlaceholder']()}
+						disabled={isPending}
+					/>
+					<p class="mt-1 text-xs text-muted-foreground">
+						{m['tierForm.paymentInstructionsHelp']()}
+					</p>
+				</div>
+			{/if}
+
+			<!-- Cancellation & Refunds (only for paid tiers) -->
+			{#if paymentMethod !== 'free'}
+				<div class="space-y-4 rounded-lg border border-border bg-muted/30 p-4">
+					<div class="flex items-center gap-2 text-sm font-medium">
+						<Undo2 class="h-4 w-4 text-primary" aria-hidden="true" />
+						{m['refundPolicy.sectionTitle']()}
+					</div>
+
+					<label class="flex cursor-pointer items-start gap-2">
+						<input
+							type="checkbox"
+							bind:checked={allowUserCancellation}
+							disabled={isPending}
+							class="mt-0.5 h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-primary"
+						/>
+						<div>
+							<span class="text-sm font-medium">
+								{m['refundPolicy.allowCancellationLabel']()}
+							</span>
+							<p class="text-xs text-muted-foreground">
+								{m['refundPolicy.allowCancellationHelp']()}
+							</p>
+						</div>
+					</label>
+
+					{#if allowUserCancellation}
+						<DurationInput
+							id="cancellation-deadline-hours"
+							label={m['refundPolicy.deadlineLabel']()}
+							helpText={m['refundPolicy.deadlineHelp']()}
+							bind:value={cancellationDeadlineHours}
+							storageUnit="hours"
+							defaultUnit="days"
+							emptyValue={null}
+							emptyLabel={m['refundPolicy.deadlineNoLimit']()}
+							disabled={isPending}
+						/>
+
+						<RefundPolicyEditor
+							value={refundPolicy}
+							disabled={isPending}
+							{currencySymbol}
+							onChange={(next) => (refundPolicy = next)}
+							onValidityChange={(valid) => (refundPolicyValid = valid)}
+						/>
+					{/if}
+				</div>
+			{/if}
+
+			<TierFormAvailabilitySection
+				bind:totalQuantity
+				bind:salesStartAt
+				bind:salesEndAt
+				{salesStartReadback}
+				{salesEndReadback}
+				bind:visibility
+				bind:purchasableBy
+				bind:restrictVisibilityToLinkedInvitations
+				bind:restrictPurchaseToLinkedInvitations
+				bind:restrictedToMembershipTiersIds
+				{membershipTiers}
+				bind:salesPaused
+				{isPending}
+			/>
+
+			<TierFormCheckInSection
+				bind:opensAt={checkInPicks.opensAt}
+				bind:closesAt={checkInPicks.closesAt}
+				{eventContext}
+				{isPending}
+			/>
+
+			<TierFormSeatingSection
+				bind:seatAssignmentMode
+				bind:maxTicketsPerUser
+				bind:sectorId
+				bind:categoryPrices
+				pricingCategories={sectorPricingCategories}
+				pricingGaps={tier?.pricing_gaps ?? []}
+				unsellableZones={tier?.unsellable_zones ?? []}
+				{currencySymbol}
+				{canUseSeatAssignment}
+				{venueId}
+				venuesLoading={venuesQuery.isLoading}
+				{selectedVenue}
+				{selectedVenueSectors}
+				standingSectors={standingVenueSectors}
+				{sectorRequired}
+				chartLoading={chartQuery.isLoading}
+				chartError={chartQuery.isError}
+				onRetryChart={() => chartQuery.refetch()}
+				{isPending}
+			/>
+
+			<!-- Form Actions -->
+			<div class="flex justify-between gap-2 border-t border-border pt-4">
+				<div>
+					{#if tier}
+						<Button type="button" variant="destructive" onclick={handleDelete} disabled={isPending}>
+							{tierDeleteMutation.isPending ? m['tierForm.deleting']() : m['tierForm.deleteTier']()}
+						</Button>
+					{/if}
+				</div>
+				<div class="flex gap-2">
+					<Button type="button" variant="outline" onclick={onClose} disabled={isPending}>
+						{m['tierForm.cancel']()}
+					</Button>
+					<Button
+						type="submit"
+						disabled={isPending ||
+							onlineSaveHeld ||
+							!name.trim() ||
+							!sectorValid ||
+							!checkInPicksValid(eventContext.start, checkInPicks) ||
+							(paymentMethod !== 'free' && allowUserCancellation && !refundPolicyValid)}
+						aria-describedby={onlineSaveHeld ? 'tier-online-blocked' : undefined}
+					>
+						{isPending
+							? m['tierForm.saving']()
+							: tier
+								? m['tierForm.saveChanges']()
+								: m['tierForm.createTier']()}
+					</Button>
+				</div>
+			</div>
+
+			{#if error}
+				{@const fieldErrors = extractFieldErrors(error)}
+				{@const errorMsg = extractErrorMessage(error)}
+				{@const isBillingError = isBillingInfoRequiredError(errorMsg)}
+				<!-- This panel renders inside DialogContent (bg-background), but the
+				     dimmed copy stops at /90 so it stays AA on a card surface too:
+				     5.61:1 / 5.18:1 dark, vs 4.71:1 / 4.40:1 at /80. Audited on both
+				     in scripts/audit-brand-themes.py. -->
+				<div class="rounded-lg bg-destructive/10 p-3" role="alert">
+					<p class="font-medium text-destructive">{m['tierForm.error']()}</p>
+
+					{#if fieldErrors.length > 0}
+						<p class="mt-1 text-sm text-destructive/90">
+							{m['tierForm.fieldErrorsTitle']()}
+						</p>
+						<ul class="mt-1 space-y-1">
+							{#each fieldErrors as { field, messages } (field)}
+								<li class="text-sm text-destructive/90">
+									<span class="font-medium">{tierFieldLabel(field)}:</span>
+									{messages.join(', ')}
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<p class="mt-1 text-sm text-destructive/90">{errorMsg}</p>
+						{#if saveStatus === 422 && paymentMethod === 'online' && !isBillingError}
+							<p class="mt-1 text-sm text-destructive/90">{m['compliance.tier.locationHint']()}</p>
+						{/if}
+					{/if}
+
+					{#if isBillingError}
+						<a
+							href={resolve('/(auth)/org/[slug]/admin/billing', { slug: organizationSlug })}
+							class="mt-2 inline-flex items-center gap-1 text-sm font-medium text-destructive underline hover:text-destructive/90"
+						>
+							{m['tierForm.completeBillingInfo']()}
+						</a>
+					{/if}
+				</div>
+			{/if}
+		</form>
+	</DialogContent>
+</Dialog>

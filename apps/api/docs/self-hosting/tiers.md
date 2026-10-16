@@ -1,0 +1,203 @@
+# Tiers & Configuration
+
+Revel is configured almost entirely through environment variables in `.env` and the set of Docker
+Compose profiles you enable. This page documents the two reference tiers and every knob you can
+turn.
+
+## Slim vs Full
+
+The two reference sizings differ in which optional profiles run and how generous the resource
+limits are:
+
+| Setting | Slim (~2 vCPU / 4 GB) | Full (8 vCPU / 32 GB) |
+| --- | --- | --- |
+| `COMPOSE_PROFILES` (wizard default) | *(empty)* | `observability,antivirus` |
+| Postgres `shared_buffers` | `256MB` | `4GB` |
+| Gunicorn workers | `2` | `6` |
+| Celery concurrency | `2` | `4` |
+
+Slim runs only the core services (caddy, frontend, web, celery, beat, postgres, pgbouncer, redis).
+Full adds antivirus scanning and the LGTM observability stack by default; the Telegram bot and the
+login canary stay optional. The tier is only a preset: either tier can run any of the profiles
+below, and the setup wizard asks about each one.
+
+## Compose profiles
+
+Each optional capability is gated behind a Compose profile. Add the profile name to
+`COMPOSE_PROFILES` (comma-separated) to run it:
+
+- **observability** — Prometheus, Loki, Tempo, Pyroscope, Alloy, and Grafana. See
+  [Observability](observability.md).
+- **antivirus** — the ClamAV daemon used by `FEATURE_MALWARE_SCAN`.
+- **telegram** — the Telegram bot process.
+- **canary** — the synthetic-monitoring canary.
+
+If you leave `COMPOSE_PROFILES` empty you get the Slim core. Remember to pair each profile with its
+feature flag — for example, running the `antivirus` profile but leaving `FEATURE_MALWARE_SCAN=False`
+just wastes RAM.
+
+## Environment knobs
+
+### Compose & resources
+
+- `COMPOSE_PROFILES` — comma-separated list of optional profiles to enable (see above).
+- `PG_SHARED_BUFFERS`, `PG_*` — PostgreSQL tuning (e.g. `shared_buffers`, work_mem). Slim uses
+  conservative values; Full scales them up.
+- Resource-limit vars — per-service CPU/memory limits (Gunicorn worker count, Celery concurrency,
+  container memory ceilings) used to fit the stack onto small or large hosts.
+
+### Domains
+
+- `FRONTEND_DOMAIN` — public hostname of the web app.
+- `API_DOMAIN` — public hostname of the API.
+- `GRAFANA_DOMAIN` — public hostname of Grafana, needed whenever the `observability` profile is
+  enabled, on either tier.
+- `BASE_URL` — **required in production.** The API's public HTTPS origin (e.g.
+  `https://api.example.org`). It builds absolute backend links in emails, including the
+  `List-Unsubscribe` one-click URL. The default, `http://localhost:8000`, only suits local
+  development.
+- `FRONTEND_BASE_URL` — **required in production.** The web app's public origin, used for links
+  into the app. `SiteSettings.frontend_base_url` (admin → Site settings) is seeded once from it
+  when the row is first created, so if you change `FRONTEND_BASE_URL` later, update that field too.
+
+The setup wizard writes both from your domains. With `DEBUG` off, `manage.py check` validates them
+at startup. The web container runs `migrate` on start, which runs the same checks, and so does
+the `telegram` container's `run_telegram_bot` (Celery workers and beat don't):
+
+| Check | Level | When |
+|---|---|---|
+| `common.E001` | Error: `check`/`migrate` fail, the API doesn't start | `BASE_URL` is empty, has no scheme, points at `localhost` or any loopback address, or is still the old default `demo.letsrevel.io` |
+| `common.W002` | Warning | `BASE_URL` is not `https://` |
+| `common.W003` | Warning | `FRONTEND_BASE_URL` is empty, has no scheme, or points at `localhost` or a loopback address |
+| `common.W004` | Warning | `DEFAULT_FROM_EMAIL` is on `letsrevel.io` but `BASE_URL` isn't, so you would be sending as our domain |
+
+### Feature flags
+
+Most default to `True` (production behaviour); set them to `False` to drop the corresponding
+dependency. `OIDC_PROVIDERS` is the exception — it is opt-in and empty by default, since it
+needs credentials from an identity provider to do anything (the opt-in rule is explained in
+[ADR-0008](../adr/0008-environment-feature-flags.md); the login flow itself in
+[ADR-0016](../adr/0016-oidc-relying-party.md)).
+
+- `FEATURE_MALWARE_SCAN` — when `False`, uploads skip the ClamAV scan and are marked clean
+  immediately. Lets you run without the `antivirus` profile.
+- `FEATURE_TELEGRAM` — when `False`, Telegram is stripped from notification delivery and the
+  linking endpoints return 404. Pair with leaving the `telegram` profile off.
+- `FEATURE_LLM_EVALUATION` — when `False`, automated questionnaire evaluation is disabled; manual
+  evaluation still works. Lets you run without an OpenAI key.
+- `FEATURE_ORGANIZATION_CREATION` — when `False`, regular users cannot create organizations; staff
+  and superusers still can. See below.
+- `OIDC_PROVIDERS` — opt-in, empty by default. A comma-separated list of provider keys; for each
+  key set `OIDC_<KEY>_ISSUER`, `OIDC_<KEY>_CLIENT_ID`, `OIDC_<KEY>_CLIENT_SECRET` and optionally
+  `OIDC_<KEY>_NAME` (button label), `OIDC_<KEY>_SCOPES` (default `openid email profile`) and
+  `OIDC_<KEY>_TOKEN_AUTH` (`client_secret_post`, the default, or `client_secret_basic` when the
+  client is registered for HTTP Basic authentication at the token endpoint).
+  Register `https://<your-api-host>/api/auth/oidc/<key>/callback` as the redirect URI at the
+  provider. Any OpenID Connect issuer works — Google (`https://accounts.google.com`), Keycloak
+  (`https://kc.example.org/realms/<realm>`), Authentik, Zitadel. With the default scopes Google
+  needs no app verification and does not apply its 100-user testing allowlist; publish the OAuth
+  consent screen to "In production" to drop the "app in testing" warning. Custom
+  `OIDC_<KEY>_SCOPES` that include sensitive or restricted Google scopes require Google's
+  verification regardless of publishing status. Sign-in (both linking to an existing account and
+  creating a new one) trusts the `email_verified` claim from every configured issuer, so only list
+  identity providers whose email verification you trust.
+  `OIDC_LOGIN_TOKEN_LIFETIME_SECONDS` (default `60`) controls how long the one-time hand-off
+  token from the callback to the frontend stays valid.
+- `OIDC_SIGNING_KEY_PATH` + `OAUTH_ISSUER` — opt-in, unset by default; not a `FEATURE_*` flag but
+  credential presence. With a readable RSA signing key and an issuer, Revel becomes an OAuth 2.1 /
+  OpenID Connect provider (third-party apps, MCP hosts, "Sign in with" your instance), and
+  `/api/version` reports `features.oauth_provider: true`. Without them every provider route is a
+  `404`. Setup, the `chmod 644` gotcha and tuning knobs: [OAuth provider setup](index.md#oauth-openid-connect-provider-setup-one-time).
+- `FEATURE_OBSERVABILITY` — master toggle for the metrics/traces/logs exporters and the async log
+  queue. Set `False` (and drop the `observability` profile) on Slim. Legacy alias:
+  `ENABLE_OBSERVABILITY` (deprecated). See [Observability](observability.md).
+
+### External listing platforms (Eventbrite)
+
+| Variable | Purpose |
+|---|---|
+| `INTEGRATIONS_EVENTBRITE_CLIENT_ID` | Eventbrite "API Key" from https://www.eventbrite.com/account-settings/apps |
+| `INTEGRATIONS_EVENTBRITE_CLIENT_SECRET` | Eventbrite "Client secret" |
+| `INTEGRATIONS_RATE_RESERVE` (default `200`) | Calls kept in reserve in the shared per-app-key hourly budget so organizer actions (push, pause) never starve behind the reconcile sweep |
+| `INTEGRATIONS_WEBHOOK_DELIVERY_RETENTION_DAYS` (default `30`) | Days a `WebhookDelivery` audit row or a finished `ImportJob` is kept before the daily prune sweep deletes it |
+
+Both empty → the provider is not offered. Register the app's OAuth redirect URI as
+`{BASE_URL}/api/integrations/eventbrite/callback` and set the application URL to `{BASE_URL}`.
+Eventbrite rejects `localhost` / `127.0.0.1` redirect URIs at its CDN, so local testing needs a
+hosts-file alias (e.g. `api.revel.test`) and `BASE_URL` pointing at it. Rate limit: 2000
+requests/hour per organization token **and** per app key (shared by every organization on this
+instance).
+
+Syncing an event mirrors its name, summary, description, dates, venue, and public fixed-price
+tiers (online or free) as ticket classes on the connected platform; pay-what-you-can, members-only,
+seated, and offline/at-the-door tiers are skipped (they stay Revel-only), and a missing cover image
+is flagged but doesn't block the sync. The first push always creates a draft on the platform —
+making it live is a separate, explicit "publish" action. After that, auto-sync is opt-in: enable it
+per connection (every pushed event) or override it per event, and it only ever keeps already-pushed
+listings up to date — it never pushes a new event on its own.
+
+Sold counts refresh from platform webhooks and a 15-minute reconcile; the reconcile stops when
+fewer than the reserve remain in the shared hourly budget.
+
+### Email
+
+- `EMAIL_DRY_RUN` — when `True`, outbound email is logged instead of sent. Useful for test
+  instances; never use it for a real instance, since verification mails won't be delivered.
+- SMTP settings — host, port, credentials, and from-address for real email.
+- `ORG_EMAIL_DOMAIN` (optional) — a dedicated sending domain such as `mail.<your-domain>` for
+  mail organizations send to people: announcements, invitations, event updates and reminders.
+  They go out as `"<Org> via Revel" <org-slug@ORG_EMAIL_DOMAIN>`. Unset, that mail uses the
+  domain of `DEFAULT_FROM_EMAIL`. A separate domain keeps the reputation of organization bulk mail
+  apart from account mail (verification, password reset, tickets). Authenticate it at your SMTP
+  provider first (see [DNS → Sending domain](dns-cloudflare.md#sending-domain-for-organization-mail)):
+  setting it before DKIM and DMARC pass makes all of that mail fail DMARC.
+- `EMAIL_WEBHOOK_SECRET` (optional) — turns on the bounce and complaint webhook (below). Unset, the
+  endpoint answers 404 and nothing is suppressed automatically.
+- `PENDING_INVITATION_DAILY_CAP` (default `200`) — how many invitations each organization can
+  send per UTC day to addresses that have no Revel account yet. `0` means unlimited. See
+  [pending invitation cap](../architecture/email-sending.md#pending-invitation-cap).
+- `ORG_NUDGE_REPLY_TO` (optional) — Reply-To on the [org setup nudges](../architecture/email-sending.md#org-setup-nudges),
+  so owners of stalled organizations can answer a person. Unset, the nudges have no Reply-To and
+  the personal check-in nudge never goes out. `ORG_NUDGE_SIGNATURE` (default `The Revel team`)
+  signs that check-in. The daily nudge task ships disabled; enable "Send org setup nudges" under
+  Periodic tasks in the Django admin after a dry run of `python manage.py org_nudges`.
+- `UNSUBSCRIBE_TOKEN_LIFETIME_DAYS` (default `3650`) — how long unsubscribe links in emails stay
+  valid. Mailbox providers show the one-click unsubscribe button on old mail too, so keep it long.
+
+Which mail users can and can't opt out of, and what each unsubscribe does, is described in
+[Email Sending & Opt-Out Policy](../architecture/email-sending.md).
+
+#### Bounce and complaint webhook
+
+Revel keeps a suppression list of addresses it must not email. Your email provider feeds it through
+a webhook; without one, bounces and spam complaints are not recorded and Revel keeps mailing those
+addresses. The receiver is built for Brevo transactional webhooks.
+
+1. Set `EMAIL_WEBHOOK_SECRET` to a long random value (`openssl rand -hex 32`) and restart the stack.
+2. In Brevo, add a **transactional** webhook with the URL
+   `https://revel:<secret>@<API_DOMAIN>/api/email-events/brevo`. Only the password is checked, so
+   the username can be anything. If you create the webhook through Brevo's API instead, you can
+   send the secret as a bearer token (`Authorization: Bearer <secret>`).
+3. Tick the events **Hard bounce**, **Spam** (complaint), **Blocked** and **Invalid email**. Other
+   events are accepted and ignored.
+
+Wrong or missing credentials get a 401 and change nothing. To let an address receive mail again,
+delete its row under **Email Suppressions** in the admin. Rows survive account deletion, so a
+re-registered address keeps its bounce, complaint or opt-out.
+
+!!! warning "Gmail complaints never reach the webhook"
+    Gmail doesn't forward spam reports to email providers. Register your sending domain in
+    [Google Postmaster Tools](https://postmaster.google.com/) and watch its spam rate there.
+
+## Single-org instances
+
+For a community that only ever needs one organization, set:
+
+```bash
+FEATURE_ORGANIZATION_CREATION=False
+```
+
+With this flag off, normal users who hit "create organization" receive a `403`, while your staff
+or superuser account can still create the single org from the admin or API. This is the
+recommended configuration for a personal or single-community instance — it keeps the public
+sign-up flow open while preventing arbitrary users from spinning up their own orgs on your box.

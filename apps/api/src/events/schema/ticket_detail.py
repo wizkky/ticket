@@ -1,0 +1,313 @@
+"""Ticket, payment, and check-in schemas."""
+
+import typing as t
+from decimal import Decimal
+from uuid import UUID
+
+from django.utils.translation import gettext as _
+from ninja import ModelSchema, Schema
+from pydantic import Field
+
+from accounts.schema import MemberUserSchema, MinimalRevelUserSchema
+from common.schema import StrippedString
+from common.signing import get_file_url
+from events import models
+from events.compliance.enforcement import ticket_fields
+from events.models import DiscountCode, Payment, Ticket, TicketAttribution, TicketSaleSource
+
+from .event import MinimalEventSchema
+from .organization import MemberVerificationSchema, MinimalOrganizationMemberSchema
+from .ticket_tier import Currencies, TicketTierSchema
+from .venue import MinimalSeatSchema
+
+if t.TYPE_CHECKING:
+    from events.service.member_scan_service import MemberScanResult
+
+
+class PaymentSchema(ModelSchema):
+    """Public representation of a Payment record."""
+
+    status: Payment.PaymentStatus
+    currency: Currencies
+    stripe_dashboard_url: str
+
+    class Meta:
+        model = Payment
+        exclude = ["user", "ticket", "raw_response"]
+
+
+class MinimalPaymentSchema(ModelSchema):
+    """Minimal payment info for inclusion in ticket schemas."""
+
+    status: Payment.PaymentStatus
+
+    class Meta:
+        model = Payment
+        fields = ["id", "status"]
+
+
+class TicketDiscountCodeSchema(ModelSchema):
+    """Minimal discount-code info for inclusion in admin ticket views."""
+
+    discount_type: DiscountCode.DiscountType
+
+    class Meta:
+        model = DiscountCode
+        fields = ["id", "code", "discount_type", "discount_value", "currency"]
+
+
+class TicketSeriesPassSchema(Schema):
+    """Minimal series-pass info for tickets materialized from a held series pass."""
+
+    held_pass_id: UUID
+    series_pass_id: UUID
+    name: str
+
+
+class TicketComplianceLineSchema(Schema):
+    """One compliance line printed on the ticket PDF and wallet passes (#1077).
+
+    ``key`` is stable (``organizer``, ``tax_id``, ``ticket_number``, ``issued_at``, ``price``,
+    ``notice``, plus country additions such as ``it_reservation``); ``label`` and ``value``
+    are translated to the request language.
+    """
+
+    key: str
+    label: str
+    value: str
+
+
+def _resolve_ticket_series_pass(obj: Ticket) -> TicketSeriesPassSchema | None:
+    """Resolve the series pass a ticket was materialized from, if any.
+
+    Shared by ``AdminTicketSchema`` and ``UserTicketSchema`` — both expose the same
+    ``series_pass`` shape.
+    """
+    held_pass = obj.held_pass
+    if held_pass is None:
+        return None
+    return TicketSeriesPassSchema(
+        held_pass_id=held_pass.id, series_pass_id=held_pass.series_pass_id, name=held_pass.series_pass.name
+    )
+
+
+class AdminTicketSchema(ModelSchema):
+    """Schema for pending tickets in admin interface.
+
+    Venue and sector info comes from tier (tier.venue, tier.sector).
+    Only seat is included at ticket level for assigned seating.
+    """
+
+    user: MemberUserSchema
+    tier: TicketTierSchema
+    payment: PaymentSchema | None = None
+    guest_name: str
+    seat: MinimalSeatSchema | None = None
+    membership: MinimalOrganizationMemberSchema | None = None
+    price_paid: Decimal | None = None
+    discount_code: TicketDiscountCodeSchema | None = None
+    discount_amount: Decimal | None = None
+    offline_refund_amount: Decimal | None = None
+    # How the ticket was issued (#1013) — tells a comp from a sale on the tier's payment method.
+    sale_source: TicketSaleSource | None = None
+    series_pass: TicketSeriesPassSchema | None = None
+    # Organizer-only (#922): deliberately absent from UserTicketSchema.
+    attribution: TicketAttribution | None = None
+    # True when a country policy made Revel skip this sale's attendee invoice (#1091).
+    invoice_skipped: bool = False
+
+    class Meta:
+        model = Ticket
+        fields = [
+            "id",
+            "status",
+            "tier",
+            "created_at",
+            "guest_name",
+            "seat",
+            "price_paid",
+            "discount_amount",
+            "offline_refund_amount",
+            "sale_source",
+        ]
+
+    @staticmethod
+    def resolve_membership(obj: Ticket) -> models.OrganizationMember | None:
+        """Resolve membership from prefetched org_membership_list."""
+        memberships = getattr(obj.user, "org_membership_list", None)
+        return memberships[0] if memberships else None
+
+    resolve_series_pass: t.ClassVar = staticmethod(_resolve_ticket_series_pass)
+
+    @staticmethod
+    def resolve_invoice_skipped(obj: Ticket) -> bool:
+        """From the list's annotation; one query for a single ticket."""
+        from events.service.skipped_fiscal_document_service import ticket_invoice_skipped
+
+        return ticket_invoice_skipped(obj)
+
+
+class TicketAttributionBucketSchema(Schema):
+    """One row of the organizer's attribution breakdown (#922).
+
+    A row with every tag ``None`` is the *direct* bucket: tickets bought without any
+    campaign tag in the URL.
+    """
+
+    utm_source: str | None = None
+    utm_medium: str | None = None
+    utm_campaign: str | None = None
+    utm_content: str | None = None
+    count: int
+
+
+class UserTicketSchema(ModelSchema):
+    """Schema for user's own tickets with event details.
+
+    Venue and sector info comes from tier (tier.venue, tier.sector).
+    Only seat is included at ticket level for assigned seating.
+    """
+
+    event: MinimalEventSchema
+    tier: TicketTierSchema
+    status: Ticket.TicketStatus
+    apple_pass_available: bool
+    google_pass_available: bool
+    guest_name: str
+    payment: MinimalPaymentSchema | None = None
+    seat: MinimalSeatSchema | None = None
+    price_paid: Decimal | None = None
+    discount_amount: Decimal | None = None
+    pdf_url: str | None = None
+    pkpass_url: str | None = None
+    series_pass: TicketSeriesPassSchema | None = None
+    # Same lines as the PDF and wallet passes; select what ``Ticket.objects.full()`` does.
+    compliance_lines: list[TicketComplianceLineSchema]
+
+    class Meta:
+        model = Ticket
+        fields = [
+            "id",
+            "status",
+            "tier",
+            "created_at",
+            "checked_in_at",
+            "guest_name",
+            "seat",
+            "price_paid",
+            "discount_amount",
+        ]
+
+    @staticmethod
+    def resolve_payment(obj: Ticket) -> Payment | None:
+        """Resolve payment for pending tickets."""
+        if hasattr(obj, "payment"):
+            return obj.payment
+        return None
+
+    @staticmethod
+    def resolve_pdf_url(obj: Ticket) -> str | None:
+        """Resolve cached PDF file to signed URL."""
+        return get_file_url(obj.pdf_file)
+
+    @staticmethod
+    def resolve_pkpass_url(obj: Ticket) -> str | None:
+        """Resolve cached pkpass file to signed URL."""
+        return get_file_url(obj.pkpass_file)
+
+    @staticmethod
+    def resolve_compliance_lines(obj: "Ticket | UserTicketSchema") -> list[TicketComplianceLineSchema]:
+        """Resolve the ticket's compliance lines from the shared PDF/wallet source.
+
+        A response wrapping an already-built ``UserTicketSchema`` (``BatchCheckoutResponse``,
+        ``GuestCheckoutResponseSchema``, ...) re-runs resolvers on the schema instance, not
+        the ``Ticket``: keep the lines it already resolved.
+        """
+        if isinstance(obj, UserTicketSchema):
+            return obj.compliance_lines
+        return [TicketComplianceLineSchema(key=f.key, label=f.label, value=f.value) for f in ticket_fields(obj)]
+
+    resolve_series_pass: t.ClassVar = staticmethod(_resolve_ticket_series_pass)
+
+
+class CheckInResponseSchema(ModelSchema):
+    """Schema for ticket check-in response."""
+
+    kind: t.Literal["checked_in"] = "checked_in"
+    user: MinimalRevelUserSchema
+    tier: TicketTierSchema | None = None
+    price_paid: Decimal | None = None
+    seat: MinimalSeatSchema | None = None
+    sector_name: str | None = None
+
+    class Meta:
+        model = Ticket
+        fields = ["id", "status", "checked_in_at", "tier", "price_paid", "seat"]
+
+    @staticmethod
+    def resolve_sector_name(obj: Ticket) -> str | None:
+        """Sector name for door staff redirecting attendees ("Stalls, Row C seat 12")."""
+        return obj.sector.name if obj.sector is not None else None
+
+
+class TicketGuestNameUpdateSchema(Schema):
+    """Payload for renaming a ticket holder.
+
+    Required: an omitted field is a 422, so ``PATCH {}`` can never silently clear a
+    name. Clearing is an explicit ``""`` (only allowed when the event doesn't
+    require names).
+    """
+
+    guest_name: StrippedString = Field(..., max_length=255)
+
+
+class ConfirmPaymentSchema(Schema):
+    """Optional payload for confirming offline/at-the-door ticket payment.
+
+    price_paid is required for PWYC tiers and must be omitted for fixed-price tiers.
+    """
+
+    price_paid: Decimal | None = Field(None, gt=0)
+
+
+class MemberScanTicketSummarySchema(Schema):
+    """Minimal ticket row for the multiple-tickets member-scan outcome."""
+
+    id: UUID
+    tier_name: str | None = None
+    status: Ticket.TicketStatus
+
+
+class MemberScanResponseSchema(Schema):
+    """Member-card scan outcome when no ticket was checked in.
+
+    ``kind`` discriminates against ``CheckInResponseSchema`` in the check-in
+    union. ``tickets`` is empty for the no-ticket outcome and lists the
+    member's non-cancelled tickets when there are several (staff must scan
+    the specific ticket QR — the endpoint never guesses which one to burn).
+    """
+
+    kind: t.Literal["member"] = "member"
+    member: MemberVerificationSchema
+    tickets: list[MemberScanTicketSummarySchema] = Field(default_factory=list)
+    detail: str
+
+    @classmethod
+    def from_result(cls, result: "MemberScanResult") -> "MemberScanResponseSchema":
+        """Build the no-check-in scan response (zero or multiple tickets)."""
+        if result.tickets:
+            detail = str(_("This member holds multiple tickets for this event. Scan the specific ticket QR."))
+        else:
+            detail = str(_("This member has no ticket for this event."))
+        return cls(
+            member=MemberVerificationSchema.from_member(result.member),
+            tickets=[
+                MemberScanTicketSummarySchema(
+                    id=tk.id,
+                    tier_name=tk.tier.name if tk.tier else None,
+                    status=t.cast(Ticket.TicketStatus, tk.status),
+                )
+                for tk in result.tickets
+            ],
+            detail=detail,
+        )

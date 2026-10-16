@@ -1,0 +1,349 @@
+"""This module contains the controllers for the authentication app."""
+
+import typing as t
+
+from django.http import HttpRequest
+from django.utils.translation import gettext_lazy as _
+from ninja import File, Path
+from ninja.files import UploadedFile
+from ninja_extra import api_controller, route, status
+
+from accounts import schema
+from accounts.models import RevelUser
+from accounts.schema import (
+    LanguageUpdateSchema,
+    ProfileUpdateSchema,
+    RevelUserSchema,
+)
+from accounts.service import account as account_service
+from accounts.service import oidc as oidc_service
+from accounts.service.auth import get_token_pair_for_user
+from accounts.service.turnstile import verify_turnstile
+from common.authentication import I18nJWTAuth, ScopedJWTAuth
+from common.client_ip import get_client_ip
+from common.controllers.base import UserAwareController
+from common.schema import EmailSchema, ErrorDetail, ResponseMessage
+from common.service.upload_service import safe_save_uploaded_file
+from common.throttling import UserDataExportThrottle, UserRegistrationThrottle, WriteThrottle
+from common.thumbnails.service import delete_image_with_derivatives
+from oauth.permissions import RequireScope
+from revel.oidc_config import KEY_PATTERN
+
+
+# No class-level throttle: routes inherit the API default pair (anon by IP, user
+# by pk). An anonymous-only throttle here would leave authenticated routes
+# unlimited, because AnonRateThrottle yields no cache key for logged-in users.
+@api_controller("/account", tags=["Account"], auth=I18nJWTAuth())
+class AccountController(UserAwareController):
+    @route.post(
+        "/export-data",
+        response={200: ResponseMessage},
+        url_name="export-data",
+        throttle=UserDataExportThrottle(),
+    )
+    def export_data(self) -> ResponseMessage:
+        """Request a GDPR-compliant export of all personal data.
+
+        Initiates an asynchronous export of all user data including profile, events, tickets,
+        and submissions. The export will be emailed to the user when ready. Rate-limited to
+        prevent abuse.
+        """
+        account_service.start_data_export(self.user())
+        return ResponseMessage(message=str(_("Your data export has been initiated.")))
+
+    @route.get(
+        "/me",
+        response=RevelUserSchema,
+        url_name="me",
+        # The ONLY route on this controller that accepts a third-party app token (R-89):
+        # registration, password reset, email change, deletion, 2FA and every profile write
+        # stay session-only, so the opt-in is per-route rather than class-level.
+        auth=ScopedJWTAuth(),
+        permissions=[RequireScope("me:read")],
+    )
+    def me(self) -> RevelUser:
+        """Retrieve the authenticated user's profile information.
+
+        Returns complete user profile including email, name, location preferences, and 2FA status.
+        Use this to display user info in the UI or verify authentication status.
+        """
+        # referral_code is a OneToOneField; a single lazy load is fine here.
+        # select_related would require re-querying the user we already have from auth.
+        return self.user()
+
+    @route.get("/identities", response=list[schema.ExternalIdentitySchema], url_name="identities_list")
+    def list_identities(self) -> list[schema.ExternalIdentitySchema]:
+        """List the OpenID Connect identities linked to the authenticated account."""
+        return [
+            schema.ExternalIdentitySchema(
+                provider=identity.provider,
+                provider_name=oidc_service.provider_display_name(identity.provider),
+                email=identity.email,
+                created_at=identity.created_at,
+            )
+            for identity in oidc_service.list_identities(self.user())
+        ]
+
+    @route.delete(
+        "/identities/{provider}",
+        response={204: None, 400: ErrorDetail, 404: ErrorDetail},
+        url_name="identities_unlink",
+        throttle=WriteThrottle(),
+    )
+    def unlink_identity(self, provider: t.Annotated[str, Path(..., pattern=KEY_PATTERN)]) -> tuple[int, None]:
+        """Unlink an OpenID Connect identity.
+
+        Refused (400) if the account has no usable password and no other linked identity,
+        since that would leave no way to sign in.
+        """
+        oidc_service.unlink_identity(self.user(), provider)
+        return 204, None
+
+    @route.put(
+        "/me",
+        response=RevelUserSchema,
+        url_name="update-profile",
+    )
+    def update_profile(self, payload: ProfileUpdateSchema) -> RevelUser:
+        """Update the authenticated user's profile information.
+
+        Allows updating name, location preferences, and other profile fields. Only provided
+        fields are updated. Returns the updated user profile.
+        """
+        return account_service.update_profile(self.user(), payload)
+
+    @route.put(
+        "/language",
+        response={200: None},
+        url_name="update-language",
+    )
+    def update_language(self, payload: LanguageUpdateSchema) -> tuple[int, None]:
+        """Update the authenticated user's preferred language.
+
+        Sets the user's preferred language for UI and communications.
+        Returns status 200 on success.
+        """
+        account_service.update_language(self.user(), payload.language)
+        return 200, None
+
+    @route.post(
+        "/register",
+        tags=["Account"],
+        response={201: RevelUserSchema},
+        url_name="register-account",
+        auth=None,
+        throttle=UserRegistrationThrottle(),
+    )
+    def register(self, payload: schema.RegisterUserSchema) -> tuple[int, RevelUser]:
+        """Create a new user account with email and password.
+
+        Creates a new account and sends a verification email. The account is created but not
+        fully active until email is verified via POST /account/verify. If an unverified account
+        with the same email exists, resends the verification email. Returns 400 if a verified
+        account already exists. When bot protection is configured, a valid `turnstile_token` is
+        required (400 otherwise).
+        """
+        request = t.cast(HttpRequest, self.context.request)  # type: ignore[union-attr]
+        verify_turnstile(payload.turnstile_token, get_client_ip(request))
+        user, _ = account_service.register_user(payload)
+        return status.HTTP_201_CREATED, user
+
+    @route.post(
+        "/verify",
+        tags=["Account"],
+        response=schema.VerifyEmailResponseSchema,
+        url_name="verify-email",
+        auth=None,
+    )
+    def verify_email(self, payload: schema.VerifyEmailSchema) -> schema.VerifyEmailResponseSchema:
+        """Verify email address using the token from the verification email.
+
+        Call this with the token received via email after registration. On success, activates
+        the account and returns the verified user profile along with JWT tokens for immediate login.
+        The verification token is single-use and expires after a set period.
+        """
+        user = account_service.verify_email(payload.token)
+        token = get_token_pair_for_user(user)
+        return schema.VerifyEmailResponseSchema(user=RevelUserSchema.from_orm(user), token=token)
+
+    @route.post(
+        "/verify-resend",
+        tags=["Account"],
+        response=ResponseMessage,
+        url_name="resend-verification-email",
+        auth=None,
+        throttle=UserRegistrationThrottle(),
+    )
+    def resend_verification_email(self, payload: schema.ResendVerificationSchema) -> ResponseMessage:
+        """Resend the email verification link for a given email address.
+
+        Use this if the original verification email was lost or expired. Always returns a
+        success message to prevent user enumeration attacks. The email is only sent if the
+        account exists and is not yet verified. An optional relative ``return_url`` is carried
+        in the verification link as ``returnUrl``, exactly as ``POST /register`` does.
+        """
+        account_service.resend_verification_email(payload.email, return_url=payload.return_url)
+        return ResponseMessage(message=str(_("Verification email sent.")))
+
+    @route.post(
+        "/delete-request",
+        tags=["Account"],
+        response=ResponseMessage,
+        url_name="delete-account-request",
+    )
+    def delete_account_request(self) -> ResponseMessage:
+        """Initiate GDPR-compliant account deletion by sending confirmation email.
+
+        Sends an email with a deletion confirmation link. The account is not deleted until
+        the user confirms via POST /account/delete-confirm with the token from the email.
+        This two-step process prevents accidental deletions.
+        """
+        account_service.request_account_deletion(self.user())
+        return ResponseMessage(message=str(_("An email has been sent.")))
+
+    @route.post(
+        "/delete-confirm",
+        tags=["Account"],
+        response={200: ResponseMessage, 409: schema.ReferralForfeitureSchema},
+        url_name="delete-account-confirm",
+        auth=None,
+    )
+    def delete_account_confirm(self, payload: schema.DeleteAccountConfirmSchema) -> ResponseMessage:
+        """Permanently delete the account using the confirmation token from email.
+
+        Call this with the token received via email after POST /account/delete-request.
+        This action is irreversible and deletes all user data. The deletion is processed
+        asynchronously in the background. The deletion token is single-use and expires
+        after a set period.
+
+        Returns 409 with a `referral_forfeiture_confirmation_required` payload when the
+        account holds unpaid referral payouts that deletion would forfeit. The token is
+        not consumed — re-submit it with `force=true` to proceed.
+        """
+        account_service.confirm_account_deletion(payload.token, force=payload.force)
+        return ResponseMessage(
+            message=str(_("Your account deletion has been initiated and will be processed shortly."))
+        )
+
+    @route.post(
+        "/password/reset-request",
+        tags=["Account"],
+        response=ResponseMessage,
+        url_name="reset-password-request",
+        auth=None,
+        throttle=UserRegistrationThrottle(),
+    )
+    def reset_password_request(self, payload: EmailSchema) -> ResponseMessage:
+        """Request a password reset by email.
+
+        Sends a password reset link to the provided email if an account exists. Always returns
+        a success message to prevent user enumeration attacks. Google SSO users cannot use this
+        endpoint. After receiving the email, use POST /account/password/reset with the token.
+        """
+        account_service.request_password_reset(payload.email)
+        return ResponseMessage(message=str(_("A password reset link will be sent.")))
+
+    @route.post(
+        "/password/reset",
+        tags=["Account"],
+        response=ResponseMessage,
+        url_name="reset-password",
+        auth=None,
+    )
+    def reset_password(self, payload: schema.PasswordResetSchema) -> ResponseMessage:
+        """Reset password using the token from the password reset email.
+
+        Call this with the token received via email after POST /account/password/reset-request.
+        The new password must meet security requirements. The reset token is single-use and
+        expires after a set period. After reset, the user must login again with the new password:
+        every existing session is signed out and every connected third-party app is disconnected.
+        """
+        account_service.reset_password(payload.token, payload.password1)
+        return ResponseMessage(message=str(_("Password reset successfully.")))
+
+    @route.post(
+        "/email-change-request",
+        tags=["Account"],
+        response=ResponseMessage,
+        url_name="email-change-request",
+        throttle=WriteThrottle(),
+    )
+    def email_change_request(self, payload: schema.EmailChangeRequestSchema) -> ResponseMessage:
+        """Begin a self-served email change.
+
+        Validates the current password, ensures the new address is available, issues a
+        single-use JWT, and emails the confirmation link to the **new** address. A
+        separate informational notice is sent to the current address. Returns 400 if
+        the new address is already in use; returns the generic success message when the
+        target is globally banned, to avoid signalling ban presence.
+
+        Args:
+            payload: Schema with ``new_email`` (lowercased by the schema validator)
+                and the user's current ``password``.
+
+        Returns:
+            A generic success message indicating that the confirmation link was sent.
+        """
+        account_service.request_email_change(
+            user=self.user(),
+            new_email=payload.new_email,
+            password=payload.password,
+        )
+        return ResponseMessage(message=str(_("A confirmation link has been sent to the new email address.")))
+
+    @route.post(
+        "/email-change-confirm",
+        tags=["Account"],
+        response=schema.EmailChangeResponseSchema,
+        url_name="email-change-confirm",
+        auth=None,
+        throttle=WriteThrottle(),
+    )
+    def email_change_confirm(self, payload: schema.EmailChangeConfirmSchema) -> schema.EmailChangeResponseSchema:
+        """Confirm an email change using the token sent to the new address.
+
+        Swaps email/username, blacklists all existing JWTs for the user (email is an
+        identity primitive), and issues a fresh token pair so the confirming device
+        stays signed in. The confirmation token is single-use.
+
+        Args:
+            payload: Schema containing the single-use email-change token.
+
+        Returns:
+            The updated user and a fresh JWT token pair for the confirming device.
+        """
+        user = account_service.confirm_email_change(payload.token)
+        token = get_token_pair_for_user(user)
+        return schema.EmailChangeResponseSchema(user=RevelUserSchema.from_orm(user), token=token)
+
+    @route.post(
+        "/me/upload-profile-picture",
+        response=RevelUserSchema,
+        url_name="upload-profile-picture",
+        throttle=WriteThrottle(),
+    )
+    def upload_profile_picture(self, profile_picture: File[UploadedFile]) -> RevelUser:
+        """Upload a profile picture for the authenticated user.
+
+        The image will have EXIF metadata stripped for privacy.
+        Supported formats: jpg, jpeg, png, gif, webp (max 10MB).
+        """
+        user = self.user()
+        return safe_save_uploaded_file(
+            instance=user,
+            field="profile_picture",
+            file=profile_picture,
+            uploader=user,
+        )
+
+    @route.delete(
+        "/me/delete-profile-picture",
+        response={204: None},
+        url_name="delete-profile-picture",
+        throttle=WriteThrottle(),
+    )
+    def delete_profile_picture(self) -> tuple[int, None]:
+        """Delete the authenticated user's profile picture and its derivatives."""
+        user = self.user()
+        delete_image_with_derivatives(user, "profile_picture")
+        return 204, None

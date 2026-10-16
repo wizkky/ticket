@@ -1,0 +1,344 @@
+# src/events/admin/event.py
+"""Admin classes for Event and related models."""
+
+import typing as t
+
+from django.contrib import admin
+from django.db.models import Count, IntegerField, OuterRef, Subquery
+from django.db.models.functions import Coalesce
+from django.urls import reverse
+from django.utils.html import format_html
+from django.utils.safestring import mark_safe
+from unfold.admin import ModelAdmin
+from unfold.contrib.filters.admin import AutocompleteSelectFilter
+
+from events import models
+from events.admin.base import (
+    EventInvitationInline,
+    EventLinkMixin,
+    EventRSVPInline,
+    EventWaitListInline,
+    OrganizationLinkMixin,
+    TicketInline,
+    TicketTierInline,
+    UserLinkMixin,
+    WaitlistOfferInline,
+)
+
+
+@admin.register(models.Event)
+class EventAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin model for Events."""
+
+    list_display = [
+        "name",
+        "organization_link",
+        "event_type",
+        "visibility",
+        "status",
+        "start",
+        "attendee_count",
+        "requires_ticket",
+        "is_template",
+    ]
+    list_select_related = ["organization"]
+    list_filter = [
+        "status",
+        "visibility",
+        "event_type",
+        ("organization", AutocompleteSelectFilter),
+        "start",
+        "requires_ticket",
+        "waitlist_open",
+        "is_template",
+    ]
+    list_filter_submit = True
+    search_fields = ["name", "slug", "organization__name"]
+    autocomplete_fields = ["organization", "event_series", "city", "venue"]
+    prepopulated_fields = {"slug": ("name",)}
+    date_hierarchy = "start"
+    ordering = ["-start"]
+
+    tabs = [
+        ("Details", ["Details"]),
+        ("Attendees", ["RSVPs", "Tickets", "Invitations", "Waitlist"]),
+        ("Configuration", ["Tiers & Resources"]),
+    ]
+
+    fieldsets = [
+        (
+            "Details",
+            {
+                "fields": (
+                    "organization",
+                    ("name", "slug"),
+                    "venue",
+                    ("city", "address"),
+                    "description",
+                    "invitation_message",
+                    ("logo", "cover_art"),
+                )
+            },
+        ),
+        (
+            "Configuration",
+            {
+                "fields": (
+                    ("event_type", "visibility", "status"),
+                    "cancellation_reason",
+                    ("start", "end", "is_open_ended"),
+                    "event_series",
+                    ("max_attendees", "max_tickets_per_user"),
+                    (
+                        "potluck_open",
+                        "accept_invitation_requests",
+                        "accept_rsvp_notes",
+                        "can_attend_without_login",
+                        "require_ticket_names",
+                        "requires_full_profile",
+                    ),
+                    "requires_ticket",
+                    "visibility_settings",
+                    ("rsvp_before", "apply_before"),
+                    ("check_in_starts_at", "check_in_ends_at"),
+                )
+            },
+        ),
+        (
+            "Waitlist",
+            {
+                "fields": (
+                    "waitlist_open",
+                    "waitlist_time_window",
+                    "waitlist_batch_size",
+                    "waitlist_lottery_mode",
+                    "waitlist_cutoff_date",
+                ),
+            },
+        ),
+    ]
+
+    inlines = [
+        EventRSVPInline,
+        TicketInline,
+        EventInvitationInline,
+        EventWaitListInline,
+        TicketTierInline,
+        WaitlistOfferInline,
+    ]
+
+
+@admin.register(models.EventSeries)
+class EventSeriesAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
+    list_display = ["name", "slug", "organization_link", "is_active", "auto_publish"]
+    list_select_related = ["organization"]
+    list_filter = ["is_active", "auto_publish"]
+    search_fields = ["name", "slug", "organization__name"]
+    autocomplete_fields = ["organization", "template_event", "recurrence_rule"]
+    prepopulated_fields = {"slug": ("name",)}
+    readonly_fields = ["last_generated_until"]
+
+
+@admin.register(models.RecurrenceRule)
+class RecurrenceRuleAdmin(ModelAdmin):  # type: ignore[misc]
+    list_display = ["__str__", "frequency", "interval", "dtstart", "until", "count"]
+    list_filter = ["frequency"]
+    readonly_fields = ["rrule_string", "created_at", "updated_at"]
+    search_fields = ["rrule_string"]
+
+
+@admin.register(models.EventInvitation)
+class EventInvitationAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[misc]
+    list_display = ["__str__", "user_link", "event_link", "tier_names", "waives_questionnaire", "waives_purchase"]
+    list_select_related = ["user", "event"]
+    list_filter = [("event", AutocompleteSelectFilter)]
+    list_filter_submit = True
+    search_fields = ["user__username", "event__name"]
+    autocomplete_fields = ["user", "event"]
+    filter_horizontal = ["tiers"]
+
+    def get_queryset(self, request: t.Any) -> t.Any:
+        """Prefetch tiers to avoid N+1 queries in list display."""
+        return super().get_queryset(request).prefetch_related("tiers")
+
+    @admin.display(description="Tiers")
+    def tier_names(self, obj: models.EventInvitation) -> str:
+        names = [tier.name for tier in obj.tiers.all()]
+        return ", ".join(names) if names else "—"
+
+
+@admin.register(models.EventRSVP)
+class EventRSVPAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[misc]
+    list_display = ["__str__", "user_link", "event_link", "status", "note"]
+    list_select_related = ["user", "event"]
+    list_filter = ["status", ("event", AutocompleteSelectFilter)]
+    list_filter_submit = True
+    search_fields = ["user__username", "event__name"]
+    autocomplete_fields = ["user", "event"]
+
+
+@admin.register(models.PendingEventInvitation)
+class PendingEventInvitationAdmin(ModelAdmin, EventLinkMixin):  # type: ignore[misc]
+    """Admin for PendingEventInvitation model."""
+
+    list_display = ["email", "event_link", "tier_names", "waives_questionnaire", "waives_purchase", "created_at"]
+    list_select_related = ["event"]
+    list_filter = [
+        ("event", AutocompleteSelectFilter),
+        ("event__organization", AutocompleteSelectFilter),
+        "waives_questionnaire",
+        "waives_purchase",
+        "created_at",
+    ]
+    list_filter_submit = True
+    search_fields = ["email", "event__name"]
+    autocomplete_fields = ["event"]
+    filter_horizontal = ["tiers"]
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    def get_queryset(self, request: t.Any) -> t.Any:
+        """Prefetch tiers to avoid N+1 queries in list display."""
+        return super().get_queryset(request).prefetch_related("tiers")
+
+    @admin.display(description="Tiers")
+    def tier_names(self, obj: models.PendingEventInvitation) -> str:
+        names = [tier.name for tier in obj.tiers.all()]
+        return ", ".join(names) if names else "—"
+
+
+@admin.register(models.EventToken)
+class EventTokenAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[misc]
+    """Admin for EventToken model."""
+
+    list_display = ["__str__", "name", "event_link", "issuer_link", "uses_display", "expires_at", "created_at"]
+    list_select_related = ["event", "issuer"]
+    list_filter = [
+        ("event", AutocompleteSelectFilter),
+        ("event__organization", AutocompleteSelectFilter),
+        "expires_at",
+        "created_at",
+    ]
+    list_filter_submit = True
+    search_fields = ["name", "event__name", "issuer__username"]
+    autocomplete_fields = ["event", "issuer"]
+    filter_horizontal = ["ticket_tiers"]
+    readonly_fields = ["id", "created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Issuer")
+    def issuer_link(self, obj: models.EventToken) -> str:
+        url = reverse("admin:accounts_reveluser_change", args=[obj.issuer.id])
+        return format_html('<a href="{}">{}</a>', url, obj.issuer.username)
+
+    @admin.display(description="Uses")
+    def uses_display(self, obj: models.EventToken) -> str:
+        if obj.max_uses > 0:
+            return f"{obj.uses} / {obj.max_uses}"
+        return f"{obj.uses} / ∞"
+
+
+@admin.register(models.EventInvitationRequest)
+class EventInvitationRequestAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[misc]
+    """Admin for EventInvitationRequest model."""
+
+    list_display = ["__str__", "user_link", "event_link", "status_display", "decided_by_link", "created_at"]
+    list_select_related = ["user", "event", "decided_by"]
+    list_filter = [
+        "status",
+        ("event", AutocompleteSelectFilter),
+        ("event__organization", AutocompleteSelectFilter),
+        "created_at",
+    ]
+    list_filter_submit = True
+    search_fields = ["user__username", "user__email", "event__name", "message"]
+    autocomplete_fields = ["user", "event", "decided_by"]
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Status")
+    def status_display(self, obj: models.EventInvitationRequest) -> str:
+        colors: dict[t.Any, str] = {
+            models.EventInvitationRequest.InvitationRequestStatus.PENDING: "orange",
+            models.EventInvitationRequest.InvitationRequestStatus.APPROVED: "green",
+            models.EventInvitationRequest.InvitationRequestStatus.REJECTED: "red",
+        }
+        color = colors.get(obj.status, "gray")
+        return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
+
+    @admin.display(description="Decided By")
+    def decided_by_link(self, obj: models.EventInvitationRequest) -> str | None:
+        if not obj.decided_by:
+            return "—"
+        url = reverse("admin:accounts_reveluser_change", args=[obj.decided_by.id])
+        return format_html('<a href="{}">{}</a>', url, obj.decided_by.username)
+
+
+@admin.register(models.EventWaitList)
+class EventWaitListAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[misc]
+    """Admin for EventWaitList model."""
+
+    list_display = ["__str__", "user_link", "event_link", "position_display", "created_at"]
+    list_select_related = ["user", "event"]
+    list_filter = [("event", AutocompleteSelectFilter), ("event__organization", AutocompleteSelectFilter), "created_at"]
+    list_filter_submit = True
+    search_fields = ["user__username", "user__email", "event__name"]
+    autocomplete_fields = ["user", "event"]
+    readonly_fields = ["created_at", "updated_at", "position_display"]
+    date_hierarchy = "created_at"
+    ordering = ["event", "created_at"]
+
+    def get_queryset(self, request: t.Any) -> t.Any:
+        """Annotate the waitlist position to avoid a COUNT query per row."""
+        earlier = (
+            models.EventWaitList.objects.filter(event=OuterRef("event"), created_at__lt=OuterRef("created_at"))
+            .order_by()
+            .values("event")
+            .annotate(c=Count("pk"))
+            .values("c")
+        )
+        return (
+            super()
+            .get_queryset(request)
+            .annotate(_position=Coalesce(Subquery(earlier, output_field=IntegerField()), 0) + 1)
+        )
+
+    def position_display(self, obj: models.EventWaitList) -> int:
+        return int(getattr(obj, "_position", 0))
+
+    position_display.short_description = "Position"  # type: ignore[attr-defined]
+
+
+@admin.register(models.PotluckItem)
+class PotluckItemAdmin(ModelAdmin, EventLinkMixin):  # type: ignore[misc]
+    """Admin for PotluckItem model."""
+
+    list_display = [
+        "name",
+        "event_link",
+        "assignee_link",
+        "created_at",
+    ]
+    list_select_related = ["event", "assignee"]
+    list_filter = [("event", AutocompleteSelectFilter), ("event__organization", AutocompleteSelectFilter), "created_at"]
+    list_filter_submit = True
+    search_fields = ["name", "event__name", "assignee__username"]
+    autocomplete_fields = ["event", "assignee"]
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Assignee")
+    def assignee_link(self, obj: models.PotluckItem) -> str | None:
+        if not obj.assignee:
+            return "Unassigned"
+        url = reverse("admin:accounts_reveluser_change", args=[obj.assignee.id])
+        return format_html('<a href="{}">{}</a>', url, obj.assignee.username)
+
+
+@admin.register(models.AdditionalResource)
+class EventResourceAdmin(ModelAdmin):  # type: ignore[misc]
+    list_display = ["__str__", "name", "resource_type"]
+    list_filter = ["resource_type"]
+    search_fields = ["name", "description"]
+    autocomplete_fields = ["organization", "events", "event_series"]
+    filter_horizontal = ["events"]

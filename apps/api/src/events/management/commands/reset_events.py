@@ -1,0 +1,167 @@
+# src/events/management/commands/reset_events.py
+
+import typing as t
+
+from django.conf import settings
+from django.core.management import call_command
+from django.core.management.base import BaseCommand, CommandError
+from django.db import connection, transaction
+from django.db.models import Q
+
+from accounts.models import (
+    Referral,
+    ReferralCode,
+    ReferralPayout,
+    ReferralPayoutStatement,
+    RevelUser,
+)
+from events.models import (
+    EventSeries,
+    HeldSeriesPass,
+    MembershipSubscription,
+    Organization,
+    OrganizationMembershipRequest,
+    RecurrenceRule,
+    Ticket,
+)
+from notifications.models import EmailSuppression
+from questionnaires.models import Questionnaire
+
+
+class Command(BaseCommand):
+    """Reset demo data by deleting all organizations and example.com users, then re-bootstrapping.
+
+    This command is only available when settings.DEMO_MODE is True to prevent accidental
+    data deletion in production environments.
+    """
+
+    help = "Delete all organizations and @example.com users, then run bootstrap_events (DEMO_MODE only)"
+
+    def add_arguments(self, parser: t.Any) -> None:
+        """Add command arguments.
+
+        Args:
+            parser: The argument parser.
+        """
+        parser.add_argument(
+            "--no-input",
+            action="store_true",
+            help="Skip confirmation prompt (useful for periodic tasks)",
+        )
+
+    def handle(self, *args: t.Any, **options: t.Any) -> None:
+        """Execute the reset_events command.
+
+        Args:
+            args: Positional arguments.
+            options: Keyword arguments from command line.
+
+        Raises:
+            CommandError: If DEMO_MODE is not enabled.
+        """
+        # Safety check: only run in DEMO_MODE
+        if not settings.DEMO_MODE:
+            raise CommandError(
+                "This command can only be run when DEMO_MODE=True. "
+                "Set DEMO_MODE=True in your environment to use this command."
+            )
+
+        # Confirmation prompt (unless --no-input is specified)
+        if not options["no_input"]:
+            confirmation = input(
+                self.style.WARNING(
+                    "This will DELETE all organizations and all users with @example.com emails, "
+                    "then re-run bootstrap_events.\n"
+                    "Are you sure you want to continue? (yes/no): "
+                )
+            )
+            if confirmation.lower() != "yes":
+                self.stdout.write(self.style.ERROR("Reset cancelled."))
+                return
+
+        # Perform the reset in a transaction
+        # We clear on_commit hooks to prevent notification signals from failing when trying to
+        # access deleted users (cascade delete triggers signals but users are already gone)
+        with transaction.atomic():
+            # Count objects before deletion
+            org_count = Organization.objects.count()
+            user_count = RevelUser.objects.filter(~Q(email__endswith="@letsrevel.io")).count()
+
+            self.stdout.write(
+                self.style.WARNING(f"Deleting {org_count} organizations and {user_count} @example.com users...")
+            )
+
+            # Delete referral data first (PROTECT FKs prevent user deletion otherwise)
+            ReferralPayoutStatement.objects.all().delete()
+            ReferralPayout.objects.all().delete()
+            Referral.objects.all().delete()
+            ReferralCode.objects.all().delete()
+            self.stdout.write(self.style.SUCCESS("✓ Deleted referral data"))
+
+            # Break the EventSeries → template_event / recurrence_rule PROTECT
+            # FKs (added in migration 0066). Without this, the Organization
+            # cascade hits the PROTECT when it tries to delete a template Event,
+            # and the whole transaction rolls back. Production teardown of a
+            # series goes through the recurrence service, but this demo-reset
+            # path can shortcut by nulling the FKs first.
+            EventSeries.objects.update(template_event=None, recurrence_rule=None)
+            RecurrenceRule.objects.all().delete()
+            self.stdout.write(self.style.SUCCESS("✓ Detached recurring-event series from templates"))
+
+            # Break the MembershipSubscriptionPlan ← MembershipSubscription
+            # PROTECT FK. The Organization cascade reaches MembershipTier →
+            # MembershipSubscriptionPlan, but PROTECT on the subscription FK
+            # aborts the whole cascade if any subscription exists (active or
+            # otherwise). Production lifecycle goes through the subscriptions
+            # service, but the demo-reset path can shortcut by deleting
+            # subscriptions directly.
+            # Membership applications PROTECT both their tier and their plan, so
+            # they have to go before the subscriptions (whose deletion only
+            # SET_NULLs the application's subscription FK) and before the org
+            # cascade reaches MembershipTier.
+            OrganizationMembershipRequest.objects.all().delete()
+            MembershipSubscription.objects.all().delete()
+            self.stdout.write(self.style.SUCCESS("✓ Deleted membership applications and subscriptions"))
+
+            # Break the SeriesPass ← HeldSeriesPass PROTECT and the
+            # Ticket → HeldSeriesPass RESTRICT FKs. The Organization cascade
+            # reaches EventSeries → SeriesPass, but HeldSeriesPass PROTECTs its
+            # series_pass, which aborts the whole cascade if any held pass
+            # exists. Materialized pass tickets also RESTRICT their held_pass,
+            # so delete those tickets first, then the held passes. Production
+            # teardown goes through the series-pass service; the demo-reset path
+            # can shortcut by deleting them directly.
+            Ticket.objects.filter(held_pass__isnull=False).delete()
+            HeldSeriesPass.objects.all().delete()
+            self.stdout.write(self.style.SUCCESS("✓ Deleted series-pass holders"))
+
+            # Delete all organizations (cascade will handle related objects)
+            Organization.objects.all().delete()
+            Questionnaire.objects.all().delete()
+            self.stdout.write(self.style.SUCCESS(f"✓ Deleted {org_count} organizations"))
+
+            # Delete all users with @example.com emails
+            RevelUser.objects.filter(~Q(email__endswith="@letsrevel.io")).delete()
+            self.stdout.write(self.style.SUCCESS(f"✓ Deleted {user_count} @example.com users"))
+
+            # Suppressions are keyed by address (+tags stripped), not by user, so they
+            # outlive the user sweep: one suppressed e2e+x@example.com would silence
+            # every seeded e2e+*@example.com mailbox across reseeds. Real addresses
+            # keep theirs — a genuine bounce/complaint must survive a demo reset.
+            EmailSuppression.objects.filter(email__endswith="@example.com").delete()
+            self.stdout.write(self.style.SUCCESS("✓ Deleted @example.com email suppressions"))
+
+            # Clear on_commit hooks to prevent signals from trying to access deleted users
+            # This prevents "DoesNotExist" errors when signals try to access cascade-deleted users
+            connection.run_on_commit = []
+
+        # Re-bootstrap (outside transaction to allow bootstrap's own transaction handling)
+        self.stdout.write(self.style.MIGRATE_HEADING("Running bootstrap_events..."))
+        call_command("bootstrap_events")
+
+        self.stdout.write(
+            self.style.SUCCESS(
+                "\n✓ Reset complete! All organizations and @example.com users have been "
+                "deleted and fresh demo data has been created."
+            )
+        )

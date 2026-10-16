@@ -1,0 +1,161 @@
+from uuid import UUID
+
+from django.db.models import BooleanField, Case, QuerySet, Value, When
+from django.shortcuts import get_object_or_404
+from ninja_extra import api_controller, route
+
+from common.authentication import I18nJWTAuth, ScopedJWTAuth
+from common.controllers import UserAwareController
+from common.throttling import UserDefaultThrottle, WriteThrottle
+from events import schema
+from events.models import Event, PotluckItem
+from events.service import potluck_service, update_db_instance
+from oauth.permissions import RequireScope
+
+from .permissions import ManagePotluckPermission, PotluckItemPermission
+
+
+@api_controller(
+    "/events/{event_id}/potluck",
+    auth=ScopedJWTAuth(),
+    tags=["Potluck"],
+    throttle=WriteThrottle(),
+    # ``org:read`` is the admission baseline every other organizer route carries and the
+    # developer guide states as a rule; this controller was the one exception (R-128).
+    permissions=[RequireScope("org:read"), RequireScope("org:potluck")],
+)
+class PotluckController(UserAwareController):
+    @route.get(
+        "/",
+        url_name="list_potluck_items",
+        response=list[schema.PotluckItemRetrieveSchema],
+        throttle=UserDefaultThrottle(),
+        # Deliberately inherits the controller's ``RequireScope("org:potluck")``, whose label is
+        # "Manage potluck items" — so an app token needs a *manage* scope to perform what is, for
+        # an attendee, a read. That is more restrictive than the label implies, not less, and the
+        # alternative (``me:read``) would put a second scope on one small controller for one
+        # route. Revisit if attendee-side potluck ever grows beyond this list (M5).
+    )
+    def list_potluck_items(self, event_id: UUID) -> QuerySet[PotluckItem]:
+        """View all potluck items for this event.
+
+        Returns items users can bring, with flags indicating if each item is assigned and if you
+        own it. Available when event.potluck_open=true. Use this to display what's needed and
+        what you've claimed.
+        """
+        event = self.get_object_or_exception(self.get_event_queryset(include_past=True), pk=event_id)
+        user_id = self.user().id
+        return (
+            PotluckItem.objects.filter(event=event)
+            .annotate(
+                is_assigned=Case(
+                    When(assignee_id__isnull=False, then=Value(True)),
+                    default=Value(False),
+                    output_field=BooleanField(),
+                ),
+                is_owned=Case(
+                    When(assignee_id=user_id, then=Value(True)),
+                    default=Value(False),
+                    output_field=BooleanField(),
+                ),
+            )
+            .distinct()
+        )
+
+    @route.post(
+        "/",
+        url_name="create_potluck_item",
+        response=schema.PotluckItemRetrieveSchema,
+        # Session-only: ``create_potluck_item`` is not a ``PermissionKey``, so no scope can gate
+        # this write and leaving it on ``ScopedJWTAuth`` would make it scope-free (R-50/R-89).
+        auth=I18nJWTAuth(),
+        permissions=[PotluckItemPermission("create_potluck_item")],
+    )
+    def create_potluck_item(self, event_id: UUID, payload: schema.PotluckItemCreateSchema) -> PotluckItem:
+        """Add a new item to the event's potluck list.
+
+        Specify item name, quantity, and optional notes. Set claim=true to immediately
+        claim the item after creation. Attendees can also claim items later via
+        POST /{event_id}/potluck/{item_id}/claim. Requires permission to create potluck items.
+        """
+        event = self.get_object_or_exception(self.get_event_queryset(), pk=event_id)
+        data = payload.model_dump(exclude={"claim"})
+        assignee = self.user() if payload.claim else None
+        return potluck_service.create_potluck_item(event, created_by=self.user(), assignee=assignee, **data)
+
+    @route.put(
+        "/{item_id}",
+        url_name="update_potluck_item",
+        response=schema.PotluckItemRetrieveSchema,
+        permissions=[RequireScope("org:read"), RequireScope("org:potluck"), ManagePotluckPermission()],
+    )
+    def update_potluck_item(
+        self, event_id: UUID, item_id: UUID, payload: schema.PotluckItemCreateSchema
+    ) -> PotluckItem:
+        """Update a potluck item's details.
+
+        Modify item name, quantity, or notes. Requires permission to manage potluck items
+        (typically event organizers).
+        """
+        event = self.get_event(event_id)
+        potluck_item = self.get_object_or_exception(PotluckItem, id=item_id, event=event)
+        return update_db_instance(potluck_item, payload)  # type: ignore[no-any-return]
+
+    @route.delete(
+        "/{item_id}",
+        url_name="delete_potluck_item",
+        permissions=[RequireScope("org:read"), RequireScope("org:potluck"), ManagePotluckPermission()],
+        response={204: None},
+    )
+    def delete_potluck_item(self, event_id: UUID, item_id: UUID) -> None:
+        """Remove a potluck item from the event.
+
+        Deletes the item even if it's been claimed. Requires permission to manage potluck items.
+        """
+        event = self.get_event(event_id)
+        potluck_item = self.get_object_or_exception(PotluckItem, id=item_id, event=event)
+        potluck_item.delete()
+
+    @route.post(
+        "/{item_id}/claim",
+        url_name="claim_potluck_item",
+        response=schema.PotluckItemRetrieveSchema,
+        # Session-only for the same reason as ``create`` above.
+        auth=I18nJWTAuth(),
+        permissions=[PotluckItemPermission("claim_potluck_item")],
+    )
+    def claim_potluck_item(self, event_id: UUID, item_id: UUID) -> PotluckItem:
+        """Claim a potluck item to bring to the event.
+
+        Assigns the item to you. Returns 400 if already claimed by someone else. Use this when
+        you want to commit to bringing a specific item.
+        """
+        event = self.get_object_or_exception(self.get_event_queryset(), pk=event_id)
+        potluck_item = get_object_or_404(PotluckItem, id=item_id, event=event)
+        return potluck_service.claim_potluck_item(potluck_item, self.user())
+
+    @route.post(
+        "/{item_id}/unclaim",
+        url_name="unclaim_potluck_item",
+        response=schema.PotluckItemRetrieveSchema,
+        # Session-only for the same reason as ``create`` above.
+        auth=I18nJWTAuth(),
+        permissions=[PotluckItemPermission("claim_potluck_item")],
+    )
+    def unclaim_potluck_item(self, event_id: UUID, item_id: UUID) -> PotluckItem:
+        """Release a potluck item you previously claimed.
+
+        Makes the item available for others to claim. Returns 404 if the item isn't claimed
+        by you.
+        """
+        event = self.get_object_or_exception(self.get_event_queryset(), pk=event_id)
+        potluck_item = get_object_or_404(PotluckItem, id=item_id, event=event, assignee=self.user())
+        return potluck_service.unclaim_potluck_item(potluck_item)
+
+    def get_event_queryset(self, include_past: bool = False) -> QuerySet[Event]:
+        """Get the event queryset."""
+        return Event.objects.for_user(self.user(), include_past=include_past)
+
+    def get_event(self, event_id: UUID) -> Event:
+        """Get event by slug."""
+        return get_object_or_404(self.get_event_queryset(), pk=event_id)

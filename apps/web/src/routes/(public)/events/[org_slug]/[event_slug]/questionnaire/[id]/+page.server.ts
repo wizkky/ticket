@@ -1,0 +1,80 @@
+import type { PageServerLoad } from './$types';
+import { error, redirect } from '@sveltejs/kit';
+import {
+	eventpublicdetailsGetEventBySlugs,
+	eventpublicattendanceGetQuestionnaire
+} from '$lib/api/client';
+import { log } from '$lib/server/logger';
+import { throwIfTransientUpstream } from '$lib/server/upstream';
+import { loginRedirectPath } from '$lib/server/auth-guard';
+
+export const load: PageServerLoad = async ({ params, locals, url }) => {
+	const { org_slug, event_slug, id: questionnaireId } = params;
+
+	// Prepare headers with authentication if user is logged in
+	const headers: HeadersInit = {};
+	if (locals.user?.accessToken) {
+		headers['Authorization'] = `Bearer ${locals.user.accessToken}`;
+	}
+
+	// Fetch the event to get its ID (pass auth to see private events)
+	const {
+		data: event,
+		error: eventError,
+		response: eventResponse
+	} = await eventpublicdetailsGetEventBySlugs({
+		path: { event_slug, org_slug },
+		headers
+	});
+
+	if (eventError || !event) {
+		log.error('questionnaire_event_fetch_failed', {
+			error: eventError,
+			orgSlug: org_slug,
+			eventSlug: event_slug
+		});
+		throwIfTransientUpstream(eventResponse);
+		throw error(404, 'Event not found');
+	}
+
+	// Check authentication - questionnaire submission requires auth
+	if (!locals.user) {
+		throw redirect(302, loginRedirectPath(url));
+	}
+
+	// Fetch the questionnaire
+	const {
+		data: questionnaire,
+		error: questionnaireError,
+		response: questionnaireResponse
+	} = await eventpublicattendanceGetQuestionnaire({
+		path: { event_id: event.id, questionnaire_id: questionnaireId },
+		headers: {
+			Authorization: `Bearer ${locals.user.accessToken}`
+		}
+	});
+
+	if (questionnaireError || !questionnaire) {
+		log.error('questionnaire_fetch_failed', { error: questionnaireError, questionnaireId });
+		throwIfTransientUpstream(questionnaireResponse);
+		throw error(404, 'Questionnaire not found');
+	}
+
+	return {
+		event: {
+			id: event.id,
+			name: event.name,
+			slug: event.slug,
+			requires_ticket: event.requires_ticket,
+			organization: {
+				name: event.organization.name,
+				slug: event.organization.slug,
+				// Feeds the band's decorative LogoChip — which renders nothing when
+				// both are null (sticker-chip rule), so no fallback is needed here.
+				logo: event.organization.logo ?? null,
+				logo_thumbnail_url: event.organization.logo_thumbnail_url ?? null
+			}
+		},
+		questionnaire
+	};
+};

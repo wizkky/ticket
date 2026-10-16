@@ -1,0 +1,14 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<p>{% blocktranslate with item=context.item_name event=context.event_name %}<strong>"{{ item }}"</strong> has been removed from the potluck for <strong>{{ event }}</strong>.{% endblocktranslate %}</p>
+
+<div class="card card--danger">
+    <p><span class="label">{% trans "Item:" %}</span> {{ context.item_name }}</p>
+</div>
+
+<center>
+    <a href="{{ context.frontend_url }}" class="button">{% trans "View Potluck List" %}</a>
+</center>
+{% endblock %}

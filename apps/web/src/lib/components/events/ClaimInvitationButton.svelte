@@ -1,0 +1,121 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { Button } from '$lib/components/ui/button';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { eventpublicdiscoveryClaimInvitation } from '$lib/api/generated/sdk.gen';
+	import { Loader2, Check, LogIn } from '@lucide/svelte';
+	import { toast } from 'svelte-sonner';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import type { EventTokenSchema } from '$lib/api/generated/types.gen';
+	import { backendMessage } from '$lib/utils/api-error-detail';
+
+	interface Props {
+		tokenId: string;
+		tokenDetails?: EventTokenSchema | null;
+		class?: string;
+		onSuccess?: () => void;
+	}
+
+	const { tokenId, tokenDetails, class: className, onSuccess }: Props = $props();
+
+	const isAuthenticated = $derived(!!authStore.accessToken);
+	const accessToken = $derived(authStore.accessToken);
+
+	let isLoading = $state(false);
+	let showSuccess = $state(false);
+
+	async function handleClaim() {
+		if (!isAuthenticated) {
+			// Redirect to login with return URL
+			const currentUrl = window.location.pathname + window.location.search;
+			// eslint-disable-next-line svelte/no-navigation-without-resolve -- resolve() validates the route id; the appended query string cannot be expressed through resolve()
+			goto(`${resolve('/(public)/login', {})}?returnUrl=${encodeURIComponent(currentUrl)}`);
+			return;
+		}
+
+		isLoading = true;
+
+		try {
+			const response = await eventpublicdiscoveryClaimInvitation({
+				path: { token: tokenId },
+				headers: { Authorization: `Bearer ${accessToken}` }
+			});
+
+			if (response.error) {
+				// One of only two endpoints in the codebase that genuinely answer 400
+				// with `ResponseMessage` (`{message}`) — everywhere else that
+				// declaration was a lie and `.message` was undefined at runtime
+				// (backend #824). Its 404 is `{detail}`, so `backendMessage` probes
+				// both rather than picking one and dropping the other.
+				throw new Error(
+					backendMessage(response.error) ?? m['claimInvitationButton.failedToClaim']()
+				);
+			}
+
+			showSuccess = true;
+			toast.success(m['claimInvitationButton.claimedSuccessfully']());
+
+			onSuccess?.();
+
+			// Strip the ?et= token from the URL before reloading so the claim
+			// button doesn't reappear on the next page load
+			const url = new URL(window.location.href);
+			url.searchParams.delete('et');
+
+			setTimeout(() => {
+				window.location.replace(url.toString());
+			}, 1000);
+		} catch (err) {
+			console.error('Failed to claim invitation:', err);
+			toast.error(
+				(err instanceof Error && err.message) || m['claimInvitationButton.failedToClaim']()
+			);
+		} finally {
+			isLoading = false;
+		}
+	}
+
+	// Determine button text based on login state and token details
+	const buttonText = $derived.by(() => {
+		if (showSuccess) return m['claimInvitationButton.claimed']();
+		if (!isAuthenticated) return m['claimInvitationButton.loginToClaim']();
+		return m['claimInvitationButton.claimInvitation']();
+	});
+
+	// Check if token grants invitation
+	const grantsInvitation = $derived(tokenDetails?.grants_invitation ?? true);
+</script>
+
+<!--
+  Claim Invitation Button Component
+
+  Shows a button to claim an event invitation via token.
+  - If user is logged in: Shows "Claim Invitation" button
+  - If user is logged out: Shows "Log in to claim invitation" button and redirects to login
+  - On success: Reloads the page to show updated eligibility status
+
+  @component
+  @example
+  <ClaimInvitationButton
+    tokenId={tokenId}
+    tokenDetails={eventTokenDetails}
+  />
+-->
+{#if grantsInvitation}
+	<Button
+		variant="default"
+		disabled={isLoading || showSuccess}
+		onclick={handleClaim}
+		class={className}
+	>
+		{#if isLoading}
+			<Loader2 class="h-5 w-5 animate-spin" aria-hidden="true" />
+		{:else if showSuccess}
+			<Check class="h-5 w-5" aria-hidden="true" />
+		{:else if !isAuthenticated}
+			<LogIn class="h-5 w-5" aria-hidden="true" />
+		{/if}
+		<span>{buttonText}</span>
+	</Button>
+{/if}

@@ -1,0 +1,93 @@
+import { API_URL, fetchWithRetry } from './api';
+
+/**
+ * Backend availability probe.
+ *
+ * The whole suite is designed to run against a locally running, freshly
+ * bootstrapped backend (see tests/e2e/README.md). When that stack isn't up we
+ * skip journey specs politely instead of drowning the report in failures.
+ *
+ * The probe result is cached for the lifetime of the worker process.
+ */
+interface VersionInfo {
+	demo?: boolean;
+	features?: Record<string, boolean>;
+	// Left unknown on purpose: the payload is an unchecked JSON cast, so the
+	// entries are validated at the ssoProvider() lookup, not trusted here.
+	sso_providers?: unknown;
+}
+
+let probe: Promise<VersionInfo | null> | undefined;
+
+function versionInfo(): Promise<VersionInfo | null> {
+	probe ??= (async () => {
+		try {
+			// Generous timeout: the probe races the first burst of parallel-worker
+			// backend load; at 3s it intermittently timed out and silently skipped
+			// an entire project's tests (cached per worker).
+			const response = await fetchWithRetry(`${API_URL}/api/version`, {
+				signal: AbortSignal.timeout(10_000)
+			});
+			if (!response.ok) return null;
+			return (await response.json()) as VersionInfo;
+		} catch {
+			return null;
+		}
+	})();
+	return probe;
+}
+
+export async function isBackendUp(): Promise<boolean> {
+	return (await versionInfo()) !== null;
+}
+
+/**
+ * Whether the backend runs in DEMO_MODE. A few UI flows are deliberately
+ * disabled on demo instances (e.g. /register redirects to /login) — the
+ * affected specs skip themselves with this.
+ */
+export async function isDemoMode(): Promise<boolean> {
+	return (await versionInfo())?.demo === true;
+}
+
+/**
+ * Whether the backend lists a configured OIDC provider under this key.
+ * Reuses the cached /api/version probe. OIDC journeys self-skip when the
+ * stack was started without the Keycloak overlay (backend PR #920).
+ */
+export async function ssoProvider(key: string): Promise<{ key: string; name: string } | null> {
+	const info = await versionInfo();
+	// Defensive: a malformed /version payload should read as "no provider"
+	// (a skip with a clear message), not a throw inside beforeEach.
+	const providers = info?.sso_providers;
+	if (!Array.isArray(providers)) {
+		return null;
+	}
+	// Per-entry guard (mirrors the app's parseSsoProviders): a malformed entry
+	// — even a null — must not throw out of the lookup, and must not hide a
+	// valid provider elsewhere in the list.
+	return (
+		providers.find(
+			(provider): provider is { key: string; name: string } =>
+				typeof provider === 'object' &&
+				provider !== null &&
+				'key' in provider &&
+				provider.key === key &&
+				'name' in provider &&
+				typeof provider.name === 'string'
+		) ?? null
+	);
+}
+
+export const BACKEND_DOWN_MESSAGE =
+	`No backend at ${API_URL} — start it with \`make run\` (revel-backend) after ` +
+	'`make bootstrap`, see tests/e2e/README.md';
+
+/**
+ * Whether `/api/version` reports `features.<flag>: true`. Journeys for
+ * flag-gated surfaces (referral applications, the OAuth provider) self-skip
+ * with this instead of each carrying a private copy of the probe.
+ */
+export async function featureEnabled(flag: string): Promise<boolean> {
+	return (await versionInfo())?.features?.[flag] === true;
+}

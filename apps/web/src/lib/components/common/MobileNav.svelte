@@ -1,0 +1,139 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import { page } from '$app/stores';
+	import { X } from '@lucide/svelte';
+	import UserMenu from './UserMenu.svelte';
+	import * as m from '$lib/paraglide/messages.js';
+
+	interface Props {
+		open: boolean;
+		navItems: Array<{ href: string; label: string }>;
+		isAuthenticated: boolean;
+		onClose: () => void;
+	}
+
+	let { open = $bindable(false), navItems, isAuthenticated, onClose }: Props = $props();
+
+	const currentPath = $derived($page.url.pathname);
+
+	// Check if link is active
+	function isActive(href: string): boolean {
+		return currentPath === href || currentPath.startsWith(href + '/');
+	}
+
+	// Handle link click
+	function handleLinkClick() {
+		onClose();
+	}
+
+	// Close on Escape key
+	function handleKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			onClose();
+		}
+	}
+
+	// Handle backdrop click
+	function handleBackdropClick(event: MouseEvent) {
+		if (event.target === event.currentTarget) {
+			onClose();
+		}
+	}
+
+	// Focus trap management
+	$effect(() => {
+		if (open) {
+			// Add event listener for Escape key
+			document.addEventListener('keydown', handleKeydown);
+			// Prevent body scroll
+			document.body.style.overflow = 'hidden';
+
+			return () => {
+				document.removeEventListener('keydown', handleKeydown);
+				document.body.style.overflow = '';
+			};
+		}
+		return undefined;
+	});
+</script>
+
+<!-- Backdrop -->
+{#if open}
+	<div
+		class="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm"
+		onclick={handleBackdropClick}
+		role="presentation"
+	></div>
+{/if}
+
+<!-- Mobile Menu Drawer -->
+<div
+	class="fixed right-0 top-0 z-50 h-full w-full max-w-sm transform border-l bg-background shadow-lg transition-transform duration-300 ease-in-out md:hidden {open
+		? 'translate-x-0'
+		: 'translate-x-full'}"
+	role="dialog"
+	aria-modal="true"
+	aria-label={m['nav.mobileNavigation']()}
+>
+	<div class="flex h-full flex-col">
+		<!-- Header -->
+		<div class="flex items-center justify-between border-b p-4">
+			<span role="heading" aria-level="2" class="text-lg font-semibold">{m['nav.menu']()}</span>
+			<button
+				type="button"
+				class="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+				onclick={onClose}
+				aria-label={m['nav.closeMenu']()}
+			>
+				<X class="h-6 w-6" aria-hidden="true" />
+			</button>
+		</div>
+
+		<!-- Navigation Links -->
+		<nav class="flex-1 overflow-y-auto p-4" aria-label={m['nav.mobileNavigation']()}>
+			<ul class="space-y-2">
+				{#each navItems as item (item.href)}
+					<li>
+						<!-- eslint-disable svelte/no-navigation-without-resolve -- href is a ResolvedPathname produced by resolve() in the nav item list above -->
+						<a
+							href={item.href}
+							class="block rounded-md px-4 py-3 text-base transition-colors {isActive(item.href)
+								? 'bg-accent font-bold text-accent-foreground'
+								: 'font-semibold text-muted-foreground hover:bg-accent hover:text-accent-foreground'}"
+							onclick={handleLinkClick}
+							aria-current={isActive(item.href) ? 'page' : undefined}
+						>
+							{item.label}
+						</a>
+						<!-- eslint-enable svelte/no-navigation-without-resolve -->
+					</li>
+				{/each}
+			</ul>
+
+			<!-- Auth Actions -->
+			{#if !isAuthenticated}
+				<div class="mt-6 space-y-2 border-t pt-6">
+					<a
+						href={resolve('/(public)/login', {})}
+						class="block rounded-md px-4 py-3 text-center text-base font-medium text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+						onclick={handleLinkClick}
+					>
+						{m['auth.login']()}
+					</a>
+					<a
+						href={resolve('/(public)/register', {})}
+						class="block rounded-md bg-primary px-4 py-3 text-center text-base font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+						onclick={handleLinkClick}
+					>
+						{m['auth.signUp']()}
+					</a>
+				</div>
+			{:else}
+				<!-- User Menu in Mobile -->
+				<div class="mt-6 border-t pt-6">
+					<UserMenu mobile={true} onItemClick={handleLinkClick} />
+				</div>
+			{/if}
+		</nav>
+	</div>
+</div>

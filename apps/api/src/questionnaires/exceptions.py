@@ -1,0 +1,63 @@
+"""Custom exceptions for the questionnaires app."""
+
+from django.core.exceptions import ValidationError
+
+
+class QuestionnaireException(Exception):
+    """Base exception for the questionnaires app."""
+
+
+class CrossQuestionnaireSectionError(ValidationError):
+    """Raised when a section is assigned to a question of a different questionnaire."""
+
+
+class DisallowedMultipleAnswersError(ValidationError):
+    """Raised when multiple answers are submitted for a single-answer question."""
+
+
+class CrossQuestionnaireSubmissionError(QuestionnaireException):
+    """Raised when a submission contains answers for a different questionnaire."""
+
+
+class MissingMandatoryAnswerError(QuestionnaireException):
+    """Raised when a mandatory answer is missing from a submission."""
+
+
+class SectionIntegrityError(QuestionnaireException):
+    """Raised when a section's integrity is compromised."""
+
+
+class QuestionIntegrityError(QuestionnaireException):
+    """Raised when a question's integrity is compromised."""
+
+
+class SubmissionInDraftError(QuestionnaireException):
+    """Raised when a submission is in draft mode and an evaluation is triggered."""
+
+
+class CrossQuestionnaireOptionDependencyError(ValidationError):
+    """Raised when depends_on_option references an option from a different questionnaire."""
+
+
+class FileValidationError(QuestionnaireException):
+    """Base class for file upload validation errors."""
+
+
+class FileOwnershipError(FileValidationError):
+    """Raised when a user tries to use files they don't own."""
+
+
+class FileLimitExceededError(FileValidationError):
+    """Raised when file count exceeds question's max_files limit."""
+
+
+class InvalidFileMimeTypeError(FileValidationError):
+    """Raised when file MIME type doesn't match allowed types."""
+
+
+class FileSizeExceededError(FileValidationError):
+    """Raised when file size exceeds question's max_file_size limit."""
+
+
+class DisallowedMimeTypeError(FileValidationError):
+    """Raised when uploading a file with a MIME type not in the global allowlist."""

@@ -1,0 +1,37 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+{% if context.days_until == 1 %}
+<p style="font-size: 18px;">{% blocktranslate with event=context.event_name %}Reminder: <strong>{{ event }}</strong> is tomorrow!{% endblocktranslate %}</p>
+{% else %}
+<p style="font-size: 18px;">{% blocktranslate with event=context.event_name days=context.days_until %}Reminder: <strong>{{ event }}</strong> is in <strong>{{ days }} days</strong>{% endblocktranslate %}</p>
+{% endif %}
+
+<div class="card card--info">
+    <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+    <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+    {% if context.event_end_formatted %}<div class="info-row">{% trans "Until:" %} {{ context.event_end_formatted }}</div>{% endif %}
+    {% if context.event_location %}<div class="info-row">📍 {% if context.address_url %}<a href="{{ context.address_url }}">{{ context.event_location }}</a>{% else %}{{ context.event_location }}{% endif %}</div>{% endif %}
+</div>
+
+{% if context.ticket_id %}
+<div class="card card--info">
+    <h3 style="margin-top: 0;">🎫 {% trans "Your Ticket" %}</h3>
+    <div class="info-row"><span class="label">{% trans "Ticket ID:" %}</span> <code>{{ context.ticket_id }}</code></div>
+    <div class="info-row"><span class="label">{% trans "Tier:" %}</span> {{ context.tier_name }}</div>
+</div>
+{% endif %}
+
+{% if context.reminder_message %}
+<div class="card card--info">
+    <p>{{ context.reminder_message }}</p>
+</div>
+{% endif %}
+
+<center>
+    <a href="{{ context.event_url }}" class="button">{% trans "View Event Details" %}</a>
+</center>
+
+<p style="text-align: center; font-size: 18px;">{% trans "See you there!" %}</p>
+{% endblock %}

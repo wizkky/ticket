@@ -1,0 +1,367 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { getUserDisplayName } from '$lib/utils/user-display';
+	import { getTicketStatusTone, getTicketStatusLabel } from '$lib/utils/status-colors';
+	import { formatPrice } from '$lib/utils/format';
+	import { formatDate } from '$lib/utils/date';
+	import {
+		getGuestNameIfDifferent,
+		getSeatDisplay,
+		getTicketPrice,
+		canCheckIn,
+		canConfirmPayment,
+		canAdminCancelTicket,
+		canRefundTicketPayment,
+		canUnconfirmPayment,
+		getTicketPaymentLabel
+	} from '$lib/utils/ticket-helpers';
+	import { Button } from '$lib/components/ui/button';
+	import { Badge } from '$lib/components/ui/badge';
+	import {
+		Check,
+		X,
+		CreditCard,
+		Banknote,
+		Coins,
+		Gift,
+		ExternalLink,
+		UserPlus,
+		MoreVertical,
+		Ban,
+		Undo2,
+		Armchair,
+		Pencil
+	} from '@lucide/svelte';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import UserAvatar from '$lib/components/common/UserAvatar.svelte';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+	import RefundStatusBadge from './RefundStatusBadge.svelte';
+	import TicketDiscountBadge from './TicketDiscountBadge.svelte';
+	import SeriesPassBadge from './SeriesPassBadge.svelte';
+	import { formatTicketAttributionLine } from '$lib/utils/attribution';
+	import type { AdminTicketSchema } from '$lib/api';
+
+	interface Props {
+		tickets: AdminTicketSchema[];
+		checkInPending: boolean;
+		confirmPaymentPending: boolean;
+		cancelTicketPending: boolean;
+		addMemberPending: boolean;
+		unconfirmPaymentPending: boolean;
+		tiersLoading: boolean;
+		onCheckIn: (ticket: AdminTicketSchema) => void;
+		onConfirmPayment: (ticket: AdminTicketSchema) => void;
+		onMakeMember: (ticket: AdminTicketSchema) => void;
+		onCancelTicket: (ticket: AdminTicketSchema) => void;
+		onBlacklist: (ticket: AdminTicketSchema) => void;
+		onUnconfirmPayment: (ticket: AdminTicketSchema) => void;
+		/** Move a seated ticket to another seat. Omit to hide the action. */
+		onReseat?: (ticket: AdminTicketSchema) => void;
+		/** Rename the holder on a ticket. Omit to hide the action. */
+		onRenameHolder?: (ticket: AdminTicketSchema) => void;
+		/** Refund an online payment (full/partial). Omit to hide the action. */
+		onRefundTicket?: (ticket: AdminTicketSchema) => void;
+	}
+
+	const {
+		tickets,
+		checkInPending,
+		confirmPaymentPending,
+		cancelTicketPending,
+		addMemberPending,
+		unconfirmPaymentPending,
+		tiersLoading,
+		onCheckIn,
+		onConfirmPayment,
+		onMakeMember,
+		onCancelTicket,
+		onBlacklist,
+		onUnconfirmPayment,
+		onReseat,
+		onRenameHolder,
+		onRefundTicket
+	}: Props = $props();
+</script>
+
+{#snippet paymentMethodIcon(method: string)}
+	{#if method === 'online'}
+		<CreditCard class="h-3 w-3" aria-hidden="true" />
+	{:else if method === 'offline'}
+		<Banknote class="h-3 w-3" aria-hidden="true" />
+	{:else if method === 'at_the_door'}
+		<Coins class="h-3 w-3" aria-hidden="true" />
+	{:else if method === 'free'}
+		<Gift class="h-3 w-3" aria-hidden="true" />
+	{:else}
+		<CreditCard class="h-3 w-3" aria-hidden="true" />
+	{/if}
+{/snippet}
+
+<div class="space-y-4 md:hidden">
+	{#each tickets as ticket (ticket.id)}
+		{@const guestName = getGuestNameIfDifferent(ticket)}
+		{@const seatInfo = getSeatDisplay(ticket)}
+		{@const attributionLine = formatTicketAttributionLine(ticket.attribution)}
+		<div class="rounded-lg border bg-card p-4">
+			<div class="mb-3 flex items-start justify-between gap-2">
+				<div class="flex flex-1 items-start gap-3">
+					<UserAvatar
+						profilePictureUrl={ticket.user.profile_picture_url}
+						previewUrl={ticket.user.profile_picture_preview_url}
+						thumbnailUrl={ticket.user.profile_picture_thumbnail_url}
+						displayName={getUserDisplayName(ticket.user)}
+						firstName={ticket.user.first_name}
+						lastName={ticket.user.last_name}
+						size="md"
+						clickable={true}
+					/>
+					<div>
+						{#if guestName}
+							<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+								<span class="font-semibold">{guestName}</span>
+							</div>
+							<div class="text-sm text-muted-foreground">
+								{m['ticketCardList.purchasedBy']({ name: getUserDisplayName(ticket.user) })}
+							</div>
+						{:else}
+							<div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+								<span class="font-semibold">{getUserDisplayName(ticket.user)}</span>
+								{#if ticket.user.pronouns}
+									<span class="text-xs text-muted-foreground">({ticket.user.pronouns})</span>
+								{/if}
+								{#if ticket.membership}
+									<Badge variant="secondary" class="text-xs">
+										{ticket.membership.tier?.name
+											? m['memberBadge.tierName']({ tier: ticket.membership.tier.name })
+											: m['memberBadge.member']()}
+									</Badge>
+								{/if}
+							</div>
+						{/if}
+						<div class="text-sm text-muted-foreground">{ticket.user.email || 'N/A'}</div>
+						{#if seatInfo}
+							<div class="mt-1 text-xs text-primary">{seatInfo}</div>
+						{/if}
+						{#if attributionLine}
+							<div class="text-xs text-muted-foreground">{attributionLine}</div>
+						{/if}
+					</div>
+				</div>
+				<div class="flex shrink-0 flex-col items-end gap-1">
+					<StatusBadge
+						tone={getTicketStatusTone(ticket.status ?? '')}
+						label={getTicketStatusLabel(ticket.status ?? '')}
+					/>
+					<!-- Refund state renders independent of ticket status: since
+					     organizer refunds, an active ticket can carry a (partial)
+					     refund — never infer cancellation from refund state. -->
+					<RefundStatusBadge
+						status={ticket.payment?.refund_status}
+						amount={ticket.payment?.refund_amount}
+						currency={ticket.payment?.currency}
+					/>
+					{#if ticket.invoice_skipped}
+						<StatusBadge
+							tone="warning"
+							size="sm"
+							label={m['compliance.skipped.ticketBadge']()}
+							data-testid="invoice-skipped-badge"
+						/>
+					{/if}
+				</div>
+			</div>
+
+			<div class="space-y-2 text-sm">
+				<div class="flex items-center justify-between">
+					<span class="text-muted-foreground">{m['eventTicketsAdmin.headerTier']()}:</span>
+					<span class="font-medium">{ticket.tier?.name || 'N/A'}</span>
+				</div>
+				{#if ticket.series_pass}
+					<div class="flex justify-end">
+						<SeriesPassBadge seriesPass={ticket.series_pass} />
+					</div>
+				{/if}
+				<div class="flex items-center justify-between">
+					<span class="text-muted-foreground">{m['eventTicketsAdmin.headerPrice']()}:</span>
+					<div class="flex flex-col items-end">
+						<span class="font-medium"
+							>{formatPrice(
+								getTicketPrice(ticket),
+								ticket.payment?.currency || ticket.tier?.currency,
+								m['eventTicketsAdmin.free']()
+							)}</span
+						>
+						<TicketDiscountBadge {ticket} />
+					</div>
+				</div>
+				<div class="flex items-center justify-between">
+					<span class="text-muted-foreground">{m['eventTicketsAdmin.labelPayment']()}:</span>
+					<span class="flex items-center gap-1">
+						{@render paymentMethodIcon(ticket.tier?.payment_method || '')}
+						{getTicketPaymentLabel(ticket)}
+					</span>
+				</div>
+				<div class="flex items-center justify-between">
+					<span class="text-muted-foreground">{m['eventTicketsAdmin.headerPurchased']()}:</span>
+					<span>{formatDate(ticket.created_at)}</span>
+				</div>
+				{#if ticket.payment?.vat_amount != null}
+					<div class="mt-2 space-y-1 border-t pt-2">
+						<p class="text-xs font-medium text-muted-foreground">
+							{m['tickets.vatBreakdown']()}
+						</p>
+						<div class="flex items-center justify-between text-xs">
+							<span class="text-muted-foreground">{m['tickets.vatNet']()}:</span>
+							<span class="font-mono"
+								>{formatPrice(
+									ticket.payment.net_amount,
+									ticket.payment.currency || ticket.tier?.currency
+								)}</span
+							>
+						</div>
+						<div class="flex items-center justify-between text-xs">
+							<span class="text-muted-foreground"
+								>{m['tickets.vatLabel']({
+									rate: String(ticket.payment.vat_rate ?? '')
+								})}:</span
+							>
+							<span class="font-mono"
+								>{formatPrice(
+									ticket.payment.vat_amount,
+									ticket.payment.currency || ticket.tier?.currency
+								)}</span
+							>
+						</div>
+						{#if ticket.payment.platform_fee_net != null}
+							<div class="flex items-center justify-between text-xs">
+								<span class="text-muted-foreground">{m['tickets.platformFeeNet']()}:</span>
+								<span class="font-mono"
+									>{formatPrice(
+										ticket.payment.platform_fee_net,
+										ticket.payment.currency || ticket.tier?.currency
+									)}</span
+								>
+							</div>
+							{#if ticket.payment.platform_fee_reverse_charge}
+								<div class="flex items-center justify-between text-xs">
+									<span class="text-muted-foreground">{m['tickets.reverseCharge']()}:</span>
+									<span class="font-medium text-info">{m['tickets.reverseChargeYes']()}</span>
+								</div>
+							{/if}
+						{/if}
+					</div>
+				{/if}
+			</div>
+
+			<div class="mt-3 flex flex-wrap gap-2">
+				{#if canConfirmPayment(ticket)}
+					<Button
+						size="sm"
+						variant="default"
+						onclick={() => onConfirmPayment(ticket)}
+						disabled={confirmPaymentPending}
+						class="flex-1"
+					>
+						<Check class="h-4 w-4" aria-hidden="true" />
+						{m['eventTicketsAdmin.actionConfirmPayment']()}
+					</Button>
+				{/if}
+				{#if canCheckIn(ticket)}
+					<Button
+						size="sm"
+						variant="default"
+						onclick={() => onCheckIn(ticket)}
+						disabled={checkInPending}
+						class="flex-1"
+					>
+						<Check class="h-4 w-4" aria-hidden="true" />
+						{m['eventTicketsAdmin.actionCheckIn']()}
+					</Button>
+				{/if}
+				{#if onRefundTicket && canRefundTicketPayment(ticket)}
+					<Button size="sm" variant="outline" onclick={() => onRefundTicket(ticket)} class="flex-1">
+						<Undo2 class="h-4 w-4" aria-hidden="true" />
+						{m['refundTicket.menuItem']()}
+					</Button>
+				{/if}
+				{#if canAdminCancelTicket(ticket)}
+					<Button
+						size="sm"
+						variant="outline"
+						class="flex-1 text-destructive hover:text-destructive"
+						onclick={() => onCancelTicket(ticket)}
+						disabled={cancelTicketPending}
+					>
+						<X class="h-4 w-4" aria-hidden="true" />
+						{m['ticketCardList.cancelTicket']()}
+					</Button>
+				{/if}
+				<!-- More actions dropdown for mobile -->
+				<DropdownMenu.Root>
+					<DropdownMenu.Trigger>
+						{#snippet child({ props })}
+							<button
+								{...props}
+								class="inline-flex items-center justify-center rounded-md border border-input bg-background px-3 py-2 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+								aria-label={m['ticketCardList.moreActionsFor']({
+									name: getUserDisplayName(ticket.user)
+								})}
+							>
+								<MoreVertical class="h-4 w-4" aria-hidden="true" />
+							</button>
+						{/snippet}
+					</DropdownMenu.Trigger>
+					<DropdownMenu.Content align="end">
+						{#if !ticket.membership && ticket.user?.id}
+							<DropdownMenu.Item
+								onclick={() => onMakeMember(ticket)}
+								disabled={addMemberPending || tiersLoading}
+							>
+								<UserPlus class="mr-2 h-4 w-4" aria-hidden="true" />
+								{m['makeMemberAction.button']()}
+							</DropdownMenu.Item>
+						{/if}
+						{#if ticket.tier?.payment_method === 'online' && ticket.payment?.stripe_dashboard_url}
+							<DropdownMenu.Item
+								onclick={() => window.open(ticket.payment?.stripe_dashboard_url, '_blank')}
+							>
+								<ExternalLink class="mr-2 h-4 w-4" aria-hidden="true" />
+								{m['ticketCardList.manageOnStripe']()}
+							</DropdownMenu.Item>
+						{/if}
+						{#if onRenameHolder && ticket.status !== 'checked_in' && ticket.status !== 'cancelled'}
+							<DropdownMenu.Item onclick={() => onRenameHolder(ticket)}>
+								<Pencil class="mr-2 h-4 w-4" aria-hidden="true" />
+								{m['ticketCardList.renameHolder']?.() ?? 'Rename holder'}
+							</DropdownMenu.Item>
+						{/if}
+						{#if onReseat && ticket.seat?.id && ticket.status !== 'cancelled'}
+							<DropdownMenu.Item onclick={() => onReseat(ticket)}>
+								<Armchair class="mr-2 h-4 w-4" aria-hidden="true" />
+								{m['ticketCardList.moveSeat']?.() ?? 'Move seat'}
+							</DropdownMenu.Item>
+						{/if}
+						{#if canUnconfirmPayment(ticket)}
+							<DropdownMenu.Item
+								onclick={() => onUnconfirmPayment(ticket)}
+								disabled={unconfirmPaymentPending}
+							>
+								<Undo2 class="mr-2 h-4 w-4" aria-hidden="true" />
+								{m['eventTicketsAdmin.actionUnconfirmPayment']()}
+							</DropdownMenu.Item>
+						{/if}
+						{#if ticket.user?.id}
+							<DropdownMenu.Item
+								onclick={() => onBlacklist(ticket)}
+								class="text-destructive focus:text-destructive"
+							>
+								<Ban class="mr-2 h-4 w-4" aria-hidden="true" />
+								{m['ticketCardList.blacklistUser']()}
+							</DropdownMenu.Item>
+						{/if}
+					</DropdownMenu.Content>
+				</DropdownMenu.Root>
+			</div>
+		</div>
+	{/each}
+</div>

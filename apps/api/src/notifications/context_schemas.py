@@ -1,0 +1,883 @@
+"""Context schemas for notifications using TypedDict for type safety.
+
+Each notification type has a corresponding context schema that defines
+the structure of the context data. This ensures type safety and makes
+it clear what data is required for each notification type.
+"""
+
+import typing as t
+
+from notifications.enums import NotificationType
+
+
+class BaseNotificationContext(t.TypedDict):
+    """Base context for all notifications."""
+
+    # Frontend URL for deep linking
+    frontend_url: t.NotRequired[str]
+
+
+# ===== Ticket Contexts =====
+
+
+class TicketCreatedContext(BaseNotificationContext):
+    """Context for TICKET_CREATED notification."""
+
+    ticket_id: str
+    ticket_reference: str
+    event_id: str
+    event_name: str
+    event_start: str  # ISO format
+    event_start_formatted: str  # User-friendly format
+    event_location: str
+    event_url: str
+    organization_id: str
+    organization_name: str
+    tier_name: str
+    tier_price: str
+    ticket_status: str
+    quantity: int
+    total_price: str
+    qr_code_url: t.NotRequired[str]
+    manual_payment_instructions: t.NotRequired[str]
+    payment_method: str
+
+
+class TicketUpdatedContext(BaseNotificationContext):
+    """Context for TICKET_UPDATED notification."""
+
+    ticket_id: str
+    ticket_reference: str
+    event_id: str
+    event_name: str
+    event_start_formatted: str
+    event_location: str
+    event_url: str
+    tier_name: str
+    ticket_status: str
+    old_status: str
+    new_status: str
+    changed_by: t.NotRequired[str]
+    reason: t.NotRequired[str]
+
+
+class TicketCancelledContext(BaseNotificationContext):
+    """Context for TICKET_CANCELLED notification."""
+
+    ticket_id: str
+    ticket_reference: str
+    event_id: str
+    event_name: str
+    event_start_formatted: str
+    event_location: str
+    event_url: str
+    organization_id: str
+    organization_name: str
+    tier_name: str
+    ticket_status: str
+    old_status: str
+    new_status: str
+
+
+class PaymentConfirmationContext(BaseNotificationContext):
+    """Context for PAYMENT_CONFIRMATION notification."""
+
+    ticket_id: str
+    ticket_reference: str
+    event_id: str
+    event_name: str
+    event_start: str
+    payment_amount: str
+    payment_method: str
+    receipt_url: t.NotRequired[str]
+
+
+class TicketRefundedContext(BaseNotificationContext):
+    """Context for TICKET_REFUNDED notification."""
+
+    ticket_id: str
+    ticket_reference: str
+    event_id: str
+    event_name: str
+    refund_amount: str
+    refund_reason: t.NotRequired[str]
+
+
+class StaffTicketCreatedContext(TicketCreatedContext):
+    """Context for STAFF_TICKET_CREATED notification (to org staff/owners)."""
+
+    ticket_holder_name: str
+    ticket_holder_email: str
+
+
+class StaffTicketCancelledContext(TicketCancelledContext):
+    """Context for STAFF_TICKET_CANCELLED notification (to org staff/owners)."""
+
+    ticket_holder_name: str
+    ticket_holder_email: str
+
+
+class StaffTicketRefundedContext(TicketRefundedContext):
+    """Context for STAFF_TICKET_REFUNDED notification (to org staff/owners)."""
+
+    ticket_holder_name: str
+    ticket_holder_email: str
+
+
+class RefundUnmatchedCandidate(t.TypedDict):
+    """One ticket an unmatched inbound refund could have applied to."""
+
+    ticket_id: str
+    event_name: str
+    seat_label: str
+    amount: str
+    holder_email: str
+
+
+class RefundUnmatchedContext(BaseNotificationContext):
+    """Context for REFUND_UNMATCHED notification (to org staff).
+
+    Sent when a refund that arrived from Stripe (typically issued from the
+    Stripe Dashboard) could not be attributed to a single ticket, so Revel
+    cancelled nothing. ``reason`` is machine-readable: ``non_uniform`` (the
+    intent's payments differ in amount, so an amount match would be a guess)
+    or ``ambiguous`` (no amount interpretation fits).
+    """
+
+    organization_id: str
+    organization_name: str
+    payment_intent_id: str
+    refund_id: str
+    refund_amount: str
+    currency: str
+    reason: str
+    candidates: list[RefundUnmatchedCandidate]
+    # Event ticket admin, pre-filtered to the buyer (#744). Every Payment on one intent
+    # belongs to one buyer, so this lands on exactly the candidates above.
+    resolve_url: str
+
+
+class EventRefundSummaryContext(BaseNotificationContext):
+    """Context for EVENT_REFUND_SUMMARY notification (to org staff).
+
+    Sent once the bulk cancel-and-refund sweep dispatched by
+    ``events.refund_cancelled_event_tickets`` finishes — or gives up waiting,
+    in which case ``still_active`` is non-zero and the counts are a
+    best-effort snapshot rather than a final tally.
+    """
+
+    organization_id: str
+    organization_name: str
+    event_id: str
+    event_name: str
+    cancelled: int
+    refunded: int
+    failed: int
+    still_active: int
+
+
+class SkippedFiscalDocumentItem(t.TypedDict):
+    """One skipped invoice or credit note listed in a FISCAL_DOCUMENT_SKIPPED digest."""
+
+    kind: str  # SkippedFiscalDocument.Kind value: "invoice" or "credit_note"
+    event_name: str
+    buyer_name: str
+    buyer_vat_id: str
+    amount: str  # "EUR 120.00"
+    policy_country: str
+    # Event ticket admin; filtered on ``invoice_skipped`` for invoices.
+    tickets_url: str
+
+
+class FiscalDocumentSkippedContext(BaseNotificationContext):
+    """Context for FISCAL_DOCUMENT_SKIPPED (to the owner and ``manage_tickets`` staff, #1073).
+
+    A daily per-organization digest of the attendee invoices and credit notes Revel skipped
+    under a country policy since the last one. ``action_url`` is the owner-only skipped-documents
+    list for the owner, and the first item's ticket list for staff.
+    """
+
+    organization_id: str
+    organization_name: str
+    document_count: int
+    invoice_count: int
+    credit_note_count: int
+    # Gross per currency, each kind on its own (credit notes are refunds): e.g. ["EUR 120.00"]
+    invoice_totals: list[str]
+    credit_note_totals: list[str]
+    items: list[SkippedFiscalDocumentItem]  # the most recent ones, capped
+    more_count: int  # documents beyond ``items``
+    is_owner: bool
+    action_url: str
+
+
+class TicketCheckedInContext(BaseNotificationContext):
+    """Context for TICKET_CHECKED_IN notification."""
+
+    ticket_id: str
+    event_id: str
+    event_name: str
+    event_start_formatted: str
+    event_location: str
+    event_url: str
+    checked_in_at: str
+
+
+# ===== Event Contexts =====
+
+
+class EventOpenContext(BaseNotificationContext):
+    """Context for EVENT_OPEN notification."""
+
+    event_id: str
+    event_name: str
+    event_description: str
+    event_start: str
+    event_end: str
+    event_location: str
+    event_image_url: t.NotRequired[str]
+    organization_id: str
+    organization_name: str
+    rsvp_required: bool
+    tickets_available: bool
+    questionnaire_required: bool
+
+
+class EventUpdatedContext(BaseNotificationContext):
+    """Context for EVENT_UPDATED notification."""
+
+    event_id: str
+    event_name: str
+    event_start_formatted: str
+    event_end_formatted: t.NotRequired[str]
+    event_location: str
+    event_url: str
+    changed_fields: list[str]  # ["start", "location", etc.]
+    old_values: dict[str, str]
+    new_values: dict[str, str]
+    changes_summary: t.NotRequired[str]
+    update_message: t.NotRequired[str]
+
+
+class EventReminderContext(BaseNotificationContext):
+    """Context for EVENT_REMINDER notification."""
+
+    event_id: str
+    event_name: str
+    event_start: str  # ISO format
+    event_start_formatted: str  # User-friendly format
+    event_end_formatted: t.NotRequired[str]  # User-friendly format
+    event_location: str
+    event_url: str
+    days_until: int  # 14, 7, or 1
+    reminder_message: t.NotRequired[str]
+    # Ticket info (if user has a ticket)
+    ticket_id: t.NotRequired[str]
+    tier_name: t.NotRequired[str]
+    # RSVP info (if user has RSVP)
+    rsvp_status: t.NotRequired[str]
+
+
+class EventCancelledContext(BaseNotificationContext):
+    """Context for EVENT_CANCELLED notification."""
+
+    event_id: str
+    event_name: str
+    event_start: str
+    event_start_formatted: str
+    event_location: str
+    cancellation_reason: t.NotRequired[str]
+    refund_available: bool
+    refund_info: t.NotRequired[str]
+    alternative_event_url: t.NotRequired[str]
+
+
+# ===== RSVP Contexts =====
+
+
+class RSVPConfirmationContext(BaseNotificationContext):
+    """Context for RSVP_CONFIRMATION notification."""
+
+    rsvp_id: str
+    event_id: str
+    event_name: str
+    event_start: str
+    event_location: str
+    response: str  # YES, NO, MAYBE
+    user_name: str  # Name of person who RSVP'd (for staff notifications)
+    user_email: str  # Email of person who RSVP'd (for staff notifications)
+    rsvp_note: t.NotRequired[str]  # Attendee note (only when event accepts notes and one was sent)
+
+
+class RSVPUpdatedContext(BaseNotificationContext):
+    """Context for RSVP_UPDATED notification."""
+
+    rsvp_id: str
+    event_id: str
+    event_name: str
+    old_response: str
+    new_response: str
+    user_name: str  # Name of person who updated RSVP (for staff notifications)
+    user_email: str  # Email of person who updated RSVP (for staff notifications)
+    rsvp_note: t.NotRequired[str]  # Attendee note (only when event accepts notes and one was sent)
+
+
+class RSVPCancelledContext(BaseNotificationContext):
+    """Context for RSVP_CANCELLED notification."""
+
+    event_id: str
+    event_name: str
+    user_name: str
+
+
+# ===== Potluck Contexts =====
+
+
+class PotluckItemContext(BaseNotificationContext):
+    """Context for potluck notifications."""
+
+    potluck_item_id: str
+    item_name: str
+    event_id: str
+    event_name: str
+    action: str  # "created", "updated", "claimed", "unclaimed"
+    item_type: t.NotRequired[str]
+    quantity: t.NotRequired[str]
+    note: t.NotRequired[str]
+    actor_name: t.NotRequired[str]  # Who performed the action (created/claimed)
+    is_organizer: t.NotRequired[bool]  # Whether recipient is org staff/owner
+
+
+# ===== Questionnaire Contexts =====
+
+
+class QuestionnaireSubmittedContext(BaseNotificationContext):
+    """Context for QUESTIONNAIRE_SUBMITTED (to staff)."""
+
+    submission_id: str
+    questionnaire_name: str
+    submitter_email: str
+    submitter_name: str
+    organization_id: str
+    organization_name: str
+    submission_url: str  # URL to view the submission in admin
+    event_id: t.NotRequired[str]
+    event_name: t.NotRequired[str]
+
+
+class QuestionnaireEvaluationContext(BaseNotificationContext):
+    """Context for QUESTIONNAIRE_EVALUATION_RESULT (to user)."""
+
+    submission_id: str
+    questionnaire_name: str
+    evaluation_status: str  # APPROVED, REJECTED
+    organization_name: str
+    evaluation_score: t.NotRequired[str]
+    evaluation_comments: t.NotRequired[str]
+    event_id: t.NotRequired[str]
+    event_name: t.NotRequired[str]
+    event_url: t.NotRequired[str]  # URL to the event page (if questionnaire is event-linked)
+
+
+# ===== Invitation Contexts =====
+
+
+class InvitationReceivedContext(BaseNotificationContext):
+    """Context for INVITATION_RECEIVED notification."""
+
+    invitation_id: str
+    event_id: str
+    event_name: str
+    invitation_message: str
+    event_start: str  # ISO format
+    event_end: str  # ISO format
+    event_start_formatted: str  # User-friendly format, in event TZ
+    event_end_formatted: t.NotRequired[str]  # User-friendly format, in event TZ
+    event_location: str
+    event_url: str
+    organization_id: str
+    organization_name: str
+    rsvp_required: bool
+    tickets_required: bool
+
+
+class InvitationRequestCreatedContext(BaseNotificationContext):
+    """Context for INVITATION_REQUEST_CREATED notification (to organizers)."""
+
+    request_id: str
+    event_id: str
+    event_name: str
+    requester_email: str
+    requester_name: t.NotRequired[str]
+    request_message: t.NotRequired[str]
+
+
+# ===== Membership Contexts =====
+
+
+class MembershipContext(BaseNotificationContext):
+    """Context for membership notifications."""
+
+    organization_id: str
+    organization_name: str
+    role: str  # "member", "staff", "owner"
+    action: str  # "granted", "promoted", "removed"
+    actioned_by_name: t.NotRequired[str]
+
+
+class MembershipCardUpdatedContext(BaseNotificationContext):
+    """Context for MEMBERSHIP_CARD_UPDATED notification (tier changed)."""
+
+    organization_id: str
+    organization_name: str
+    member_id: str
+    tier_name: str
+
+
+class MembershipRequestCreatedContext(BaseNotificationContext):
+    """Context for MEMBERSHIP_REQUEST_CREATED notification (to organizers)."""
+
+    request_id: str
+    organization_id: str
+    organization_name: str
+    requester_id: str
+    requester_name: str
+    requester_email: str
+    request_message: t.NotRequired[str]
+
+
+class MembershipRequestApprovedContext(BaseNotificationContext):
+    """Context for MEMBERSHIP_REQUEST_APPROVED notification (to the applicant).
+
+    A request decision is not a role change, so it does not carry the ``role``/``action``
+    keys of ``MembershipContext`` — only the organization the applicant was admitted to.
+    """
+
+    organization_id: str
+    organization_name: str
+
+
+class MembershipRequestRejectedContext(BaseNotificationContext):
+    """Context for MEMBERSHIP_REQUEST_REJECTED notification (to the applicant)."""
+
+    organization_id: str
+    organization_name: str
+
+
+# ===== Account Contexts =====
+
+
+class AccountBannedContext(BaseNotificationContext):
+    """Context for ACCOUNT_BANNED notification."""
+
+    ban_reason: str
+
+
+# ===== System Contexts =====
+
+
+class OrgAnnouncementContext(BaseNotificationContext):
+    """Context for ORG_ANNOUNCEMENT notification."""
+
+    organization_id: str
+    organization_name: str
+    organization_url: str
+    announcement_id: str
+    announcement_title: str
+    announcement_body: str
+    posted_by_name: str
+    event_id: t.NotRequired[str]
+    event_name: t.NotRequired[str]
+    event_url: t.NotRequired[str]
+
+
+class OrgContactMessageReceivedContext(BaseNotificationContext):
+    """Context for ORG_CONTACT_MESSAGE_RECEIVED notification (to org admins)."""
+
+    message_id: str
+    organization_id: str
+    organization_name: str
+    sender_email: str
+    subject: str
+    message_preview: str
+    admin_url: str
+
+
+class OrgSetupNudgeContext(BaseNotificationContext):
+    """Context for ORG_SETUP_NUDGE notification (to the org owner)."""
+
+    trigger: str  # events.OrganizationNudge.Trigger value; templates branch on it
+    is_last: bool  # the final nudge for this trigger ("this is the last one")
+    organization_name: str
+    organization_slug: str
+    action_url: str  # the one deep link the email carries ("" for the plain-text check-in)
+    can_reply: bool  # ORG_NUDGE_REPLY_TO is set, so "reply to this email" reaches a person
+    event_name: t.NotRequired[str]  # draft_event: the forgotten draft; dormant: the last event
+    signature: t.NotRequired[str]  # check_in: the human name signing it (settings.ORG_NUDGE_SIGNATURE)
+
+
+class SystemAnnouncementContext(BaseNotificationContext):
+    """Context for SYSTEM_ANNOUNCEMENT notification."""
+
+    announcement_title: str
+    announcement_body: str
+    policy_url: t.NotRequired[str]
+
+
+# ===== Waitlist Contexts =====
+
+
+class WaitlistSpotAvailableContext(BaseNotificationContext):
+    """Context for WAITLIST_SPOT_AVAILABLE notification.
+
+    Sent when a user is selected in a waitlist batch (Advanced Waitlist
+    Management, issue #2). One notification per offer; the user has until
+    ``expires_at`` to claim their spot via the normal registration flow.
+
+    The legacy ``event_location``/``spots_available`` fields are retained as
+    optional for backwards compatibility with the older signal-based
+    dispatcher in ``notifications.signals.waitlist`` (which still emits the
+    full-to-non-full broadcast). New offer-based dispatches populate the
+    per-user fields below instead.
+    """
+
+    event_id: str
+    event_name: str
+    event_start: str  # ISO format (timezone-aware, in event TZ)
+    event_start_formatted: str  # User-friendly format, in event TZ
+    event_url: str
+    organization_id: str
+    organization_name: str
+    offer_id: t.NotRequired[str]
+    expires_at: t.NotRequired[str]  # ISO format, in event TZ
+    expires_at_formatted: t.NotRequired[str]  # User-friendly, in event TZ
+    time_remaining_formatted: t.NotRequired[str]  # e.g. "in 23 hours"
+    is_cutoff_batch: t.NotRequired[bool]
+    # Legacy fields from the broadcast (full → non-full) dispatcher
+    event_location: t.NotRequired[str]
+    spots_available: t.NotRequired[int]
+
+
+# ===== Whitelist Contexts =====
+
+
+class WhitelistRequestCreatedContext(BaseNotificationContext):
+    """Context for WHITELIST_REQUEST_CREATED notification (to organizers)."""
+
+    request_id: str
+    organization_id: str
+    organization_name: str
+    requester_id: str
+    requester_name: str
+    requester_email: str
+    request_message: t.NotRequired[str]
+    matched_entries_count: int
+
+
+class WhitelistRequestApprovedContext(BaseNotificationContext):
+    """Context for WHITELIST_REQUEST_APPROVED notification (to user)."""
+
+    organization_id: str
+    organization_name: str
+
+
+class WhitelistRequestRejectedContext(BaseNotificationContext):
+    """Context for WHITELIST_REQUEST_REJECTED notification (to user)."""
+
+    organization_id: str
+    organization_name: str
+
+
+# ===== Follow Contexts =====
+
+
+class OrganizationFollowedContext(BaseNotificationContext):
+    """Context for ORGANIZATION_FOLLOWED notification (to org admins)."""
+
+    organization_id: str
+    organization_name: str
+    follower_id: str
+    follower_name: str
+    follower_email: str
+
+
+class EventSeriesFollowedContext(BaseNotificationContext):
+    """Context for EVENT_SERIES_FOLLOWED notification (to org admins)."""
+
+    organization_id: str
+    organization_name: str
+    event_series_id: str
+    event_series_name: str
+    follower_id: str
+    follower_name: str
+    follower_email: str
+
+
+class NewEventFromFollowedOrgContext(BaseNotificationContext):
+    """Context for NEW_EVENT_FROM_FOLLOWED_ORG notification (to followers)."""
+
+    organization_id: str
+    organization_name: str
+    event_id: str
+    event_name: str
+    event_description: str
+    event_start: str  # ISO format
+    event_start_formatted: str  # User-friendly format
+    event_location: str
+    event_url: str
+
+
+class NewEventFromFollowedSeriesContext(BaseNotificationContext):
+    """Context for NEW_EVENT_FROM_FOLLOWED_SERIES notification (to followers)."""
+
+    organization_id: str
+    organization_name: str
+    event_series_id: str
+    event_series_name: str
+    event_id: str
+    event_name: str
+    event_description: str
+    event_start: str  # ISO format
+    event_start_formatted: str  # User-friendly format
+    event_location: str
+    event_url: str
+
+
+class SeriesEventsGeneratedContext(BaseNotificationContext):
+    """Context for SERIES_EVENTS_GENERATED notification (digest to followers/staff)."""
+
+    organization_id: str
+    organization_name: str
+    event_series_id: str
+    event_series_name: str
+    events_count: int
+    series_url: str
+
+
+# ===== Series Pass Contexts =====
+
+
+class SeriesPassPurchasedContext(BaseNotificationContext):
+    """Context for SERIES_PASS_PURCHASED notification (to the pass holder)."""
+
+    pass_id: str
+    pass_name: str
+    series_id: str
+    series_name: str
+    organization_id: str
+    organization_name: str
+    event_count: int
+    price_paid: str
+    currency: str
+
+
+class SeriesPassExtendedContext(BaseNotificationContext):
+    """Context for SERIES_PASS_EXTENDED notification (to the pass holder)."""
+
+    pass_id: str
+    pass_name: str
+    series_id: str
+    series_name: str
+    organization_id: str
+    organization_name: str
+    new_event_count: int
+    new_event_names: list[str]
+
+
+class SeriesPassCancelledContext(BaseNotificationContext):
+    """Context for SERIES_PASS_CANCELLED notification (to the pass holder)."""
+
+    pass_id: str
+    pass_name: str
+    series_id: str
+    series_name: str
+    organization_id: str
+    organization_name: str
+    cancelled_ticket_count: int
+    refunded_total: str
+    currency: str
+    reason: str
+
+
+class StaffSeriesPassPurchasedContext(SeriesPassPurchasedContext):
+    """Context for STAFF_SERIES_PASS_PURCHASED notification (to org staff/owners)."""
+
+    holder_name: str
+    holder_email: str
+
+
+class StaffSeriesPassCancelledContext(SeriesPassCancelledContext):
+    """Context for STAFF_SERIES_PASS_CANCELLED notification (to org staff/owners)."""
+
+    holder_name: str
+    holder_email: str
+
+
+# ===== Subscription Contexts =====
+
+
+class SubscriptionRenewalSucceededContext(BaseNotificationContext):
+    """Context for SUBSCRIPTION_RENEWAL_SUCCEEDED notification."""
+
+    organization_name: str
+    organization_slug: str
+    plan_name: str
+    amount: str  # formatted "{amount} {currency}"
+    period_end: str  # ISO date
+    manage_subscription_url: t.NotRequired[str | None]  # ONLINE only — FE /account/memberships (POST /billing-portal)
+
+
+class SubscriptionPaymentFailedContext(BaseNotificationContext):
+    """Context for SUBSCRIPTION_PAYMENT_FAILED notification."""
+
+    organization_name: str
+    organization_slug: str
+    plan_name: str
+    amount: str
+    grace_period_end: str
+    manage_subscription_url: t.NotRequired[str | None]  # ONLINE only — FE /account/memberships (POST /billing-portal)
+    is_online: bool
+
+
+class SubscriptionExpiredContext(BaseNotificationContext):
+    """Context for SUBSCRIPTION_EXPIRED notification."""
+
+    organization_name: str
+    organization_slug: str
+    plan_name: str
+    expired_at: str
+    revival_window_end: t.NotRequired[str | None]
+    revival_url: t.NotRequired[str | None]
+
+
+class SubscriptionCancellationConfirmedContext(BaseNotificationContext):
+    """Context for SUBSCRIPTION_CANCELLATION_CONFIRMED notification."""
+
+    organization_name: str
+    organization_slug: str
+    plan_name: str
+    immediate: bool
+    access_ends_at: str
+
+
+class SubscriptionRenewalReminderContext(BaseNotificationContext):
+    """Context for SUBSCRIPTION_RENEWAL_REMINDER notification."""
+
+    organization_name: str
+    organization_slug: str
+    plan_name: str
+    amount: str
+    period_end: str
+    is_online: bool
+    manage_subscription_url: t.NotRequired[str | None]  # ONLINE only — FE /account/memberships (POST /billing-portal)
+
+
+class SubscriptionRevivalCheckoutContext(BaseNotificationContext):
+    """Context for SUBSCRIPTION_REVIVAL_CHECKOUT notification."""
+
+    organization_name: str
+    organization_slug: str
+    plan_name: str
+    amount: str  # formatted "{amount} {currency}"
+    checkout_url: str  # hosted Stripe Checkout the member completes to renew
+
+
+class SubscriptionPriceMigrationNoticeContext(BaseNotificationContext):
+    """Context for SUBSCRIPTION_PRICE_MIGRATION_NOTICE notification."""
+
+    organization_name: str
+    organization_slug: str
+    plan_name: str
+    old_amount: str
+    new_amount: str
+    effective_at: str
+
+
+# Context type registry
+NOTIFICATION_CONTEXT_SCHEMAS: dict[NotificationType, type[BaseNotificationContext]] = {
+    NotificationType.TICKET_CREATED: TicketCreatedContext,
+    NotificationType.TICKET_UPDATED: TicketUpdatedContext,
+    NotificationType.TICKET_CANCELLED: TicketCancelledContext,
+    NotificationType.TICKET_REFUNDED: TicketRefundedContext,
+    NotificationType.STAFF_TICKET_CREATED: StaffTicketCreatedContext,
+    NotificationType.STAFF_TICKET_CANCELLED: StaffTicketCancelledContext,
+    NotificationType.STAFF_TICKET_REFUNDED: StaffTicketRefundedContext,
+    NotificationType.TICKET_CHECKED_IN: TicketCheckedInContext,
+    NotificationType.PAYMENT_CONFIRMATION: PaymentConfirmationContext,
+    NotificationType.REFUND_UNMATCHED: RefundUnmatchedContext,
+    NotificationType.EVENT_REFUND_SUMMARY: EventRefundSummaryContext,
+    NotificationType.FISCAL_DOCUMENT_SKIPPED: FiscalDocumentSkippedContext,
+    NotificationType.EVENT_OPEN: EventOpenContext,
+    NotificationType.EVENT_UPDATED: EventUpdatedContext,
+    NotificationType.EVENT_REMINDER: EventReminderContext,
+    NotificationType.EVENT_CANCELLED: EventCancelledContext,
+    NotificationType.RSVP_CONFIRMATION: RSVPConfirmationContext,
+    NotificationType.RSVP_UPDATED: RSVPUpdatedContext,
+    NotificationType.RSVP_CANCELLED: RSVPCancelledContext,
+    NotificationType.POTLUCK_ITEM_CREATED: PotluckItemContext,
+    NotificationType.POTLUCK_ITEM_CREATED_AND_CLAIMED: PotluckItemContext,
+    NotificationType.POTLUCK_ITEM_UPDATED: PotluckItemContext,
+    NotificationType.POTLUCK_ITEM_CLAIMED: PotluckItemContext,
+    NotificationType.POTLUCK_ITEM_UNCLAIMED: PotluckItemContext,
+    NotificationType.POTLUCK_ITEM_DELETED: PotluckItemContext,
+    NotificationType.QUESTIONNAIRE_SUBMITTED: QuestionnaireSubmittedContext,
+    NotificationType.QUESTIONNAIRE_EVALUATION_RESULT: QuestionnaireEvaluationContext,
+    NotificationType.INVITATION_RECEIVED: InvitationReceivedContext,
+    NotificationType.INVITATION_REQUEST_CREATED: InvitationRequestCreatedContext,
+    NotificationType.MEMBERSHIP_GRANTED: MembershipContext,
+    NotificationType.MEMBERSHIP_PROMOTED: MembershipContext,
+    NotificationType.MEMBERSHIP_REMOVED: MembershipContext,
+    NotificationType.MEMBERSHIP_CARD_UPDATED: MembershipCardUpdatedContext,
+    NotificationType.MEMBERSHIP_REQUEST_CREATED: MembershipRequestCreatedContext,
+    NotificationType.MEMBERSHIP_REQUEST_APPROVED: MembershipRequestApprovedContext,
+    NotificationType.MEMBERSHIP_REQUEST_REJECTED: MembershipRequestRejectedContext,
+    NotificationType.ACCOUNT_BANNED: AccountBannedContext,
+    NotificationType.ORG_ANNOUNCEMENT: OrgAnnouncementContext,
+    NotificationType.ORG_CONTACT_MESSAGE_RECEIVED: OrgContactMessageReceivedContext,
+    NotificationType.ORG_SETUP_NUDGE: OrgSetupNudgeContext,
+    NotificationType.SYSTEM_ANNOUNCEMENT: SystemAnnouncementContext,
+    NotificationType.WAITLIST_SPOT_AVAILABLE: WaitlistSpotAvailableContext,
+    NotificationType.WHITELIST_REQUEST_CREATED: WhitelistRequestCreatedContext,
+    NotificationType.WHITELIST_REQUEST_APPROVED: WhitelistRequestApprovedContext,
+    NotificationType.WHITELIST_REQUEST_REJECTED: WhitelistRequestRejectedContext,
+    NotificationType.ORGANIZATION_FOLLOWED: OrganizationFollowedContext,
+    NotificationType.EVENT_SERIES_FOLLOWED: EventSeriesFollowedContext,
+    NotificationType.NEW_EVENT_FROM_FOLLOWED_ORG: NewEventFromFollowedOrgContext,
+    NotificationType.NEW_EVENT_FROM_FOLLOWED_SERIES: NewEventFromFollowedSeriesContext,
+    NotificationType.SERIES_EVENTS_GENERATED: SeriesEventsGeneratedContext,
+    NotificationType.SERIES_PASS_PURCHASED: SeriesPassPurchasedContext,
+    NotificationType.STAFF_SERIES_PASS_PURCHASED: StaffSeriesPassPurchasedContext,
+    NotificationType.STAFF_SERIES_PASS_CANCELLED: StaffSeriesPassCancelledContext,
+    NotificationType.SERIES_PASS_EXTENDED: SeriesPassExtendedContext,
+    NotificationType.SERIES_PASS_CANCELLED: SeriesPassCancelledContext,
+    NotificationType.SUBSCRIPTION_RENEWAL_SUCCEEDED: SubscriptionRenewalSucceededContext,
+    NotificationType.SUBSCRIPTION_PAYMENT_FAILED: SubscriptionPaymentFailedContext,
+    NotificationType.SUBSCRIPTION_EXPIRED: SubscriptionExpiredContext,
+    NotificationType.SUBSCRIPTION_CANCELLATION_CONFIRMED: SubscriptionCancellationConfirmedContext,
+    NotificationType.SUBSCRIPTION_RENEWAL_REMINDER: SubscriptionRenewalReminderContext,
+    NotificationType.SUBSCRIPTION_PRICE_MIGRATION_NOTICE: SubscriptionPriceMigrationNoticeContext,
+    NotificationType.SUBSCRIPTION_REVIVAL_CHECKOUT: SubscriptionRevivalCheckoutContext,
+}
+
+
+def validate_notification_context(notification_type: NotificationType, context: dict[str, t.Any]) -> None:
+    """Validate that context matches expected schema for notification type.
+
+    Args:
+        notification_type: Type of notification
+        context: Context dict to validate
+
+    Raises:
+        ValueError: If context is invalid or notification type has no schema
+    """
+    schema = NOTIFICATION_CONTEXT_SCHEMAS.get(notification_type)
+    if schema is None:
+        raise ValueError(f"No schema defined for notification type: {notification_type}")
+
+    # TypedDict validation happens at type-check time with mypy
+    # At runtime, we do basic key validation for required fields
+    required_keys: set[str] = getattr(schema, "__required_keys__", set())
+    missing_keys = required_keys - context.keys()
+
+    if missing_keys:
+        raise ValueError(f"Missing required context keys for {notification_type}: {missing_keys}")

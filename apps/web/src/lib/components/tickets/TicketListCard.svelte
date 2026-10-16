@@ -1,0 +1,239 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import * as m from '$lib/paraglide/messages.js';
+	import type { UserTicketSchema } from '$lib/api/generated/types.gen';
+	import { Card } from '$lib/components/ui/card';
+	import TicketStatusBadge from './TicketStatusBadge.svelte';
+	import SeriesPassBadge from './SeriesPassBadge.svelte';
+	import MyTicketModal from './MyTicketModal.svelte';
+	import AddToWalletButton from './AddToWalletButton.svelte';
+	import AddToGoogleWalletButton from './AddToGoogleWalletButton.svelte';
+	import PendingDownloadsNotice from './PendingDownloadsNotice.svelte';
+	import { Calendar, MapPin, Ticket, CalendarDays } from '@lucide/svelte';
+	import { onMount } from 'svelte';
+	import { detectWalletPlatform } from '$lib/utils/platform';
+	import { downloadRevelEventICalFile } from '$lib/utils/ical';
+	import { getImageUrl } from '$lib/utils/url';
+	import { formatEventDateRange, formatDate } from '$lib/utils/date';
+	import { getEventLogo, getEventLogoThumbnail } from '$lib/utils/event';
+	import { useQueryClient } from '@tanstack/svelte-query';
+
+	const queryClient = useQueryClient();
+
+	interface Props {
+		ticket: UserTicketSchema;
+	}
+
+	const { ticket }: Props = $props();
+
+	let showTicketModal = $state(false);
+
+	// Ordering only (never hides a rail): Google badge first on Android.
+	// Set post-mount so SSR markup stays platform-neutral.
+	let googleWalletFirst = $state(false);
+	onMount(() => {
+		googleWalletFirst = detectWalletPlatform() === 'android';
+	});
+
+	// Logo with fallback hierarchy: event -> series -> organization
+	// Prefer thumbnail for card display (64x64)
+	const logoThumbnailPath = $derived(getEventLogoThumbnail(ticket.event));
+	const logoPath = $derived(getEventLogo(ticket.event));
+	const logoUrl = $derived(getImageUrl(logoThumbnailPath || logoPath));
+
+	// Format event date — in the event's OWN timezone (MinimalEventSchema carries
+	// it since BE #862), matching the event page and the ticket modal.
+	const eventDate = $derived.by(() => {
+		if (!ticket.event.start) return null;
+		// If no end date, just show start
+		return formatEventDateRange(ticket.event.start, ticket.event.start, ticket.event.timezone);
+	});
+
+	// Get event location (will use venue name if available, then fallback to address)
+	const eventLocation = $derived.by(() => {
+		const venue = ticket.event.venue;
+		if (!venue) return null;
+		// Show venue name, and optionally address
+		if (venue.name && venue.address) {
+			return `${venue.name}, ${venue.address}`;
+		}
+		return venue.name || venue.address || null;
+	});
+
+	// Download iCal
+	function downloadICalFile() {
+		const event = ticket.event;
+		if (!event.start) return;
+
+		downloadRevelEventICalFile({
+			id: event.id,
+			slug: event.slug || event.id, // Fallback to ID if slug missing
+			name: event.name,
+			description: undefined,
+			start: event.start,
+			end: event.end || event.start, // Fallback to start if end not available
+			location: event.venue?.address,
+			venue_name: event.venue?.name,
+			organization: undefined
+		});
+	}
+
+	// Check if ticket can show QR code
+	const canShowQRCode = $derived(
+		ticket.status === 'active' ||
+			ticket.status === 'checked_in' ||
+			(ticket.status as string) === 'pending'
+	);
+
+	// Format created date
+	const createdDate = $derived(formatDate(ticket.created_at));
+</script>
+
+<Card class="group overflow-hidden transition-shadow hover:shadow-poster-lg">
+	<div class="flex flex-col gap-4 p-4 md:p-6">
+		<!-- Header with Event Info -->
+		<div class="flex items-start gap-4">
+			<!-- Event Logo/Icon (with fallback: event -> series -> org) -->
+			<div class="shrink-0">
+				{#if logoUrl}
+					<img src={logoUrl} alt="" class="h-16 w-16 rounded-lg border object-cover" />
+				{:else}
+					<div
+						class="flex h-16 w-16 items-center justify-center rounded-lg bg-primary/10 text-primary"
+					>
+						<Ticket class="h-8 w-8" aria-hidden="true" />
+					</div>
+				{/if}
+			</div>
+
+			<!-- Event Details -->
+			<div class="min-w-0 flex-1">
+				<div class="mb-2 flex items-start justify-between gap-2">
+					<div class="min-w-0 flex-1">
+						<h3 class="text-lg font-bold">
+							<a
+								href={resolve('/(public)/events/[id]', { id: ticket.event.id })}
+								class="hover:underline focus:underline focus:outline-none"
+							>
+								{ticket.event.name}
+							</a>
+						</h3>
+						<p class="text-sm text-muted-foreground">
+							{ticket.tier.name || m['ticketListCard.generalAdmission']()}
+						</p>
+						{#if ticket.series_pass}
+							<SeriesPassBadge seriesPass={ticket.series_pass} class="mt-1" />
+						{/if}
+					</div>
+					<TicketStatusBadge status={ticket.status} />
+				</div>
+
+				<!-- Event Metadata -->
+				<ul class="space-y-1.5 text-sm">
+					{#if eventDate}
+						<li class="flex items-center gap-2 text-muted-foreground">
+							<Calendar class="h-4 w-4 shrink-0" aria-hidden="true" />
+							<!-- datetime carries the machine-readable start instant; the text
+							     is the localized, event-timezone rendering. -->
+							<time datetime={ticket.event.start} class="truncate">{eventDate}</time>
+						</li>
+					{/if}
+					{#if eventLocation}
+						<li class="flex items-center gap-2 text-muted-foreground">
+							<MapPin class="h-4 w-4 shrink-0" aria-hidden="true" />
+							<span class="truncate">{eventLocation}</span>
+						</li>
+					{/if}
+					<!-- Purchased Date -->
+					<li class="text-muted-foreground">
+						<span class="font-medium">{m['ticketListCard.purchased']()}</span>
+						<time datetime={ticket.created_at}>{createdDate}</time>
+					</li>
+				</ul>
+			</div>
+		</div>
+
+		<!-- Actions Footer -->
+		<div class="border-t border-border pt-4">
+			<div class="flex flex-col gap-2">
+				<!-- Download iCal -->
+				{#if ticket.event.start}
+					<button
+						type="button"
+						onclick={downloadICalFile}
+						class="inline-flex items-center justify-center gap-1.5 rounded-md border bg-background px-3 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+						aria-label={m['ticketListCard.downloadCalendarEvent']()}
+					>
+						<CalendarDays class="h-4 w-4" aria-hidden="true" />
+						{m['ticketListCard.addToCalendar']()}
+					</button>
+				{/if}
+
+				<!-- View Ticket -->
+				{#if canShowQRCode}
+					<button
+						type="button"
+						onclick={() => (showTicketModal = true)}
+						class="inline-flex items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+						aria-label={m['ticketListCard.viewTicketAndQr']()}
+					>
+						<Ticket class="h-4 w-4" aria-hidden="true" />
+						{m['ticketListCard.viewTicket']()}
+					</button>
+				{:else}
+					<a
+						href={resolve('/(public)/events/[id]', { id: ticket.event.id })}
+						class="inline-flex items-center justify-center gap-1.5 rounded-md bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
+					>
+						{m['ticketListCard.viewEvent']()}
+					</a>
+				{/if}
+
+				<!-- Add to Wallet (hide for cancelled tickets) -->
+				{#if ticket.id && ticket.status !== 'cancelled' && (ticket.apple_pass_available || ticket.google_pass_available)}
+					<!-- Pending tickets keep their wallet passes (pay-at-the-door flow)
+					     but must be labeled. Sits on the Card (--card) — the surface the
+					     audited "MyTicket warning banner" pair covers. -->
+					{#if ticket.status === 'pending'}
+						<PendingDownloadsNotice />
+					{/if}
+					{#snippet googleWalletButton()}
+						{#if ticket.google_pass_available && ticket.id}
+							<AddToGoogleWalletButton id={ticket.id} kind="ticket" />
+						{/if}
+					{/snippet}
+					<div class="flex flex-wrap items-center justify-center gap-2">
+						{#if googleWalletFirst}
+							{@render googleWalletButton()}
+						{/if}
+						{#if ticket.apple_pass_available}
+							<AddToWalletButton id={ticket.id} name={ticket.event.name} />
+						{/if}
+						{#if !googleWalletFirst}
+							{@render googleWalletButton()}
+						{/if}
+					</div>
+				{/if}
+			</div>
+		</div>
+	</div>
+</Card>
+
+<!-- Ticket Modal -->
+{#if canShowQRCode}
+	<MyTicketModal
+		bind:open={showTicketModal}
+		tickets={ticket}
+		eventName={ticket.event.name}
+		eventDate={eventDate ?? undefined}
+		eventLocation={eventLocation ?? undefined}
+		timezone={ticket.event.timezone}
+		onTicketCancelled={() => {
+			showTicketModal = false;
+			queryClient.invalidateQueries({ queryKey: ['dashboard-tickets'] });
+		}}
+		onTicketRenamed={() => {
+			queryClient.invalidateQueries({ queryKey: ['dashboard-tickets'] });
+		}}
+	/>
+{/if}

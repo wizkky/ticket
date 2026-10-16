@@ -1,0 +1,34 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+
+    <p style="font-size: 18px;">{% blocktranslate with event=context.event_name action=context.action %}Your ticket for <strong>{{ event }}</strong> has been <strong>{{ action }}</strong>.{% endblocktranslate %}</p>
+
+    <div class="card card--warning">
+        <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+        <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+        {% if context.event_location %}<div class="info-row">📍 {{ context.event_location }}</div>{% endif %}
+    </div>
+
+    <div class="card card--warning">
+        <h3 style="margin-top: 0;">{% trans "Updated Ticket Information" %}</h3>
+        <div class="info-row"><span class="label">{% trans "Tier:" %}</span> {{ context.tier_name }}</div>
+        <div class="info-row"><span class="label">{% trans "Status:" %}</span> {{ context.ticket_status }}</div>
+        <div class="info-row"><span class="label">{% trans "Ticket ID:" %}</span> <code>{{ context.ticket_id }}</code></div>
+    </div>
+
+    {% include "notifications/email/_wallet_badges.html" %}
+
+    {% if context.update_reason %}
+    <div class="card card--warning">
+        <h3 style="margin-top: 0;">{% trans "Reason" %}</h3>
+        <p>{{ context.update_reason }}</p>
+    </div>
+    {% endif %}
+    {% include "notifications/email/_tax_notice.html" %}
+
+<center>
+    <a href="{{ context.event_url }}" class="button">{% trans "View Event Details" %}</a>
+</center>
+{% endblock %}

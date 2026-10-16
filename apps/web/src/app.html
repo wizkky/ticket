@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="%paraglide.lang%" dir="%paraglide.textDirection%" %revel.rootAttributes%>
+	<head>
+		<meta charset="utf-8" />
+		<link rel="icon" type="image/svg+xml" href="%sveltekit.assets%/caudal-mark.svg" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+		<meta name="theme-color" content="#8C3CDD" />
+		<link rel="manifest" href="/manifest.json" />
+		<!-- RSS Feed for events -->
+		<link
+			rel="alternate"
+			type="application/rss+xml"
+			title="CaudalTickets Events Feed"
+			href="/feed.xml"
+		/>
+		<!-- OpenSearch for browser search integration -->
+		<link
+			rel="search"
+			type="application/opensearchdescription+xml"
+			title="CaudalTickets"
+			href="/opensearch.xml"
+		/>
+		<!--
+			Open Graph / Twitter image tags are emitted per-page by SeoHead.svelte
+			(src/lib/seo) so each event/org share carries its own cover. They used
+			to be hardcoded here too, which double-emitted og:image and made
+			unfurlers pick the generic card over the specific one. SeoHead's
+			buildSeo() falls back to the versioned og-image (OG_IMAGE_PATH in
+			src/lib/seo/constants.ts) for all non-event/org pages.
+		-->
+		<!--
+			Anti-FOUC: apply the dark class before first paint so dark-mode users
+			never see a light flash on SSR loads (#440). This is the ONLY anti-FOUC
+			script: mode-watcher used to inject an equivalent <svelte:head> snippet,
+			but it carried no nonce, was blocked by our production CSP
+			(script-src 'self' 'nonce-…') and logged a violation on every page load,
+			so `<ModeWatcher disableHeadScriptInjection />` in src/routes/+layout.svelte
+			now turns it off (#816). This script is nonced via %sveltekit.nonce% so it
+			runs. Must stay synchronous (no defer/async) and mirror mode-watcher's
+			storage key ('mode-watcher-mode') and dark class — mode-watcher no longer
+			has a fallback to cover a drift here.
+
+			Embed documents (/embed/*) with an explicit ?theme=light|dark carry
+			data-theme-locked and are skipped: their theme is already applied to
+			<html> server-side (src/lib/server/embed.ts), and localStorage inside a
+			third-party iframe is partitioned per host page — empty and meaningless
+			— so letting it win here would override the organizer's choice.
+			?theme=auto locks nothing, because this script's own 'system' default
+			IS prefers-color-scheme, which is what auto means.
+		-->
+		<script nonce="%sveltekit.nonce%">
+			(() => {
+				if (document.documentElement.dataset.themeLocked) return;
+				try {
+					const mode = localStorage.getItem('mode-watcher-mode') || 'system';
+					const dark =
+						mode === 'dark' ||
+						(mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+					const root = document.documentElement;
+					root.classList.toggle('dark', dark);
+					root.style.colorScheme = dark ? 'dark' : 'light';
+				} catch {
+					/* localStorage unavailable (e.g. private mode) — fall back to light */
+				}
+			})();
+		</script>
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>

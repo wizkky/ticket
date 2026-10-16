@@ -1,0 +1,12 @@
+{% extends "emails/base.html" %}
+{% load i18n markdown_tags %}
+{% block content %}
+<div class="card card--info">
+    <div class="card-body">{{ context.announcement_body|markdown }}</div>
+</div>
+{% if context.policy_url %}
+<center>
+    <a href="{{ context.policy_url }}" class="button">{% trans "Read More" %}</a>
+</center>
+{% endif %}
+{% endblock %}

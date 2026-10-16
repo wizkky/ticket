@@ -1,0 +1,44 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+
+{% if context.user_name %}
+    <p>{% blocktranslate with user=context.user_name event=context.event_name %}<strong>{{ user }}</strong> has cancelled their RSVP for <strong>{{ event }}</strong>.{% endblocktranslate %}</p>
+
+    <div class="card card--danger">
+        <h3 style="margin-top: 0;">{% trans "Cancellation Details" %}</h3>
+        <div class="info-row"><span class="label">{% trans "User:" %}</span> {{ context.user_name }}</div>
+        <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+        {% if context.event_location %}<div class="info-row">📍 {{ context.event_location }}</div>{% endif %}
+    </div>
+
+    {% if context.cancellation_reason %}
+    <div class="card card--danger">
+        <h3 style="margin-top: 0;">{% trans "Reason" %}</h3>
+        <p>{{ context.cancellation_reason }}</p>
+    </div>
+    {% endif %}
+{% else %}
+    <p>{% blocktranslate with event=context.event_name %}Your RSVP for <strong>{{ event }}</strong> has been cancelled.{% endblocktranslate %}</p>
+
+    <div class="card card--danger">
+        <h3 style="margin-top: 0;">{% trans "Event Details" %}</h3>
+        <div class="info-row">📅 {{ context.event_start_formatted }}</div>
+        {% if context.event_location %}<div class="info-row">📍 {{ context.event_location }}</div>{% endif %}
+    </div>
+
+    {% if context.cancellation_reason %}
+    <div class="card card--danger">
+        <h3 style="margin-top: 0;">{% trans "Reason" %}</h3>
+        <p>{{ context.cancellation_reason }}</p>
+    </div>
+    {% endif %}
+
+    <p>{% trans "You can RSVP again anytime if you change your mind." %}</p>
+{% endif %}
+
+<center>
+    <a href="{{ context.event_url }}" class="button">{% trans "View Event Details" %}</a>
+</center>
+{% endblock %}

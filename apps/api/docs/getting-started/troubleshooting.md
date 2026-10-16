@@ -1,0 +1,255 @@
+# Troubleshooting
+
+Common gotchas and their solutions. Most of these surface during initial setup or after a Docker restart.
+
+---
+
+## macOS: "Could not find the GDAL library" (Homebrew native libs)
+
+**Symptom** — on macOS, `make run` / `make test` / any `manage.py` command crashes at startup with one of:
+
+```
+django.core.exceptions.ImproperlyConfigured: Could not find the GDAL library
+    (tried "gdal", "GDAL", "gdal3.10.0", ...). Is GDAL installed?
+```
+```
+OSError: cannot load library 'libgobject-2.0-0': dlopen(libgobject-2.0-0, ...)
+    ... ctypes.util.find_library() did not manage to locate a library
+```
+
+**Cause** — the backend loads several Homebrew-installed native libraries at import time:
+GDAL and GEOS (GeoDjango / PostGIS) and glib/pango/harfbuzz/fontconfig/cairo (WeasyPrint PDF
+rendering). These live under `$(brew --prefix)/lib` (`/opt/homebrew/lib` on Apple Silicon).
+A **macOS system update** can change how `dyld` / Python's `ctypes.util.find_library` probe for
+libraries, after which that directory is no longer searched — so the libs "disappear" even though
+Homebrew still has them installed. GDAL fails first (it's imported earliest); once it's fixed the
+same failure resurfaces for WeasyPrint's `libgobject`.
+
+**Why the obvious fixes don't work** — `DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib` fixes it in a
+bare shell, but **not** through `make`: `/usr/bin/make` and `/bin/sh` are SIP-protected system
+binaries, and macOS **strips all `DYLD_*` variables** from the environment when a protected binary
+launches. So exporting `DYLD_*` in `~/.zshrc` or the `Makefile` is silently dropped before the
+Django process starts. Django's `GDAL_LIBRARY_PATH` setting would fix GDAL/GEOS but not WeasyPrint,
+which has no equivalent knob.
+
+**Fix (one symlink, SIP-proof, works everywhere)** — expose Homebrew's lib dir on `dyld`'s
+*built-in default fallback path* (`$HOME/lib`), which needs no environment variable and therefore
+survives SIP for `make`, subagents, and direct `uv run` alike:
+
+```bash
+ln -s "$(brew --prefix)/lib" ~/lib
+```
+
+That single symlink resolves GDAL, GEOS, and all of WeasyPrint's native dependencies at once.
+To undo it: `rm ~/lib`.
+
+!!! note "Why `$HOME/lib` specifically"
+    macOS `dyld` consults a fixed default fallback list — `$HOME/lib:/usr/local/lib:/lib:/usr/lib` —
+    when a library isn't found by its install name. These directories are searched **without** any
+    `DYLD_*` variable, so unlike the `DYLD_FALLBACK_LIBRARY_PATH` env var they are not stripped by
+    SIP. `~/lib` is user-scoped and trivially reversible; `/usr/local/lib` would work too.
+
+---
+
+## Geo Data Files
+
+The geo app requires two data files in `src/geo/data/`:
+
+| File | Purpose | Required By |
+|------|---------|-------------|
+| `worldcities.csv` | City database (names, coords, population) | Migration `0002_load_cities` |
+| `IP2LOCATION-LITE-DB5.BIN` | IP-to-location mapping | Runtime geolocation lookups |
+
+### Cities CSV missing
+
+Migration `0002_load_cities` loads `src/geo/data/worldcities.csv` if present and otherwise falls back to the
+bundled 50-city `src/geo/fixtures/worldcities.mini.csv`. The fallback lives outside `src/geo/data/` so a bind mount
+over that directory cannot hide it. The migration only fails with a `FileNotFoundError` if neither file exists.
+
+!!! tip "Full city list"
+    Download the file from [SimpleMaps](https://simplemaps.com/data/world-cities) and place it at `src/geo/data/worldcities.csv`.
+
+### IP2Location database
+
+A Celery periodic task downloads a fresh IP2Location database every Monday at 04:00 UTC. It requires the `IP2LOCATION_TOKEN` environment variable.
+
+```bash
+# .env
+IP2LOCATION_TOKEN=your-token-here
+```
+
+!!! warning "Docker volume permissions"
+    The download task writes to `src/geo/data/` inside the container. If you mount this directory as a volume, ensure the container user (`appuser`) has **read and write** access. Without write access the download silently fails and stale data is served.
+
+    ```yaml
+    # docker-compose example
+    volumes:
+      - ./src/geo/data:/app/src/geo/data  # must be writable by appuser
+    ```
+
+---
+
+## Apple Wallet Certificates
+
+Apple Wallet pass generation requires three PEM certificate files and several environment variables.
+
+### Required environment variables
+
+```bash
+# .env
+APPLE_TEAM_IDENTIFIER=YOUR_TEAM_ID
+APPLE_WALLET_PASS_TYPE_ID=pass.io.letsrevel.events
+APPLE_WALLET_TEAM_ID=YOUR_TEAM_ID
+APPLE_WALLET_CERT_PATH=/app/src/certs/pass_certificate.pem
+APPLE_WALLET_KEY_PATH=/app/src/certs/pass_key.pem
+APPLE_WALLET_KEY_PASSWORD=           # can be empty string
+APPLE_WALLET_WWDR_CERT_PATH=/app/src/certs/wwdr.pem
+```
+
+### Required certificate files
+
+Place these in `src/certs/`:
+
+| File | Description |
+|------|-------------|
+| `pass_certificate.pem` | Your pass type certificate from Apple Developer |
+| `pass_key.pem` | Private key for the pass certificate |
+| `wwdr.pem` | Apple Worldwide Developer Relations certificate |
+
+!!! warning "File permissions in Docker"
+    Certificate files must be readable by `appuser` inside the container. Set permissions before building:
+
+    ```bash
+    chmod 644 src/certs/pass_certificate.pem src/certs/wwdr.pem
+    chmod 600 src/certs/pass_key.pem  # private key (restrict access)
+    ```
+
+!!! info "Feature is optional"
+    If the environment variables are not set, the wallet feature is simply disabled. The app starts normally. You will only see errors if you try to generate a pass without the configuration.
+
+---
+
+## Docker Permissions
+
+The production Docker image runs as a non-root user (`appuser`). This is the most common source of permission errors.
+
+### The `appuser` setup
+
+```dockerfile
+# From Dockerfile
+RUN useradd --create-home --system --shell /bin/bash appuser
+# ...
+USER appuser
+```
+
+All files copied into the image use `--chown=appuser:appuser`, but **mounted volumes** inherit permissions from the host.
+
+### Fixing volume permission issues
+
+If you see `PermissionError` or `EACCES` in logs:
+
+=== "Linux"
+
+    ```bash
+    # Find appuser's UID inside the container
+    docker compose exec web id appuser
+    # uid=999(appuser) gid=999(appuser)
+
+    # Fix host directory ownership
+    sudo chown -R 999:999 ./src/geo/data ./src/certs
+    ```
+
+=== "macOS"
+
+    Docker Desktop for Mac uses a VM with gRPC-FUSE file sharing, so host UIDs don't map 1:1. Permissions usually just work. If they don't:
+
+    ```bash
+    chmod -R a+rw ./src/geo/data ./src/certs
+    ```
+
+### Volumes that need write access
+
+| Path | Why |
+|------|-----|
+| `src/geo/data/` | Celery downloads IP2Location database updates |
+| Media directory | User-uploaded files (profile photos, event images) |
+
+### Volumes that are read-only
+
+| Path | Why |
+|------|-----|
+| `src/certs/` | Apple Wallet certificates (never modified at runtime) |
+
+!!! note "tmpfs and data loss"
+    The development Docker setup uses **tmpfs** for PostgreSQL (configured in `docker-compose-base.yml`), meaning the database lives in memory. Data is lost when the container stops. This is intentional for fast test cycles. Use `make bootstrap` to repopulate after a restart.
+
+---
+
+## External Services
+
+Most external services have safe defaults for local development. Here's what actually needs configuration:
+
+### Required for any development
+
+| Service | Env Var | Default | Notes |
+|---------|---------|---------|-------|
+| PostgreSQL | `DB_USER`, `DB_PASSWORD`, `DB_NAME`, `DB_PORT` | `revel`, `db-password`, `revel`, `5432` | Provided by Docker Compose (values from `.env.example`) |
+| Redis | `REDIS_HOST` | `localhost` | Provided by Docker Compose |
+| Redis DB indices | `CACHE_REDIS_DB`, `CELERY_REDIS_DB`, `AIOGRAM_REDIS_DB` | `2`, `0`, `1` | One Redis instance split by logical DB. Keep them disjoint — `cache.clear()` issues a `FLUSHDB` on the cache's index and would wipe anything sharing it |
+| Redis timeouts | `REDIS_SOCKET_CONNECT_TIMEOUT`, `REDIS_SOCKET_TIMEOUT` | `1.0`, `1.0` | Seconds; bound every cache op so a hung Redis errors instead of blocking requests (#880) |
+
+### Required for specific features
+
+| Service | Env Var | Default | Feature |
+|---------|---------|---------|---------|
+| Stripe | `STRIPE_SECRET_KEY` | Test key (`sk_test_...`) | Paid ticket checkout |
+| Telegram | `TELEGRAM_BOT_TOKEN` | `0000000000:AABBCCDD` | Telegram bot |
+| LLM Provider | `LLM_API_KEY`, `LLM_DEFAULT_MODEL` | Ollama local | Questionnaire AI evaluation (requires `FEATURE_LLM_EVALUATION=True`) |
+| Django admin Google login | `GOOGLE_SSO_CLIENT_ID` | `fake-id` | Google login on the Django admin page only |
+| OpenID Connect login | `OIDC_PROVIDERS`, `OIDC_<KEY>_ISSUER` / `_CLIENT_ID` / `_CLIENT_SECRET` | unset (off) | Sign in with Google, Keycloak, Authentik, … (see [self-hosting tiers](../self-hosting/tiers.md#feature-flags)) |
+| IP2Location | `IP2LOCATION_TOKEN` | `None` | IP geolocation |
+| HuggingFace | `HUGGING_FACE_HUB_TOKEN` | **None** | Sentinel model download |
+
+### Feature flags
+
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `FEATURE_LLM_EVALUATION` | `True` | Enable LLM-powered evaluation for questionnaires with free-text questions |
+| `FEATURE_MALWARE_SCAN` | `True` | Scan uploads with ClamAV; when `False`, uploads are marked clean (ClamAV optional) |
+| `FEATURE_TELEGRAM` | `True` | Enable Telegram delivery and linking endpoints |
+| `FEATURE_ORGANIZATION_CREATION` | `True` | Allow regular users to create organizations |
+| `FEATURE_OBSERVABILITY` | `True` | Enable metrics/traces/logs exporters (renamed from `ENABLE_OBSERVABILITY`, whose deprecated alias still works for one release) |
+
+!!! info "Telegram token"
+    The default `TELEGRAM_BOT_TOKEN` is a non-functional placeholder. The app starts fine with it, but Telegram features won't work. To develop with a real bot, create one via [@BotFather](https://t.me/BotFather) and set the token in your `.env`.
+
+!!! tip "Stripe test mode"
+    The default Stripe keys are test keys (prefixed `sk_test_` / `pk_test_`). These are safe for development; no real charges are made.
+
+!!! danger "Stripe webhook: own events vs. connected accounts"
+    A Stripe webhook endpoint can be configured to receive events either from the platform's own account **or** from connected accounts. Revel currently expects a single `STRIPE_WEBHOOK_SECRET`, so the endpoint you point at Revel should only receive events from one of these sources; mixing platform-account and connected-account events on the same endpoint would require additional backend support. If the platform host also operates an organization that sells tickets, that organization must use a **different** Stripe account from the platform's `STRIPE_ACCOUNT`. Otherwise, webhook events (e.g., `checkout.session.completed`) won't be delivered. Configure this in the Stripe Dashboard under **Developers > Webhooks**. See [Billing & VAT](../architecture/billing-and-vat.md) for details.
+
+---
+
+## Feature Flags
+
+Flags that affect development behavior:
+
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `DEMO_MODE` | `True` in dev | Exposes a fake login endpoint (no password required) |
+| `SYSTEM_TESTING` | `False` | Exposes verification tokens in response headers |
+| `DISABLE_THROTTLING` | `False` | Removes all rate limiting |
+| `SILK_PROFILER` | `False` | Enables Django Silk profiling UI |
+
+!!! danger "Production safety"
+    `DEMO_MODE` and `SYSTEM_TESTING` must be `False` in production. `DEMO_MODE` defaults to `True` when `DEBUG=True`, so it's safe in development, but always verify production `.env` files.
+
+!!! warning "Silk deadlocks under parallel E2E runs"
+    Django Silk's middleware writes a request row to Postgres on every request. When the frontend
+    E2E suite drives a local `make run` backend with several parallel Playwright workers, those
+    concurrent inserts can deadlock in Postgres and surface as sporadic 500s on unrelated
+    endpoints (e.g. `POST /api/account/verify`). Run the backend with **`SILK_PROFILER=False`**
+    for E2E / parallel-load runs — the profiler is a dev-only convenience and is fully gated off
+    by this flag (middleware, app, and URLs). The durable fix belongs in the E2E harness that
+    launches the backend (see `letsrevel/revel-frontend#596`); this is tracked in #671.

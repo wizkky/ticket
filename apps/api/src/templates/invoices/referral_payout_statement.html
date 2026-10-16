@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+{% load invoice_filters %}
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>{{ document_title }} {{ document_number }}</title>
+  {% include "invoices/_base_styles.html" %}
+</head>
+<body>
+  {% include "invoices/_brand_header.html" %}
+
+  <div class="header">
+    <div class="supplier-info">
+      <div class="supplier-name">{{ platform_business_name }}</div>
+      <div class="supplier-details">
+        {{ platform_business_address }}<br>
+        VAT: {{ platform_vat_id }}
+      </div>
+    </div>
+    <div class="invoice-badge">
+      <div class="invoice-title">{{ document_title }}</div>
+      <div class="invoice-meta">
+        <strong>Number</strong> {{ document_number }}<br>
+        <strong>Date</strong> {{ issued_date }}<br>
+        <strong>Period</strong> {{ period_start }} &mdash; {{ period_end }}<br>
+        <strong>Currency</strong> {{ currency }}
+      </div>
+    </div>
+  </div>
+
+  <hr class="divider">
+
+  <div class="bill-to-section">
+    <div class="bill-to-label">{% if is_b2b %}Supplier{% else %}Recipient{% endif %}</div>
+    <div class="bill-to-name">{{ referrer_name }}</div>
+    <div class="bill-to-details">
+      {% if referrer_address %}{{ referrer_address }}<br>{% endif %}
+      {% if is_b2b and referrer_vat_id %}VAT: {{ referrer_vat_id }}{% endif %}
+    </div>
+  </div>
+
+  <table class="items-table">
+    <thead>
+      <tr>
+        <th>Description</th>
+        <th>Amount</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Referral commission &mdash; {{ period_label }}</td>
+        <td>{{ amount_net|format_currency:currency }}</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="totals">
+    <div class="totals-box">
+      <div class="totals-row subtotal">
+        <span>Subtotal</span>
+        <span>{{ amount_net|format_currency:currency }}</span>
+      </div>
+      {% if is_b2b %}
+        {% if reverse_charge %}
+        <div class="totals-row vat">
+          <span>VAT</span>
+          <span>Reverse Charge</span>
+        </div>
+        {% else %}
+        <div class="totals-row vat">
+          <span>VAT ({{ vat_rate }}%)</span>
+          <span>{{ amount_vat|format_currency:currency }}</span>
+        </div>
+        {% endif %}
+      {% else %}
+      <div class="totals-row vat">
+        <span>VAT</span>
+        <span>N/A</span>
+      </div>
+      {% endif %}
+      <div class="totals-row total">
+        <span>Total</span>
+        <span>{{ amount_gross|format_currency:currency }}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <div class="notes">
+      {% if is_b2b and reverse_charge %}
+      <div class="footer-label">Tax Notice</div>
+      <div class="notes-text">
+        Reverse charge: VAT to be accounted for<br>
+        by the recipient of the service.<br>
+        Tax liability transfers to the recipient.
+      </div>
+      {% elif not is_b2b %}
+      <div class="footer-label">Notice</div>
+      <div class="notes-text">
+        This is a payout statement, not a VAT invoice.<br>
+        No VAT ID on file for the recipient.
+      </div>
+      {% endif %}
+      {% if is_b2b %}
+      <div class="footer-label" style="margin-top: 12px;">Self-Billing Notice</div>
+      <div class="notes-text">
+        This document was issued by the recipient of the service<br>
+        on behalf of the supplier under a self-billing agreement.
+      </div>
+      {% endif %}
+    </div>
+  </div>
+
+</body>
+</html>

@@ -1,0 +1,253 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import SearchInput from '$lib/components/events/filters/SearchInput.svelte';
+	import { parseTicketOrderBy, type TicketOrderBy } from './ticket-sort';
+
+	interface Props {
+		searchQuery: string;
+		selectedStatus: string | null;
+		selectedPaymentMethod: string | null;
+		selectedSource?: string | null;
+		/** Only sales whose attendee invoice Revel skipped (#1008). */
+		invoiceSkippedOnly?: boolean;
+		selectedOrderBy?: TicketOrderBy;
+		onSearch: (value: string) => void;
+		onStatusFilter: (status: string | null) => void;
+		onPaymentMethodFilter: (method: string | null) => void;
+		onSourceFilter?: (source: string | null) => void;
+		onInvoiceSkippedFilter?: (only: boolean) => void;
+		onSort?: (orderBy: TicketOrderBy | undefined) => void;
+	}
+
+	const {
+		searchQuery,
+		selectedStatus,
+		selectedPaymentMethod,
+		selectedSource = null,
+		invoiceSkippedOnly = false,
+		selectedOrderBy,
+		onSearch,
+		onStatusFilter,
+		onPaymentMethodFilter,
+		onSourceFilter,
+		onInvoiceSkippedFilter,
+		onSort
+	}: Props = $props();
+
+	// Mobile sort options (the desktop table sorts via clickable column headers).
+	const sortOptions: { value: TicketOrderBy; label: () => string }[] = [
+		{ value: '-created_at', label: m['eventTicketsAdmin.sortNewest'] },
+		{ value: 'created_at', label: m['eventTicketsAdmin.sortOldest'] },
+		{ value: 'tier__name', label: m['eventTicketsAdmin.sortTierAsc'] },
+		{ value: '-tier__name', label: m['eventTicketsAdmin.sortTierDesc'] },
+		{ value: 'price', label: m['eventTicketsAdmin.sortPriceAsc'] },
+		{ value: '-price', label: m['eventTicketsAdmin.sortPriceDesc'] },
+		{ value: 'status', label: m['eventTicketsAdmin.sortStatusAsc'] },
+		{ value: '-status', label: m['eventTicketsAdmin.sortStatusDesc'] },
+		{ value: 'tier__payment_method', label: m['eventTicketsAdmin.sortPaymentAsc'] },
+		{ value: '-tier__payment_method', label: m['eventTicketsAdmin.sortPaymentDesc'] }
+	];
+
+	function handleSortChange(event: Event) {
+		const value = (event.currentTarget as HTMLSelectElement).value;
+		onSort?.(parseTicketOrderBy(value));
+	}
+</script>
+
+<div class="mt-6 space-y-4">
+	<!-- Search -->
+	<SearchInput
+		value={searchQuery}
+		{onSearch}
+		placeholder={m['eventTicketsAdmin.searchPlaceholder']()}
+		ariaLabel={m['eventTicketsAdmin.searchPlaceholder']()}
+	/>
+
+	<!-- Mobile sort (desktop uses the table column headers) -->
+	{#if onSort}
+		<div class="md:hidden">
+			<label for="ticket-sort" class="mb-2 block text-sm font-semibold">
+				{m['eventTicketsAdmin.sortLabel']()}
+			</label>
+			<select
+				id="ticket-sort"
+				value={selectedOrderBy ?? ''}
+				onchange={handleSortChange}
+				class="h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+			>
+				<option value="">{m['eventTicketsAdmin.sortDefault']()}</option>
+				{#each sortOptions as option (option.value)}
+					<option value={option.value}>{option.label()}</option>
+				{/each}
+			</select>
+		</div>
+	{/if}
+
+	<!-- Status Filters -->
+	<div>
+		<h3 class="mb-2 text-sm font-semibold">{m['eventTicketsAdmin.filterByStatus']()}</h3>
+		<div class="flex flex-wrap gap-2">
+			<button
+				type="button"
+				onclick={() => onStatusFilter(null)}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedStatus ===
+				null
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.filterAll']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onStatusFilter('pending')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedStatus ===
+				'pending'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.statsPending']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onStatusFilter('active')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedStatus ===
+				'active'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.statsActive']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onStatusFilter('checked_in')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedStatus ===
+				'checked_in'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.statsCheckedIn']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onStatusFilter('cancelled')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedStatus ===
+				'cancelled'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.statsCancelled']()}
+			</button>
+		</div>
+	</div>
+
+	<!-- Payment Method Filters -->
+	<div>
+		<h3 class="mb-2 text-sm font-semibold">{m['eventTicketsAdmin.filterByPaymentMethod']()}</h3>
+		<div class="flex flex-wrap gap-2">
+			<button
+				type="button"
+				onclick={() => onPaymentMethodFilter(null)}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedPaymentMethod ===
+				null
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.filterAll']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onPaymentMethodFilter('online')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedPaymentMethod ===
+				'online'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.paymentOnline']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onPaymentMethodFilter('offline')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedPaymentMethod ===
+				'offline'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.paymentOffline']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onPaymentMethodFilter('at_the_door')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedPaymentMethod ===
+				'at_the_door'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.paymentAtDoor']()}
+			</button>
+			<button
+				type="button"
+				onclick={() => onPaymentMethodFilter('free')}
+				class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedPaymentMethod ===
+				'free'
+					? 'border-primary bg-primary text-primary-foreground'
+					: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+			>
+				{m['eventTicketsAdmin.paymentFree']()}
+			</button>
+		</div>
+	</div>
+
+	<!-- Source Filters (direct purchase vs. series pass) -->
+	{#if onSourceFilter}
+		<div>
+			<h3 class="mb-2 text-sm font-semibold">{m['eventTicketsAdmin.filterBySource']()}</h3>
+			<div class="flex flex-wrap gap-2">
+				<button
+					type="button"
+					onclick={() => onSourceFilter(null)}
+					aria-pressed={selectedSource === null}
+					class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedSource ===
+					null
+						? 'border-primary bg-primary text-primary-foreground'
+						: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+				>
+					{m['eventTicketsAdmin.filterAll']()}
+				</button>
+				<button
+					type="button"
+					onclick={() => onSourceFilter('direct')}
+					aria-pressed={selectedSource === 'direct'}
+					class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedSource ===
+					'direct'
+						? 'border-primary bg-primary text-primary-foreground'
+						: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+				>
+					{m['eventTicketsAdmin.sourceDirect']()}
+				</button>
+				<button
+					type="button"
+					onclick={() => onSourceFilter('pass')}
+					aria-pressed={selectedSource === 'pass'}
+					class="rounded-md border px-3 py-1 text-sm font-medium transition-colors {selectedSource ===
+					'pass'
+						? 'border-primary bg-primary text-primary-foreground'
+						: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+				>
+					{m['eventTicketsAdmin.sourcePass']()}
+				</button>
+			</div>
+		</div>
+	{/if}
+
+	{#if onInvoiceSkippedFilter}
+		<label class="flex w-fit cursor-pointer items-center gap-2 text-sm font-medium">
+			<input
+				type="checkbox"
+				checked={invoiceSkippedOnly}
+				onchange={(e) => onInvoiceSkippedFilter(e.currentTarget.checked)}
+				class="h-4 w-4 rounded border-input accent-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+			/>
+			{m['compliance.skipped.ticketFilter']()}
+		</label>
+	{/if}
+</div>

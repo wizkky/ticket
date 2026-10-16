@@ -1,0 +1,230 @@
+site_name: Revel Backend Documentation
+site_url: https://docs.letsrevel.io
+site_description: Developer documentation for the Revel event management platform backend.
+repo_url: https://github.com/letsrevel/revel-backend
+repo_name: letsrevel/revel-backend
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to dark mode
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.instant
+    - navigation.instant.prefetch
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.path
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - header.autohide
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tooltips
+    - content.tabs.link
+    - palette.toggle
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: index.md
+  - What's New:
+      - whats-new/index.md
+      - whats-new/2026-09-30-last-month.md
+      - whats-new/2026-09-01-last-month.md
+      - whats-new/2026-07-31-last-month.md
+      - whats-new/2026-06-22-last-month.md
+  - Getting Started:
+      - getting-started/index.md
+      - Quick Start: getting-started/quickstart.md
+      - Project Structure: getting-started/project-structure.md
+      - Development Commands: getting-started/development-commands.md
+      - Troubleshooting: getting-started/troubleshooting.md
+  - Architecture:
+      - architecture/index.md
+      - Service Layer: architecture/service-layer.md
+      - Controllers: architecture/controllers.md
+      - Permissions & Roles: architecture/permissions.md
+      - Eligibility Pipeline: architecture/eligibility-pipeline.md
+      - Membership Eligibility: architecture/membership-eligibility.md
+      - Membership Subscriptions: architecture/membership-subscriptions.md
+      - Advanced Waitlist: architecture/waitlist.md
+      - Recurring Series: architecture/recurring-series.md
+      - Series Passes: architecture/series-passes.md
+      - Protected Files (HMAC): architecture/protected-files.md
+      - File Security: architecture/security.md
+      - Notifications: architecture/notifications.md
+      - Email Sending & Opt-Out: architecture/email-sending.md
+      - Scheduled Announcements: architecture/scheduled-announcements.md
+      - Questionnaires: architecture/questionnaires.md
+      - Polls: architecture/polls.md
+      - Content Moderation: architecture/moderation.md
+      - Billing & VAT: architecture/billing-and-vat.md
+      - Exports: architecture/exports.md
+      - Engineering Notes (deep gotchas): engineering-notes.md
+  - Guides:
+      - guides/index.md
+      - User Journey: guides/user-journey.md
+      - Internationalization: guides/internationalization.md
+      - Observability: guides/observability.md
+      - Telegram Bot: guides/telegram-bot.md
+      - Third-Party Apps (OAuth): developer-guide/oauth.md
+      - Demo & Seeding: guides/demo-and-seeding.md
+      - Reserved Seating:
+          - guides/seating/index.md
+          - Venue & Layout Setup: guides/seating/venue-and-layout.md
+          - Tickets, Pricing & Assignment: guides/seating/tiers-and-pricing.md
+          - The Buyer Experience: guides/seating/buyer-experience.md
+          - Box Office & Event-Day Ops: guides/seating/box-office.md
+  - Compliance:
+      - Overview: compliance/index.md
+      - Adding a Country: compliance/adding-a-country.md
+      - EU:
+          - compliance/eu/index.md
+          - Austria: compliance/eu/at.md
+          - Belgium: compliance/eu/be.md
+          - Bulgaria: compliance/eu/bg.md
+          - Croatia: compliance/eu/hr.md
+          - Cyprus: compliance/eu/cy.md
+          - Czechia: compliance/eu/cz.md
+          - Denmark: compliance/eu/dk.md
+          - Estonia: compliance/eu/ee.md
+          - Finland: compliance/eu/fi.md
+          - France: compliance/eu/fr.md
+          - Germany: compliance/eu/de.md
+          - Greece: compliance/eu/gr.md
+          - Hungary: compliance/eu/hu.md
+          - Ireland: compliance/eu/ie.md
+          - Italy: compliance/eu/it.md
+          - Latvia: compliance/eu/lv.md
+          - Lithuania: compliance/eu/lt.md
+          - Luxembourg: compliance/eu/lu.md
+          - Malta: compliance/eu/mt.md
+          - Netherlands: compliance/eu/nl.md
+          - Poland: compliance/eu/pl.md
+          - Portugal: compliance/eu/pt.md
+          - Romania: compliance/eu/ro.md
+          - Slovakia: compliance/eu/sk.md
+          - Slovenia: compliance/eu/si.md
+          - Spain: compliance/eu/es.md
+          - Sweden: compliance/eu/se.md
+  - Contributing:
+      - contributing/index.md
+      - Code Style: contributing/code-style.md
+      - Testing: contributing/testing.md
+      - Dependency Management: contributing/dependency-management.md
+      - CI Pipeline: contributing/ci-pipeline.md
+  - ADR:
+      - adr/index.md
+      - adr/0000-no-async-orm.md
+      - adr/0001-hmac-caddy-over-s3.md
+      - adr/0002-hybrid-service-architecture.md
+      - adr/0003-django-ninja-over-drf.md
+      - adr/0004-no-dependency-injection.md
+      - adr/0005-django-lts-policy.md
+      - adr/0006-mo-files-in-git.md
+      - adr/0007-celery-exception-propagation.md
+      - adr/0008-environment-feature-flags.md
+      - adr/0009-referral-payout-bounded-contexts.md
+      - adr/0010-dependency-compliance.md
+      - adr/0011-mo-files-built-not-committed.md
+  - Self-Hosting:
+      - Overview: self-hosting/index.md
+      - Quickstart: self-hosting/quickstart.md
+      - DNS & Cloudflare: self-hosting/dns-cloudflare.md
+      - Tiers & Configuration: self-hosting/tiers.md
+      - Observability: self-hosting/observability.md
+      - Maintenance: self-hosting/maintenance.md
+      - Troubleshooting: self-hosting/troubleshooting.md
+  - Runbooks:
+      - runbooks/dependency-audit.md
+      - runbooks/admin-groups.md
+      - runbooks/stripe-hardening-rollout.md
+      - runbooks/stripe-webhook-endpoints.md
+      - runbooks/rate-limit-429s.md
+  - Post-Mortems:
+      - postmortems/index.md
+      - postmortems/0001-guest-user-verification-bypass.md
+      - postmortems/0002-server-side-cursor-pgbouncer.md
+      - postmortems/0003-ssr-post-body-loss-internal-api-path.md
+
+# Internal agent plans/specs live under docs/superpowers/ — kept in git but not published.
+exclude_docs: |
+  superpowers/
+
+plugins:
+  - search
+  - minify:
+      minify_html: true
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.smartsymbols
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/letsrevel
+    - icon: fontawesome/brands/discord
+      link: https://discord.gg/Rnwbzuvxvn
+  generator: false

@@ -1,0 +1,64 @@
+"""Signal handlers for organization membership request notifications."""
+
+import typing as t
+
+import structlog
+from django.db import transaction
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+from common.models import SiteSettings
+from events.models import OrganizationMembershipRequest
+from notifications.enums import NotificationType
+from notifications.service.notification_helpers import notify_org_staff
+
+logger = structlog.get_logger(__name__)
+
+
+@receiver(post_save, sender=OrganizationMembershipRequest)
+def handle_membership_request_created(
+    sender: type[OrganizationMembershipRequest],
+    instance: OrganizationMembershipRequest,
+    created: bool,
+    **kwargs: t.Any,
+) -> None:
+    """Notify organization owners/staff when someone requests membership.
+
+    Sends MEMBERSHIP_REQUEST_CREATED notification to organization staff and owners.
+    """
+    if not created:
+        return
+
+    def send_request_notifications() -> None:
+        organization = instance.organization
+        requester = instance.user
+
+        # Get frontend URL
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+        frontend_url = f"{frontend_base_url}/org/{organization.slug}/admin/members?tab=requests"
+
+        # Notify staff and owners with manage_members permission
+        notified = notify_org_staff(
+            organization_id=organization.id,
+            notification_type=NotificationType.MEMBERSHIP_REQUEST_CREATED,
+            context={
+                "request_id": str(instance.id),
+                "organization_id": str(organization.id),
+                "organization_name": organization.name,
+                "requester_id": str(requester.id),
+                "requester_name": requester.display_name,
+                "requester_email": requester.email,
+                "request_message": instance.message or "",
+                "frontend_url": frontend_url,
+            },
+            sender=handle_membership_request_created,
+        )
+
+        logger.info(
+            "membership_request_notifications_sent",
+            request_id=str(instance.id),
+            organization_id=str(organization.id),
+            recipient_count=notified,
+        )
+
+    transaction.on_commit(send_request_notifications)

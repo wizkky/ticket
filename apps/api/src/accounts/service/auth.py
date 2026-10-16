@@ -1,0 +1,84 @@
+"""Authentication service layer."""
+
+from datetime import datetime, timedelta
+from uuid import uuid4
+
+import pyotp
+import structlog
+from django.conf import settings
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from ninja.errors import HttpError
+from ninja_jwt.schema import TokenObtainPairOutputSchema
+from ninja_jwt.tokens import RefreshToken
+
+from accounts import schema
+from accounts.jwt import TOTPJWTPayload, check_blacklist, create_token, validate_otp_jwt
+from accounts.jwt import blacklist as blacklist_token
+from accounts.models import RevelUser
+
+logger = structlog.get_logger(__name__)
+
+
+def get_temporary_otp_jwt(user: RevelUser) -> str:
+    """Get a temporary JWT.
+
+    This will need to be used by a user in combination with their OTP code to obtain a valid JWT.
+    """
+    logger.info("otp_jwt_generated", user_id=str(user.id), email=user.email)
+    payload = TOTPJWTPayload(
+        sub=str(user.id),
+        aud=settings.JWT_AUDIENCE,
+        email=user.email,
+        user_id=user.id,
+        iat=datetime.now(),
+        exp=datetime.now() + timedelta(minutes=5),
+        jti=uuid4().hex,
+    )
+    return create_token(payload.model_dump(mode="json"), settings.SECRET_KEY, settings.JWT_ALGORITHM)
+
+
+@transaction.atomic
+def verify_otp_jwt(token: str, otp: str) -> tuple[RevelUser, bool]:
+    """Verify the OTP JWT token."""
+    validated_token = validate_otp_jwt(
+        token, key=settings.SECRET_KEY, audience=settings.JWT_AUDIENCE, algorithms=[settings.JWT_ALGORITHM]
+    )
+    check_blacklist(validated_token.jti)
+    if validated_token.type != "totp-access":
+        logger.warning("otp_verification_invalid_token_type", token_type=validated_token.type)  # type: ignore[unreachable]
+        raise HttpError(401, str(_("Invalid token type.")))
+    blacklist_token(token)
+    user = get_object_or_404(RevelUser, id=validated_token.user_id)
+    totp = pyotp.TOTP(user.totp_secret)
+    is_valid = totp.verify(otp)
+    logging_method, result = (
+        (logger.info, "otp_verification_success") if is_valid else (logger.warning, "otp_verification_failure")
+    )
+    logging_method(result, user_id=str(user.id), email=user.email)
+    return user, is_valid
+
+
+def get_token_pair_for_user(user: RevelUser) -> TokenObtainPairOutputSchema:
+    """Get a token pair for the user."""
+    user.last_login = timezone.now()
+    user.save(update_fields=["last_login"])
+
+    logger.info("token_pair_generated", user_id=str(user.id), email=user.email)
+    token = RefreshToken.for_user(user)
+    token.payload.update(schema.RevelUserSchema.from_orm(user).model_dump(mode="json"))
+    token.payload.update(
+        {
+            "sub": str(user.id),
+            "groups": list(user.groups.values_list("name", flat=True)),
+            "is_staff": user.is_staff,
+            "is_superuser": user.is_superuser,
+        }
+    )
+    return TokenObtainPairOutputSchema(
+        username=user.username,
+        access=str(token.access_token),  # type: ignore[attr-defined]
+        refresh=str(token),
+    )

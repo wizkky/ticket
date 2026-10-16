@@ -1,0 +1,412 @@
+import typing as t
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+import pytest
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.utils import timezone
+
+from accounts.models import RevelUser
+from events.models import (
+    Event,
+    EventInvitation,
+    EventInvitationRequest,
+    EventSeries,
+    EventToken,
+    MembershipTier,
+    Organization,
+    OrganizationMember,
+    OrganizationMembershipRequest,
+    OrganizationQuestionnaire,
+    OrganizationStaff,
+    OrganizationToken,
+    Payment,
+    PermissionMap,
+    PermissionsSchema,
+    Ticket,
+    TicketTier,
+    Venue,
+    VenueSeat,
+    VenueSector,
+)
+from questionnaires.models import Questionnaire, QuestionnaireEvaluation, QuestionnaireSubmission
+
+
+@pytest.fixture
+def organization_owner_user(django_user_model: t.Type[RevelUser]) -> RevelUser:
+    return django_user_model.objects.create_user(
+        username="organization_owner_user", email="a@example.com", password="pass", email_verified=True
+    )
+
+
+@pytest.fixture
+def organization_staff_user(django_user_model: t.Type[RevelUser]) -> RevelUser:
+    return django_user_model.objects.create_user(
+        username="organization_staff_user", email="b@example.com", password="pass"
+    )
+
+
+@pytest.fixture
+def nonmember_user(django_user_model: t.Type[RevelUser]) -> RevelUser:
+    return django_user_model.objects.create_user(username="nonmember_user", email="c@example.com", password="pass")
+
+
+@pytest.fixture
+def organization(organization_owner_user: RevelUser) -> Organization:
+    return Organization.objects.create(
+        name="Org", slug="org", owner=organization_owner_user, accept_membership_requests=True
+    )
+
+
+@pytest.fixture
+def event_series(organization: Organization) -> EventSeries:
+    return EventSeries.objects.create(organization=organization, name="Series", slug="series")
+
+
+@pytest.fixture
+def staff_member(organization: Organization, organization_staff_user: RevelUser) -> OrganizationStaff:
+    return OrganizationStaff.objects.create(
+        organization=organization,
+        user=organization_staff_user,
+        permissions=PermissionsSchema(default=PermissionMap(edit_organization=True)).model_dump(mode="json"),
+    )
+
+
+@pytest.fixture
+def event(organization: Organization, event_series: EventSeries) -> Event:
+    return Event.objects.create(
+        organization=organization,
+        name="Event",
+        slug="event",
+        event_type=Event.EventType.PUBLIC,
+        visibility=Event.Visibility.PUBLIC,
+        event_series=event_series,
+        max_attendees=100,
+        start=timezone.now(),
+        status="open",
+        requires_ticket=True,
+    )
+
+
+@pytest.fixture
+def seated_event(event: Event, organization: Organization) -> tuple[Event, list[VenueSeat]]:
+    """The generic event bound to a venue with one seated sector of six seats (A1..A6)."""
+    venue = Venue.objects.create(organization=organization, name="Hall")
+    sector = VenueSector.objects.create(venue=venue, name="Stalls")
+    seats = [
+        VenueSeat.objects.create(sector=sector, label=f"A{i}", row_label="A", number=i, adjacency_index=i - 1)
+        for i in range(1, 7)
+    ]
+    event.venue = venue
+    # The Event default (1) would cap holds at a single seat; None means "unlimited
+    # tickets", so holds fall back to the seated tiers' caps — or, as here where no
+    # capped seated tier exists, to DEFAULT_MAX_HELD_SEATS.
+    event.max_tickets_per_user = None
+    event.save(update_fields=["venue", "max_tickets_per_user"])
+    return event, seats
+
+
+# --- User Fixtures ---
+# Your existing user fixtures are fine: organization_owner_user, organization_staff_user
+
+
+@pytest.fixture
+def member_user(django_user_model: type[RevelUser]) -> RevelUser:
+    """A user who is a standard member of the organization."""
+    return django_user_model.objects.create_user(username="member_user", email="member@example.com", password="pass")
+
+
+@pytest.fixture
+def public_user(django_user_model: type[RevelUser]) -> RevelUser:
+    """A user with no special relationship to the organization."""
+    return django_user_model.objects.create_user(username="public_user", email="public@example.com", password="pass")
+
+
+# --- Organization Fixture ---
+# Your existing organization fixture is fine
+
+
+@pytest.fixture
+def organization_membership(organization: Organization, member_user: RevelUser) -> OrganizationMember:
+    """Make the member_user a member of the main organization."""
+    return OrganizationMember.objects.create(organization=organization, user=member_user)
+
+
+# --- Event and Tier Fixtures ---
+@pytest.fixture
+def public_event(organization: Organization, next_week: datetime) -> Event:
+    """A standard public event."""
+    return Event.objects.create(
+        organization=organization,
+        name="Public Event",
+        slug="Public-Event",
+        visibility=Event.Visibility.PUBLIC,
+        event_type=Event.EventType.PUBLIC,
+        max_attendees=10,
+        status="open",
+        start=next_week,
+        end=next_week + timedelta(days=1),
+        accept_invitation_requests=True,
+        requires_ticket=True,
+    )
+
+
+@pytest.fixture
+def private_event(organization: Organization, next_week: datetime) -> Event:
+    """A private, invite-only event."""
+    return Event.objects.create(
+        organization=organization,
+        name="Private Event",
+        slug="Private-Event",
+        visibility=Event.Visibility.PRIVATE,
+        event_type=Event.EventType.PRIVATE,
+        max_attendees=10,
+        status="open",
+        start=next_week,
+        end=next_week + timedelta(days=1),
+        accept_invitation_requests=True,
+        requires_ticket=True,
+    )
+
+
+@pytest.fixture
+def members_only_event(organization: Organization, next_week: datetime) -> Event:
+    """A members-only event."""
+    return Event.objects.create(
+        organization=organization,
+        name="Members Only Event",
+        slug="Members-Only-Event",
+        visibility=Event.Visibility.MEMBERS_ONLY,
+        event_type=Event.EventType.MEMBERS_ONLY,
+        status="open",
+        start=next_week,
+        end=next_week + timedelta(days=1),
+        requires_ticket=True,
+    )
+
+
+@pytest.fixture
+def vip_tier(public_event: Event) -> TicketTier:
+    """A 'VIP' ticket tier for the public event."""
+    return TicketTier.objects.create(event=public_event, name="VIP")
+
+
+@pytest.fixture
+def event_ticket_tier(event: Event) -> TicketTier:
+    """A ticket tier for the generic event fixture."""
+    return TicketTier.objects.create(
+        event=event, name="General", price=10.00, payment_method=TicketTier.PaymentMethod.ONLINE
+    )
+
+
+@pytest.fixture
+def ticket(event: Event, member_user: RevelUser, event_ticket_tier: TicketTier) -> Ticket:
+    return Ticket.objects.create(
+        event=event,
+        user=member_user,
+        tier=event_ticket_tier,
+        guest_name=member_user.get_display_name(),
+    )
+
+
+@pytest.fixture
+def invitation(public_user: RevelUser, private_event: Event, vip_tier: TicketTier) -> EventInvitation:
+    """An invitation for the public_user to the private_event for the VIP tier."""
+    invitation = EventInvitation.objects.create(
+        user=public_user,
+        event=private_event,
+        overrides_max_attendees=False,
+        waives_questionnaire=False,
+    )
+    invitation.tiers.add(vip_tier)
+    return invitation
+
+
+# --- Request Fixtures ---
+@pytest.fixture
+def event_invitation_request(public_event: Event, public_user: RevelUser) -> "EventInvitationRequest":
+    """An invitation request from the public_user for the public_event."""
+    return EventInvitationRequest.objects.create(event=public_event, user=public_user)
+
+
+@pytest.fixture
+def event_token(event: Event) -> EventToken:
+    """An event token."""
+    return EventToken.objects.create(event=event, issuer=event.organization.owner)
+
+
+@pytest.fixture
+def organization_membership_request(
+    organization: Organization, nonmember_user: RevelUser
+) -> "OrganizationMembershipRequest":
+    """A membership request from the nonmember_user for the organization."""
+    return OrganizationMembershipRequest.objects.create(organization=organization, user=nonmember_user)
+
+
+# --- Questionnaire Fixtures ---
+@pytest.fixture
+def questionnaire() -> Questionnaire:
+    return Questionnaire.objects.create(name="Test Questionnaire", status=Questionnaire.QuestionnaireStatus.PUBLISHED)
+
+
+@pytest.fixture
+def org_questionnaire(organization: Organization, questionnaire: Questionnaire) -> OrganizationQuestionnaire:
+    """Link the questionnaire to the main organization."""
+    return OrganizationQuestionnaire.objects.create(organization=organization, questionnaire=questionnaire)
+
+
+@pytest.fixture
+def submitted_submission(member_user: RevelUser, questionnaire: Questionnaire) -> QuestionnaireSubmission:
+    """A submitted questionnaire from the member_user."""
+    return QuestionnaireSubmission.objects.create(
+        user=member_user,
+        questionnaire=questionnaire,
+        status=QuestionnaireSubmission.QuestionnaireSubmissionStatus.READY,
+    )
+
+
+@pytest.fixture
+def approved_evaluation(submitted_submission: QuestionnaireSubmission) -> QuestionnaireEvaluation:
+    """An approved evaluation for the member's submission."""
+    return QuestionnaireEvaluation.objects.create(
+        submission=submitted_submission, status=QuestionnaireEvaluation.QuestionnaireEvaluationStatus.APPROVED
+    )
+
+
+@pytest.fixture
+def rejected_evaluation(submitted_submission: QuestionnaireSubmission) -> QuestionnaireEvaluation:
+    """A rejected evaluation for the member's submission."""
+    return QuestionnaireEvaluation.objects.create(
+        submission=submitted_submission, status=QuestionnaireEvaluation.QuestionnaireEvaluationStatus.REJECTED
+    )
+
+
+@pytest.fixture
+def png_file(png_bytes: bytes) -> SimpleUploadedFile:
+    """Return a valid-looking PNG file upload."""
+    return SimpleUploadedFile(
+        name="test.png",
+        content=png_bytes,
+        content_type="image/png",
+    )
+
+
+@pytest.fixture
+def organization_token(organization: Organization, organization_owner_user: RevelUser) -> OrganizationToken:
+    # Get the default "General membership" tier created by the signal
+    default_tier = MembershipTier.objects.get(organization=organization, name="General membership")
+    return OrganizationToken.objects.create(
+        organization=organization, name="Test Token", issuer=organization_owner_user, membership_tier=default_tier
+    )
+
+
+@pytest.fixture
+def tier_online_with_cancellation_enabled(tier_factory: t.Callable[..., TicketTier]) -> TicketTier:
+    """An ONLINE tier with user cancellation enabled and a simple 100% refund policy."""
+    return tier_factory(
+        payment_method=TicketTier.PaymentMethod.ONLINE,
+        price=Decimal("40.00"),
+        allow_user_cancellation=True,
+        refund_policy={
+            "tiers": [{"hours_before_event": 48, "refund_percentage": "100"}],
+            "flat_fee": "0",
+        },
+    )
+
+
+@pytest.fixture
+def tier_online_with_cancellation_disabled(tier_factory: t.Callable[..., TicketTier]) -> TicketTier:
+    """An ONLINE tier with user cancellation disabled."""
+    return tier_factory(
+        payment_method=TicketTier.PaymentMethod.ONLINE,
+        price=Decimal("40.00"),
+        allow_user_cancellation=False,
+    )
+
+
+@pytest.fixture
+def tier_factory(event: Event) -> t.Callable[..., TicketTier]:
+    """Factory for ``TicketTier`` instances. Keyword args override defaults.
+
+    Args:
+        event: Default event to attach tiers to (uses the ``event`` fixture).
+
+    Returns:
+        A callable that creates and returns a ``TicketTier``.
+    """
+
+    def _make(**kwargs: t.Any) -> TicketTier:
+        defaults: dict[str, t.Any] = {
+            "event": event,
+            "name": "Factory Tier",
+            "price": Decimal("40.00"),
+            "currency": "EUR",
+            "payment_method": TicketTier.PaymentMethod.ONLINE,
+        }
+        defaults.update(kwargs)
+        # Ensure unique names when multiple tiers are created for the same event.
+        if "name" not in kwargs:
+            existing = TicketTier.objects.filter(event=defaults["event"], name=defaults["name"]).count()
+            if existing:
+                defaults["name"] = f"Factory Tier {existing + 1}"
+        return TicketTier.objects.create(**defaults)
+
+    return _make
+
+
+@pytest.fixture
+def ticket_factory(
+    event: Event,
+    member_user: RevelUser,
+    tier_factory: t.Callable[..., TicketTier],
+) -> t.Callable[..., Ticket]:
+    """Factory for ``Ticket`` instances. Keyword args override defaults.
+
+    Args:
+        event: Default event (uses the ``event`` fixture).
+        member_user: Default user (uses the ``member_user`` fixture).
+        tier_factory: Used to auto-create a tier when none is supplied.
+
+    Returns:
+        A callable that creates and returns a ``Ticket``.
+    """
+
+    def _make(**kwargs: t.Any) -> Ticket:
+        tier = kwargs.pop("tier", None) or tier_factory()
+        user = kwargs.pop("user", member_user)
+        defaults: dict[str, t.Any] = {
+            "event": event,
+            "user": user,
+            "tier": tier,
+            "status": Ticket.TicketStatus.ACTIVE,
+            "guest_name": user.get_display_name(),
+        }
+        defaults.update(kwargs)
+        return Ticket.objects.create(**defaults)
+
+    return _make
+
+
+@pytest.fixture
+def payment_factory() -> t.Callable[..., Payment]:
+    """Factory for ``Payment`` instances linked to a ticket. Keyword args override defaults.
+
+    Returns:
+        A callable that accepts a ``ticket`` positional arg and creates a ``Payment``.
+    """
+
+    def _make(ticket: Ticket, **kwargs: t.Any) -> Payment:
+        defaults: dict[str, t.Any] = {
+            "ticket": ticket,
+            "user": ticket.user,
+            "amount": Decimal("40.00"),
+            "platform_fee": Decimal("0.00"),
+            "currency": "EUR",
+            "status": Payment.PaymentStatus.SUCCEEDED,
+            "stripe_session_id": f"cs_test_{ticket.id}",
+            "stripe_payment_intent_id": f"pi_test_{ticket.id}",
+        }
+        defaults.update(kwargs)
+        return Payment.objects.create(**defaults)
+
+    return _make

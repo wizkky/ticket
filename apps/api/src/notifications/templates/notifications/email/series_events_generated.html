@@ -1,0 +1,16 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<p>{% blocktranslate with series=context.event_series_name count counter=context.events_count %}<strong>{{ counter }}</strong> new event has been scheduled for <strong>{{ series }}</strong>.{% plural %}<strong>{{ counter }}</strong> new events have been scheduled for <strong>{{ series }}</strong>.{% endblocktranslate %}</p>
+
+<div class="card">
+    <div class="info-row"><span class="label">{% trans "Series:" %}</span> {{ context.event_series_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Organization:" %}</span> {{ context.organization_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Events scheduled:" %}</span> {{ context.events_count }}</div>
+</div>
+
+<center>
+    <a href="{{ context.series_url }}" class="button">{% trans "View Series" %}</a>
+</center>
+{% endblock %}

@@ -1,0 +1,407 @@
+"""Member-facing endpoints for membership subscriptions."""
+
+import typing as t
+from uuid import UUID
+
+from django.db.models import F, Prefetch, QuerySet
+from django.http import Http404
+from django.shortcuts import get_object_or_404
+from django.utils.translation import gettext as _
+from ninja.errors import HttpError
+from ninja_extra import api_controller, route
+from ninja_extra.pagination import PageNumberPaginationExtra, PaginatedResponseSchema, paginate
+
+from common.authentication import I18nJWTAuth, ScopedJWTAuth
+from common.controllers import UserAwareController
+from common.schema import ErrorDetail
+from common.throttling import UserDefaultThrottle, WriteThrottle
+from events import schema
+from events.models import (
+    MembershipPayment,
+    MembershipSubscription,
+    MembershipSubscriptionPlan,
+    Organization,
+    OrganizationMember,
+)
+from events.service.subscription import eligibility as subscription_eligibility
+from events.service.subscription import lifecycle as subscription_lifecycle
+from events.service.subscription import uncancel as subscription_uncancel
+from events.service.subscription.stripe import checkout as subscription_stripe_checkout
+from oauth.permissions import RequireScope
+
+
+@api_controller(
+    "/me",
+    auth=ScopedJWTAuth(),
+    tags=["Me - Subscriptions"],
+    throttle=UserDefaultThrottle(),
+    permissions=[RequireScope("me:read")],
+)
+class MeSubscriptionsController(UserAwareController):
+    """Member-facing access to the current user's own membership subscriptions."""
+
+    @route.get(
+        "/membership-subscriptions",
+        url_name="list_my_membership_subscriptions",
+        response=PaginatedResponseSchema[schema.MySubscriptionSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    def list_my_subscriptions(self) -> QuerySet[MembershipSubscription]:
+        """List all of the current user's memberships subscriptions across organizations."""
+        return (
+            MembershipSubscription.objects.filter(user=self.user())
+            .select_related("plan", "plan__tier", "organization")
+            .order_by("-created_at")
+        )
+
+    @route.get(
+        "/memberships",
+        url_name="list_my_memberships",
+        response=PaginatedResponseSchema[schema.MyMembershipSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    def list_my_memberships(self) -> QuerySet[OrganizationMember]:
+        """List every organization the user is a member of (legacy + subscription-backed).
+
+        Each entry inlines the caller's most recent non-terminal subscription for that
+        organization when one exists. Includes BANNED memberships so the frontend can
+        render an explicit banned state; the FE may filter as needed.
+        """
+        user = self.user()
+        active_subs = (
+            MembershipSubscription.objects.filter(user=user)
+            .exclude(status__in=MembershipSubscription.TERMINAL_STATUSES)
+            .select_related("plan", "plan__tier", "organization")
+            .order_by("-created_at")
+        )
+        return (
+            OrganizationMember.objects.filter(user=user)
+            .select_related("organization", "tier")
+            .prefetch_related(
+                Prefetch(
+                    "organization__membership_subscriptions",
+                    queryset=active_subs,
+                    to_attr="_caller_active_subs",
+                )
+            )
+            .order_by("-created_at", "-id")
+        )
+
+    @route.get(
+        "/organizations/{org_id}/subscription",
+        url_name="get_my_organization_subscription",
+        response={200: schema.MySubscriptionSchema, 404: ErrorDetail},
+    )
+    def get_my_subscription(self, org_id: UUID) -> MembershipSubscription:
+        """Get the current user's most recent non-terminal subscription in an organization.
+
+        404 if the user has never subscribed (or only has fully-terminated history).
+        """
+        qs = (
+            MembershipSubscription.objects.filter(user=self.user(), organization_id=org_id)
+            .exclude(status__in=MembershipSubscription.TERMINAL_STATUSES)
+            .select_related("plan", "plan__tier", "organization")
+            .order_by("-created_at")
+        )
+        return get_object_or_404(qs)
+
+    @route.get(
+        "/organizations/{org_id}/subscription/payments",
+        url_name="list_my_membership_payments",
+        response=PaginatedResponseSchema[schema.MyMembershipPaymentSchema],
+    )
+    @paginate(PageNumberPaginationExtra, page_size=20)
+    def list_my_subscription_payments(self, org_id: UUID) -> QuerySet[MembershipPayment]:
+        """List the caller's own membership payments in an organization, newest first.
+
+        Covers every subscription the caller has ever had in that org (including
+        terminated ones) so the billing history survives a cancel/revive cycle,
+        and both ONLINE and OFFLINE plans — an offline member has no Stripe
+        portal, so this is their only record of what they were charged.
+        """
+        return MembershipPayment.objects.filter(
+            subscription__user=self.user(),
+            subscription__organization_id=org_id,
+        ).order_by("-created_at", "-id")
+
+    @route.post(
+        "/organizations/{org_id}/subscribe",
+        url_name="subscribe_to_membership_plan",
+        # ``me:read`` is a READ scope — its label promises only "See your profile, tickets,
+        # RSVPs, memberships, invoices and payments". A read scope must never be the sole
+        # gate on an unsafe method (a write needs a scope of its own), and no write scope
+        # in the registry covers this, so the route stays session-only (R-99).
+        auth=I18nJWTAuth(),
+        response={
+            # 400 carries either the serialized eligibility verdict (gate-stack
+            # refusal — same shape /apply returns) or a plain {detail} error.
+            201: schema.SubscribeResponseSchema,
+            400: schema.MembershipEligibilitySchema | ErrorDetail,
+            404: ErrorDetail,
+            409: schema.SubscriptionActivationPendingSchema,
+            502: ErrorDetail,
+        },
+        throttle=WriteThrottle(),
+    )
+    def subscribe(
+        self,
+        org_id: UUID,
+        payload: schema.SubscribeRequestSchema,
+    ) -> tuple[int, schema.SubscribeResponseSchema]:
+        """Subscribe to an ONLINE (Stripe) or FREE (self-serve) membership plan.
+
+        Runs the full membership eligibility gate stack first — a questionnaire
+        or manual-approval requirement on the tier must be satisfied before
+        anything is granted.
+
+        For an ONLINE plan, returns the local subscription row plus a hosted
+        Stripe Checkout ``checkout_url`` the frontend redirects the member to
+        for payment; when the caller has an application on file (the gated
+        flow), the created subscription is linked to it so the Stripe
+        activation can settle it COMPLETED.
+
+        For a FREE plan there is nothing to pay: ``checkout_url`` is ``null``,
+        the subscription is already ACTIVE with no period end (FREE plans are
+        LIFETIME and never renew), the membership is granted, and any
+        originating application is settled COMPLETED straight away.
+        """
+        # Visibility-aware load: hard-blacklisted users get a 404 (the org is
+        # invisible to them) rather than a distinguishable 403, matching the
+        # anti-enumeration posture of the other member-facing entry points.
+        organization = get_object_or_404(Organization.objects.for_user(self.user()), pk=org_id)
+        plan = get_object_or_404(
+            MembershipSubscriptionPlan.objects.select_related("tier", "tier__organization"),
+            pk=payload.plan_id,
+            tier__organization=organization,
+            is_active=True,
+        )
+        subscription, checkout_url = subscription_eligibility.subscribe_to_plan(plan, self.user())
+        # Return a dict (not a constructed schema): Ninja's response pipeline will
+        # validate it via ``SubscribeResponseSchema``. Pre-validating the inner
+        # ``MySubscriptionSchema`` would cause Ninja's wrap-validator to re-run
+        # resolvers against the already-validated schema instance (which lacks
+        # the original Django relations), breaking serialization.
+        return 201, t.cast(
+            schema.SubscribeResponseSchema,
+            {"subscription": subscription, "checkout_url": checkout_url},
+        )
+
+    @route.post(
+        "/organizations/{org_id}/subscription/cancel",
+        url_name="cancel_my_membership_subscription",
+        # Session-only for the same reason as the first write on this controller (R-99).
+        auth=I18nJWTAuth(),
+        response={
+            200: schema.MySubscriptionSchema,
+            400: ErrorDetail,
+            404: ErrorDetail,
+            # The Checkout Session backing a PENDING row was paid mid-cancel:
+            # the money moved, so the cancel waits for the activation webhooks.
+            409: schema.SubscriptionActivationPendingSchema,
+            502: ErrorDetail,
+        },
+        throttle=WriteThrottle(),
+    )
+    def cancel_subscription(
+        self,
+        org_id: UUID,
+        payload: schema.MemberCancelSubscriptionSchema,
+    ) -> MembershipSubscription:
+        """Cancel the caller's active subscription in an organization.
+
+        For ONLINE plans the cancel is mirrored to Stripe; the webhook then
+        settles local state. ``immediate=False`` (default) schedules the
+        cancellation at the period boundary.
+        """
+        qs = (
+            MembershipSubscription.objects.filter(user=self.user(), organization_id=org_id)
+            .exclude(status__in=MembershipSubscription.TERMINAL_STATUSES)
+            .select_related("plan", "plan__tier", "organization")
+            .order_by("-created_at")
+        )
+        subscription = get_object_or_404(qs)
+        return subscription_lifecycle.cancel_subscription(subscription, immediate=payload.immediate)
+
+    @route.post(
+        "/organizations/{org_id}/subscription/uncancel",
+        url_name="uncancel_my_membership_subscription",
+        # Session-only for the same reason as the first write on this controller (R-99).
+        auth=I18nJWTAuth(),
+        response={
+            200: schema.MySubscriptionSchema,
+            400: ErrorDetail,
+            # 403 (declared API-wide) is also refused while the membership is PAUSED / BANNED.
+            404: ErrorDetail,
+            502: ErrorDetail,
+        },
+        throttle=WriteThrottle(),
+    )
+    def uncancel_subscription(self, org_id: UUID) -> MembershipSubscription:
+        """Undo a scheduled cancellation on the caller's subscription.
+
+        Clears ``cancel_at_period_end`` so the subscription keeps renewing; for
+        ONLINE plans the same flag is cleared on Stripe. Refuses once the row is
+        terminal, or if the plan has since been archived.
+        """
+        qs = (
+            MembershipSubscription.objects.filter(user=self.user(), organization_id=org_id)
+            .exclude(status__in=MembershipSubscription.TERMINAL_STATUSES)
+            .select_related("plan", "plan__tier", "organization")
+            .order_by("-created_at")
+        )
+        subscription = get_object_or_404(qs)
+        return subscription_uncancel.uncancel_subscription(subscription)
+
+    @route.post(
+        "/organizations/{org_id}/subscription/change-plan",
+        url_name="change_my_membership_plan",
+        # Session-only for the same reason as the first write on this controller (R-99).
+        auth=I18nJWTAuth(),
+        response={
+            # 400 carries the serialized eligibility verdict when a cross-tier
+            # target's gates refuse the member, else a plain {detail} error.
+            200: schema.MySubscriptionSchema,
+            400: schema.MembershipEligibilitySchema | ErrorDetail,
+            404: ErrorDetail,
+            502: ErrorDetail,
+        },
+        throttle=WriteThrottle(),
+    )
+    def change_plan(
+        self,
+        org_id: UUID,
+        payload: schema.ChangePlanRequestSchema,
+    ) -> MembershipSubscription:
+        """Switch to a different plan within the same organization.
+
+        For ONLINE plans the price delta decides: upgrade prorates immediately
+        on Stripe, downgrade is scheduled via a Stripe Subscription Schedule
+        and surfaces as ``pending_plan_id`` until the period rolls over.
+        """
+        qs = (
+            MembershipSubscription.objects.filter(user=self.user(), organization_id=org_id)
+            .exclude(status__in=MembershipSubscription.TERMINAL_STATUSES)
+            .select_related("plan", "plan__tier", "organization")
+            .order_by("-created_at")
+        )
+        subscription = get_object_or_404(qs)
+
+        # Trust boundary: members must never self-record money — the same rule
+        # that keeps ``revive`` staff-only for OFFLINE plans. An offline swap is
+        # immediate and fee-free (the member sync re-points ``member.tier`` at
+        # once, bypassing the tier's questionnaire gates), and the *next*
+        # staff-recorded payment derives its period from the plan the row is on
+        # — so a self-service Monthly→Annual switch turns one monthly payment
+        # into twelve months of membership.
+        if subscription.plan.payment_method == MembershipSubscriptionPlan.PaymentMethod.OFFLINE:
+            raise HttpError(
+                400,
+                str(_("This subscription is managed by the organization. Contact them to change your plan.")),
+            )
+
+        new_plan = get_object_or_404(
+            MembershipSubscriptionPlan.objects.select_related("tier", "tier__organization"),
+            pk=payload.plan_id,
+            tier__organization_id=org_id,
+            is_active=True,
+        )
+        return subscription_lifecycle.change_plan(subscription, new_plan)
+
+    @route.post(
+        "/organizations/{org_id}/subscription/revive",
+        url_name="revive_my_membership_subscription",
+        # Session-only for the same reason as the first write on this controller (R-99).
+        auth=I18nJWTAuth(),
+        response={
+            200: schema.RevivalResponseSchema,
+            400: ErrorDetail,
+            # 403 (declared API-wide): ``_validate_revivable`` refuses BANNED / blacklisted members.
+            404: ErrorDetail,
+            502: ErrorDetail,
+        },
+        throttle=WriteThrottle(),
+    )
+    def revive_subscription(
+        self,
+        org_id: UUID,
+        payload: schema.RevivalRequestSchema,
+    ) -> schema.RevivalResponseSchema:
+        """Revive the caller's most recent EXPIRED subscription in an org.
+
+        Only ONLINE plans can be revived self-service: the response includes
+        ``checkout_url`` — a hosted Stripe Checkout the member completes to
+        pay the new Stripe Subscription's first invoice. OFFLINE plans are
+        revived by organization staff (who record the payment they actually
+        received) — the member endpoint refuses them.
+        """
+        qs = (
+            MembershipSubscription.objects.filter(
+                user=self.user(),
+                organization_id=org_id,
+                status=MembershipSubscription.SubscriptionStatus.EXPIRED,
+            )
+            .select_related("plan", "plan__tier", "organization")
+            .order_by(F("expired_at").desc(nulls_last=True))
+        )
+        subscription = qs.first()
+        if subscription is None:
+            raise Http404("No expired subscription found.")
+
+        # Trust boundary: members must never self-record money. A member-supplied
+        # amount/currency here would let an EXPIRED offline subscriber grant
+        # themselves an ACTIVE period with a self-authored ledger entry.
+        if subscription.plan.payment_method == MembershipSubscriptionPlan.PaymentMethod.OFFLINE:
+            raise HttpError(
+                400,
+                str(_("This subscription is managed by the organization. Contact them to renew your membership.")),
+            )
+
+        revived, checkout_url = subscription_lifecycle.revive_subscription(
+            subscription,
+            initial_payment=None,
+            revived_by=self.user(),
+        )
+        # See note on ``subscribe``: return a dict so Ninja's response pipeline
+        # validates the Django model through ``MySubscriptionSchema`` resolvers.
+        return t.cast(
+            schema.RevivalResponseSchema,
+            {"subscription": revived, "checkout_url": checkout_url},
+        )
+
+    @route.post(
+        "/organizations/{org_id}/billing-portal",
+        url_name="create_billing_portal_session",
+        # Session-only for the same reason as the first write on this controller (R-99).
+        auth=I18nJWTAuth(),
+        response={
+            201: schema.BillingPortalSessionSchema,
+            400: ErrorDetail,
+            404: ErrorDetail,
+            502: ErrorDetail,
+        },
+        throttle=WriteThrottle(),
+    )
+    def create_billing_portal_session(
+        self,
+        org_id: UUID,
+        payload: schema.BillingPortalRequestSchema,
+    ) -> tuple[int, schema.BillingPortalSessionSchema]:
+        """Create a Stripe Customer Portal session for the caller in this org.
+
+        Members use the portal to manage saved payment methods and download
+        invoices. The portal also offers cancel/change-plan UI when the org's
+        Stripe dashboard configuration enables it.
+        """
+        from common.models import SiteSettings
+
+        organization = get_object_or_404(Organization, pk=org_id)
+        # ``payload.return_url`` is a validated ``HttpUrl`` (or None) — coerce
+        # to plain ``str`` for the Stripe API. Falling back to the platform's
+        # frontend keeps a sensible default when the client omits it.
+        return_url = str(payload.return_url) if payload.return_url else SiteSettings.get_solo().frontend_base_url
+        url = subscription_stripe_checkout.create_billing_portal_session(
+            self.user(),
+            organization,
+            return_url=return_url,
+        )
+        return 201, schema.BillingPortalSessionSchema(url=url)

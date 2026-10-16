@@ -1,0 +1,123 @@
+"""Signal handlers for invitation notifications."""
+
+import typing as t
+
+import structlog
+from django.db import transaction
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+from common.models import SiteSettings
+from events.models import EventInvitation, EventInvitationRequest, PendingEventInvitation
+from events.tasks import build_attendee_visibility_flags
+from notifications.enums import NotificationType
+from notifications.service.notification_helpers import format_event_datetime, notify_org_staff
+from notifications.signals import notification_requested
+
+logger = structlog.get_logger(__name__)
+
+
+@receiver(post_save, sender=EventInvitation)
+def handle_invitation_save(
+    sender: type[EventInvitation], instance: EventInvitation, created: bool, **kwargs: t.Any
+) -> None:
+    """Send notifications after invitation is created."""
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(str(instance.event_id)))
+    if not created:
+        return
+
+    # Send INVITATION_RECEIVED notification to the invited user
+    def send_invitation_notification() -> None:
+        event = instance.event
+
+        # Build location string
+        event_location = event.full_address()
+
+        # Build frontend URL
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+        frontend_url = f"{frontend_base_url}/events/{event.id}"
+
+        notification_requested.send(
+            sender=sender,
+            user=instance.user,
+            notification_type=NotificationType.INVITATION_RECEIVED,
+            context={
+                "invitation_id": str(instance.id),
+                "event_id": str(event.id),
+                "event_name": event.name,
+                "invitation_message": instance.custom_message or "",
+                "event_start": event.start.isoformat() if event.start else "",
+                "event_end": event.end.isoformat() if event.end else "",
+                "event_start_formatted": format_event_datetime(event.start, event),
+                "event_end_formatted": format_event_datetime(event.end, event),
+                "event_location": event_location,
+                "organization_id": str(event.organization.id),
+                "organization_name": event.organization.name,
+                "rsvp_required": not event.requires_ticket,
+                "tickets_required": event.requires_ticket,
+                "event_url": frontend_url,
+            },
+        )
+
+    transaction.on_commit(send_invitation_notification)
+
+
+@receiver(post_save, sender=PendingEventInvitation)
+def handle_pending_invitation_save(
+    sender: type[PendingEventInvitation], instance: PendingEventInvitation, created: bool, **kwargs: t.Any
+) -> None:
+    """Send invitation email to non-registered users when a pending invitation is created."""
+    if not created:
+        return
+
+    def send_pending_email() -> None:
+        from notifications.tasks import send_pending_invitation_email
+
+        send_pending_invitation_email.delay(str(instance.id))
+
+    transaction.on_commit(send_pending_email)
+
+
+@receiver(post_save, sender=EventInvitationRequest)
+def handle_invitation_request_created(
+    sender: type[EventInvitationRequest], instance: EventInvitationRequest, created: bool, **kwargs: t.Any
+) -> None:
+    """Notify event organizers when someone requests an invitation.
+
+    Sends INVITATION_REQUEST_CREATED notification to event staff and owners.
+    """
+    if not created:
+        return
+
+    def send_request_notifications() -> None:
+        event = instance.event
+        requester = instance.user
+
+        # Get frontend URL
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+        frontend_url = f"{frontend_base_url}/org/{event.organization.slug}/admin/events/{event.id}/invitations"
+
+        # Notify staff and owners with invite_to_event permission
+        notified = notify_org_staff(
+            organization_id=event.organization.id,
+            notification_type=NotificationType.INVITATION_REQUEST_CREATED,
+            context={
+                "request_id": str(instance.id),
+                "event_id": str(event.id),
+                "event_name": event.name,
+                "requester_email": requester.email,
+                "requester_name": requester.display_name,
+                "request_message": instance.message or "",
+                "frontend_url": frontend_url,
+            },
+            sender=handle_invitation_request_created,
+        )
+
+        logger.info(
+            "invitation_request_notifications_sent",
+            request_id=str(instance.id),
+            event_id=str(event.id),
+            recipient_count=notified,
+        )
+
+    transaction.on_commit(send_request_notifications)

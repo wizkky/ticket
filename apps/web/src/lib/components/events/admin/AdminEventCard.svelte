@@ -1,0 +1,366 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import type { EventInListSchema } from '$lib/api/generated/types.gen';
+	import { cn } from '$lib/utils/cn';
+	import { formatDateTime } from '$lib/utils/date';
+	import { getEventStatusTone } from '$lib/utils/status-colors';
+	import EventCoverImage from '$lib/components/events/EventCoverImage.svelte';
+	import StatusBadge from '$lib/components/common/StatusBadge.svelte';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import {
+		Calendar,
+		MapPin,
+		Users,
+		Edit,
+		Eye,
+		EyeOff,
+		Trash2,
+		CheckCircle,
+		XCircle,
+		UserCheck,
+		Mail,
+		ListPlus,
+		Ban,
+		MoreVertical,
+		Copy,
+		Armchair,
+		Code
+	} from '@lucide/svelte';
+
+	type CardVariant = 'draft' | 'open' | 'closed' | 'cancelled';
+
+	interface Props {
+		event: EventInListSchema;
+		organizationSlug: string;
+		variant: CardVariant;
+		onPublish?: (eventId: string) => void;
+		onClose?: (eventId: string) => void;
+		onCancel?: (eventId: string) => void;
+		onReopen?: (eventId: string) => void;
+		onDelete?: (eventId: string) => void;
+		onDuplicate?: (event: EventInListSchema) => void;
+	}
+
+	const {
+		event,
+		organizationSlug,
+		variant,
+		onPublish,
+		onClose,
+		onCancel,
+		onReopen,
+		onDelete,
+		onDuplicate
+	}: Props = $props();
+
+	const faded = $derived(variant === 'closed' || variant === 'cancelled');
+
+	const statusLabel = $derived.by(() => {
+		switch (variant) {
+			case 'draft':
+				return m['orgAdmin.events.status.draft']();
+			case 'open':
+				return m['orgAdmin.events.status.published']();
+			case 'closed':
+				return m['orgAdmin.events.status.closed']();
+			case 'cancelled':
+				return m['orgAdmin.events.status.cancelled']();
+		}
+	});
+
+	const showAttendeeCount = $derived(variant !== 'draft' && event.attendee_count !== undefined);
+
+	// Editing is valid for any status (the edit route has no date/status guard),
+	// so organizers can fix details on closed/cancelled events too — see #447.
+	const showEdit = $derived(
+		variant === 'draft' || variant === 'open' || variant === 'closed' || variant === 'cancelled'
+	);
+	const showManagement = $derived(variant !== 'draft');
+
+	// An embed is loaded anonymously, so only an event a logged-out visitor could
+	// open is worth offering — a draft or members-only one would render the embed
+	// error page on the organizer's own website.
+	const canEmbed = $derived(
+		variant !== 'draft' && (event.visibility === 'public' || event.visibility === 'unlisted')
+	);
+
+	function viewEvent(): void {
+		goto(
+			resolve('/(public)/events/[org_slug]/[event_slug]', {
+				org_slug: organizationSlug,
+				event_slug: event.slug
+			})
+		);
+	}
+
+	function editEvent(): void {
+		goto(
+			resolve('/(auth)/org/[slug]/admin/events/[event_id]/edit', {
+				slug: organizationSlug,
+				event_id: event.id
+			})
+		);
+	}
+
+	function manageTickets(): void {
+		goto(
+			resolve('/(auth)/org/[slug]/admin/events/[event_id]/tickets', {
+				slug: organizationSlug,
+				event_id: event.id
+			})
+		);
+	}
+
+	function manageAttendees(): void {
+		goto(
+			resolve('/(auth)/org/[slug]/admin/events/[event_id]/attendees', {
+				slug: organizationSlug,
+				event_id: event.id
+			})
+		);
+	}
+
+	function manageInvitations(): void {
+		goto(
+			resolve('/(auth)/org/[slug]/admin/events/[event_id]/invitations', {
+				slug: organizationSlug,
+				event_id: event.id
+			})
+		);
+	}
+
+	function manageWaitlist(): void {
+		goto(
+			resolve('/(auth)/org/[slug]/admin/events/[event_id]/waitlist', {
+				slug: organizationSlug,
+				event_id: event.id
+			})
+		);
+	}
+
+	function manageSeating(): void {
+		goto(
+			resolve('/(auth)/org/[slug]/admin/events/[event_id]/seating', {
+				slug: organizationSlug,
+				event_id: event.id
+			})
+		);
+	}
+
+	// The builder is org-wide, so the event is named by slug in the query string
+	// rather than by a route param — see the embed page's own load.
+	function embedEvent(): void {
+		const builder = resolve('/(auth)/org/[slug]/admin/embed', { slug: organizationSlug });
+		// eslint-disable-next-line svelte/no-navigation-without-resolve -- resolve() validates the route id; the appended query string cannot be expressed through resolve()
+		goto(`${builder}?event=${encodeURIComponent(event.slug)}`);
+	}
+</script>
+
+<div
+	class={cn(
+		'flex flex-col overflow-hidden rounded-lg border border-border bg-card shadow-sm transition-shadow hover:shadow-md',
+		faded && 'grayscale'
+	)}
+>
+	<!-- Cover Image -->
+	<EventCoverImage {event} />
+
+	<!-- Card Content -->
+	<div class="flex flex-1 flex-col gap-3 p-4">
+		<!-- Header -->
+		<div class="flex items-start justify-between gap-2">
+			<h3 class="flex-1 font-bold">{event.name}</h3>
+			<div class="flex items-center gap-2">
+				{#if event.visibility === 'unlisted'}
+					<span
+						class="inline-flex items-center gap-1 rounded-full border border-input bg-background px-2 py-1 text-xs font-medium text-muted-foreground"
+						title={m['eventBadges.unlisted']()}
+					>
+						<EyeOff class="h-3 w-3" aria-hidden="true" />
+						{m['eventBadges.unlisted']()}
+					</span>
+				{/if}
+				<StatusBadge tone={getEventStatusTone(event.status)} label={statusLabel} />
+				<!-- More Actions Dropdown -->
+				<DropdownMenu.Root>
+					<DropdownMenu.Trigger>
+						{#snippet child({ props })}
+							<button
+								{...props}
+								type="button"
+								class="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+								aria-label={m['orgAdmin.events.actions.moreActions']()}
+							>
+								<MoreVertical class="h-4 w-4" aria-hidden="true" />
+							</button>
+						{/snippet}
+					</DropdownMenu.Trigger>
+					<DropdownMenu.Content align="end" class="w-48">
+						<DropdownMenu.Item onclick={() => onDuplicate?.(event)}>
+							<Copy class="mr-2 h-4 w-4" />
+							{m['orgAdmin.events.actions.duplicate']()}
+						</DropdownMenu.Item>
+						{#if showManagement && event.requires_ticket}
+							<DropdownMenu.Item onclick={manageSeating}>
+								<Armchair class="mr-2 h-4 w-4" />
+								{m['orgAdmin.events.actions.seating']()}
+							</DropdownMenu.Item>
+						{/if}
+						{#if canEmbed}
+							<DropdownMenu.Item onclick={embedEvent}>
+								<Code class="mr-2 h-4 w-4" />
+								{m['orgAdmin.events.actions.embed']()}
+							</DropdownMenu.Item>
+						{/if}
+						<DropdownMenu.Separator />
+						{#if variant === 'open' && onClose}
+							<DropdownMenu.Item
+								onclick={() => onClose(event.id)}
+								class="text-destructive focus:text-destructive"
+							>
+								<XCircle class="mr-2 h-4 w-4" />
+								{m['orgAdmin.events.actions.close']()}
+							</DropdownMenu.Item>
+						{/if}
+						{#if variant !== 'cancelled' && onCancel}
+							<!-- text-highlight-foreground alone passes AA (it's a dark ink,
+							     not amber) but reads as plain text next to the destructive
+							     red items below — no warning signal in light mode. The
+							     persistent bg-highlight/10 wash restores it; data-[highlighted]
+							     is a higher-specificity compound selector so the shared
+							     hover/focus bg-accent treatment still wins on interaction. -->
+							<DropdownMenu.Item
+								onclick={() => onCancel(event.id)}
+								class="bg-highlight/10 text-highlight-foreground focus:text-highlight-foreground dark:text-highlight dark:focus:text-highlight"
+							>
+								<Ban class="mr-2 h-4 w-4" />
+								{m['orgAdmin.events.actions.cancel']()}
+							</DropdownMenu.Item>
+						{/if}
+						{#if onDelete}
+							<DropdownMenu.Item
+								onclick={() => onDelete(event.id)}
+								class="text-destructive focus:text-destructive"
+							>
+								<Trash2 class="mr-2 h-4 w-4" />
+								{m['orgAdmin.events.actions.delete']()}
+							</DropdownMenu.Item>
+						{/if}
+					</DropdownMenu.Content>
+				</DropdownMenu.Root>
+			</div>
+		</div>
+
+		<!-- Event details -->
+		<div class="space-y-2 text-sm text-muted-foreground">
+			<div class="flex items-center gap-2">
+				<Calendar class="h-4 w-4" aria-hidden="true" />
+				<!-- Event-local, not viewer-local: EventInListSchema carries a required
+				     `timezone`, and the sibling surfaces (EventCard, the org-admin
+				     tickets list) already pass it. formatDateTime stays the helper here
+				     — it is the documented admin/lists format and keeps the year, which
+				     a list mixing drafts and past events needs — it just gains the
+				     event's zone (and, with it, the tz abbreviation). -->
+				<time datetime={event.start}>{formatDateTime(event.start, event.timezone)}</time>
+			</div>
+			{#if event.city}
+				<div class="flex items-center gap-2">
+					<MapPin class="h-4 w-4" aria-hidden="true" />
+					{event.city.name}, {event.city.country}
+				</div>
+			{/if}
+			{#if showAttendeeCount}
+				<div class="flex items-center gap-2">
+					<Users class="h-4 w-4" aria-hidden="true" />
+					{event.attendee_count}
+					{event.requires_ticket
+						? m['orgAdmin.events.attendeeCount.attendees']()
+						: m['orgAdmin.events.attendeeCount.rsvps']()}
+				</div>
+			{/if}
+		</div>
+
+		<!-- Actions -->
+		<div class="flex flex-wrap gap-2 border-t border-border pt-3">
+			<button
+				type="button"
+				onclick={viewEvent}
+				class="inline-flex items-center gap-1 rounded-md bg-secondary px-3 py-1 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+			>
+				<Eye class="h-4 w-4" aria-hidden="true" />
+				{variant === 'draft'
+					? m['orgAdmin.events.actions.preview']()
+					: m['orgAdmin.events.actions.view']()}
+			</button>
+			{#if showEdit}
+				<button
+					type="button"
+					onclick={editEvent}
+					class="inline-flex items-center gap-1 rounded-md bg-secondary px-3 py-1 text-sm font-medium text-secondary-foreground transition-colors hover:bg-secondary/80"
+				>
+					<Edit class="h-4 w-4" aria-hidden="true" />
+					{m['orgAdmin.events.actions.edit']()}
+				</button>
+			{/if}
+			{#if variant === 'draft' && onPublish}
+				<button
+					type="button"
+					onclick={() => onPublish(event.id)}
+					class="inline-flex items-center gap-1 rounded-md bg-success px-3 py-1 text-sm font-medium text-success-foreground transition-colors hover:bg-success/90"
+				>
+					<CheckCircle class="h-4 w-4" aria-hidden="true" />
+					{m['orgAdmin.events.actions.publish']()}
+				</button>
+			{/if}
+			{#if showManagement}
+				{#if event.requires_ticket}
+					<button
+						type="button"
+						onclick={manageTickets}
+						class="inline-flex items-center gap-1 rounded-md bg-poster-periwinkle px-3 py-1 text-sm font-medium text-poster-ink ring-1 ring-inset ring-border transition-colors hover:bg-poster-periwinkle/90"
+					>
+						<UserCheck class="h-4 w-4" aria-hidden="true" />
+						{m['orgAdmin.events.actions.tickets']()}
+					</button>
+				{:else}
+					<button
+						type="button"
+						onclick={manageAttendees}
+						class="inline-flex items-center gap-1 rounded-md bg-poster-periwinkle px-3 py-1 text-sm font-medium text-poster-ink ring-1 ring-inset ring-border transition-colors hover:bg-poster-periwinkle/90"
+					>
+						<UserCheck class="h-4 w-4" aria-hidden="true" />
+						{m['orgAdmin.events.actions.attendees']()}
+					</button>
+				{/if}
+				<button
+					type="button"
+					onclick={manageInvitations}
+					class="inline-flex items-center gap-1 rounded-md bg-poster-purple px-3 py-1 text-sm font-medium text-poster-white ring-1 ring-inset ring-border transition-colors hover:bg-poster-purple/90"
+				>
+					<Mail class="h-4 w-4" aria-hidden="true" />
+					{m['orgAdmin.events.actions.invitations']()}
+				</button>
+				<button
+					type="button"
+					onclick={manageWaitlist}
+					class="inline-flex items-center gap-1 rounded-md bg-poster-amber px-3 py-1 text-sm font-medium text-poster-ink ring-1 ring-inset ring-border transition-colors hover:bg-poster-amber/90"
+				>
+					<ListPlus class="h-4 w-4" aria-hidden="true" />
+					{m['orgAdmin.events.actions.waitlist']()}
+				</button>
+			{/if}
+			{#if (variant === 'closed' || variant === 'cancelled') && onReopen}
+				<button
+					type="button"
+					onclick={() => onReopen(event.id)}
+					class="inline-flex items-center gap-1 rounded-md bg-success px-3 py-1 text-sm font-medium text-success-foreground transition-colors hover:bg-success/90"
+				>
+					<CheckCircle class="h-4 w-4" aria-hidden="true" />
+					{m['orgAdmin.events.actions.reopen']()}
+				</button>
+			{/if}
+		</div>
+	</div>
+</div>

@@ -1,0 +1,15 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<p>{% trans "Hello" %} {{ user.display_name }},</p>
+<p>{% blocktranslate with name=context.submitter_name questionnaire=context.questionnaire_name %}<strong>{{ name }}</strong> has submitted the questionnaire <strong>{{ questionnaire }}</strong>.{% endblocktranslate %}</p>
+<div class="card card--info">
+    <div class="info-row"><span class="label">{% trans "Submitted by:" %}</span> {{ context.submitter_name }} ({{ context.submitter_email }})</div>
+    <div class="info-row"><span class="label">{% trans "Questionnaire:" %}</span> {{ context.questionnaire_name }}</div>
+    <div class="info-row"><span class="label">{% trans "Organization:" %}</span> {{ context.organization_name }}</div>
+    {% if context.event_name %}<div class="info-row"><span class="label">{% trans "For Event:" %}</span> {{ context.event_name }}</div>{% endif %}
+</div>
+<center>
+    <a href="{{ context.submission_url }}" class="button">{% trans "Review Submission" %}</a>
+</center>
+{% endblock %}

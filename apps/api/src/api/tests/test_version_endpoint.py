@@ -1,0 +1,256 @@
+"""Tests for the /version endpoint and maintenance banner logic."""
+
+import typing as t
+from datetime import timedelta
+from pathlib import Path
+
+import pytest
+from django.conf import settings
+from django.test.client import Client
+from django.urls import reverse
+from django.utils import timezone
+from freezegun import freeze_time
+
+from common.models import SiteSettings
+
+pytestmark = pytest.mark.django_db
+
+VERSION_URL = reverse("api:version")
+
+
+class TestVersionEndpointBaseline:
+    """Tests for /version without any banner configured."""
+
+    def test_returns_version_and_demo(self, client: Client) -> None:
+        """Test that /version returns the app version and demo flag."""
+        response = client.get(VERSION_URL)
+        data = response.json()
+
+        assert response.status_code == 200
+        assert data["version"] == settings.VERSION
+        assert data["demo"] == settings.DEMO_MODE
+
+    def test_banner_is_null_by_default(self, client: Client) -> None:
+        """Test that banner is null when no maintenance message is set."""
+        response = client.get(VERSION_URL)
+        data = response.json()
+
+        assert data["banner"] is None
+
+
+class TestVersionEndpointFeatures:
+    """Tests for the user-facing feature flags exposed in /version."""
+
+    def test_features_reflect_settings(self, client: Client, settings: t.Any) -> None:
+        """Test that the features block mirrors the FEATURE_* settings."""
+        settings.FEATURE_ORGANIZATION_CREATION = True
+        settings.FEATURE_TELEGRAM = False
+        settings.FEATURE_LLM_EVALUATION = False
+
+        data = client.get(VERSION_URL).json()
+
+        assert data["features"] == {
+            "organization_creation": True,
+            "telegram": False,
+            "llm_evaluation": False,
+            "referral_applications": False,
+            # Credential presence is the flag (ADR-0008) and the test settings ship no signing
+            # key; the enabled half is next door in
+            # ``test_oauth_provider_flag_reflects_credential_presence``.
+            "oauth_provider": False,
+        }
+
+    def test_oauth_provider_flag_reflects_credential_presence(
+        self, client: Client, settings: t.Any, tmp_path: Path
+    ) -> None:
+        """Credential presence is the flag (ADR-0008): a configured signing key, not a boolean.
+
+        Lives here rather than in ``src/oauth/tests`` because it is about ``/version``; the
+        oauth package's autouse fixture switches the provider on for every test in it, which
+        would make the disabled half unreachable.
+        """
+        assert client.get(VERSION_URL).json()["features"]["oauth_provider"] is False
+
+        key = tmp_path / "oidc.pem"
+        key.write_text("not a real key, and the flag never parses it")
+        settings.OIDC_SIGNING_KEY_PATH = str(key)
+
+        assert client.get(VERSION_URL).json()["features"]["oauth_provider"] is True
+
+    def test_referral_applications_flag_reflects_site_settings(self, client: Client) -> None:
+        """The referral-applications flag comes from SiteSettings, not Django settings."""
+        site = SiteSettings.get_solo()
+        site.referral_applications_enabled = True
+        site.save()
+
+        assert client.get(VERSION_URL).json()["features"]["referral_applications"] is True
+
+    def test_operational_flags_are_not_exposed(self, client: Client) -> None:
+        """Test that operational flags (malware scan, observability) are not leaked to clients."""
+        data = client.get(VERSION_URL).json()
+
+        assert set(data["features"]) == {
+            "organization_creation",
+            "telegram",
+            "llm_evaluation",
+            "referral_applications",
+            "oauth_provider",
+        }
+
+    def test_sso_providers_listed(self, client: Client, settings: t.Any) -> None:
+        """Configured OIDC providers are exposed as key + display name, secrets excluded."""
+        from revel.oidc_config import OIDCProviderConfig
+
+        settings.OIDC_PROVIDERS = (
+            OIDCProviderConfig(
+                key="google", name="Google", issuer="https://accounts.google.com", client_id="c", client_secret="s"
+            ),
+        )
+        data = client.get(VERSION_URL).json()
+        assert data["sso_providers"] == [{"key": "google", "name": "Google"}]
+
+    def test_sso_providers_empty_when_unset(self, client: Client, settings: t.Any) -> None:
+        settings.OIDC_PROVIDERS = ()
+        assert client.get(VERSION_URL).json()["sso_providers"] == []
+
+
+class TestVersionEndpointDemoBookingUrl:
+    """Tests for the public demo-booking link exposed in /version."""
+
+    def test_demo_booking_url_is_null_by_default(self, client: Client) -> None:
+        """Test that demo_booking_url is null when the singleton has no link configured."""
+        data = client.get(VERSION_URL).json()
+
+        assert data["demo_booking_url"] is None
+
+    def test_demo_booking_url_returned_when_set(self, client: Client) -> None:
+        """Test that the configured demo-booking link is echoed back."""
+        site = SiteSettings.get_solo()
+        site.demo_booking_url = "https://cal.example.com/revel/demo"
+        site.save()
+
+        data = client.get(VERSION_URL).json()
+
+        assert data["demo_booking_url"] == "https://cal.example.com/revel/demo"
+
+
+class TestVersionEndpointWithBanner:
+    """Tests for /version when a maintenance banner is configured."""
+
+    def test_banner_returned_when_message_set_no_end(self, client: Client) -> None:
+        """Test that an open-ended banner (no ends_at) is returned."""
+        site = SiteSettings.get_solo()
+        site.maintenance_message = "Scheduled maintenance tonight"
+        site.maintenance_severity = SiteSettings.BannerSeverity.WARNING
+        site.save()
+
+        response = client.get(VERSION_URL)
+        data = response.json()
+
+        assert data["banner"] is not None
+        assert data["banner"]["message"] == "Scheduled maintenance tonight"
+        assert data["banner"]["severity"] == SiteSettings.BannerSeverity.WARNING.value
+        assert data["banner"]["scheduled_at"] is None
+        assert data["banner"]["ends_at"] is None
+
+    def test_banner_returned_when_ends_at_in_future(self, client: Client) -> None:
+        """Test that banner is returned when ends_at is in the future."""
+        site = SiteSettings.get_solo()
+        site.maintenance_message = "Brief downtime expected"
+        site.maintenance_severity = SiteSettings.BannerSeverity.INFO
+        site.maintenance_scheduled_at = timezone.now() + timedelta(hours=1)
+        site.maintenance_ends_at = timezone.now() + timedelta(hours=3)
+        site.save()
+
+        response = client.get(VERSION_URL)
+        data = response.json()
+
+        assert data["banner"] is not None
+        assert data["banner"]["message"] == "Brief downtime expected"
+        assert data["banner"]["severity"] == SiteSettings.BannerSeverity.INFO.value
+        assert data["banner"]["scheduled_at"] is not None
+        assert data["banner"]["ends_at"] is not None
+
+    def test_banner_null_when_ends_at_in_past(self, client: Client) -> None:
+        """Test that banner is hidden once the maintenance window has passed."""
+        site = SiteSettings.get_solo()
+        site.maintenance_message = "This maintenance is over"
+        site.maintenance_severity = SiteSettings.BannerSeverity.ERROR
+        site.maintenance_ends_at = timezone.now() - timedelta(hours=1)
+        site.save()
+
+        response = client.get(VERSION_URL)
+        data = response.json()
+
+        assert data["banner"] is None
+
+    def test_banner_null_when_message_is_blank(self, client: Client) -> None:
+        """Test that banner is null when message is empty even if severity is set."""
+        site = SiteSettings.get_solo()
+        site.maintenance_message = ""
+        site.maintenance_severity = SiteSettings.BannerSeverity.CRITICAL
+        site.maintenance_ends_at = timezone.now() + timedelta(hours=5)
+        site.save()
+
+        response = client.get(VERSION_URL)
+        data = response.json()
+
+        assert data["banner"] is None
+
+    def test_banner_transitions_from_active_to_expired(self, client: Client) -> None:
+        """Test that a banner becomes null once its ends_at passes."""
+        ends_at = timezone.now() + timedelta(hours=1)
+
+        site = SiteSettings.get_solo()
+        site.maintenance_message = "Going down soon"
+        site.maintenance_severity = SiteSettings.BannerSeverity.WARNING
+        site.maintenance_ends_at = ends_at
+        site.save()
+
+        # Banner is active now
+        response = client.get(VERSION_URL)
+        assert response.json()["banner"] is not None
+
+        # Jump past ends_at
+        with freeze_time(ends_at + timedelta(minutes=1)):
+            response = client.get(VERSION_URL)
+            assert response.json()["banner"] is None
+
+    @pytest.mark.parametrize(
+        "severity",
+        list(SiteSettings.BannerSeverity),
+        ids=[s.value for s in SiteSettings.BannerSeverity],
+    )
+    def test_all_severity_levels_are_returned(self, client: Client, severity: SiteSettings.BannerSeverity) -> None:
+        """Test that every valid severity level is correctly serialized."""
+        site = SiteSettings.get_solo()
+        site.maintenance_message = f"Testing {severity.value}"
+        site.maintenance_severity = severity
+        site.save()
+
+        response = client.get(VERSION_URL)
+        data = response.json()
+
+        assert data["banner"] is not None
+        assert data["banner"]["severity"] == severity.value
+
+
+class TestVersionTurnstileSiteKey:
+    """The site key is published only when Turnstile is fully configured."""
+
+    def test_null_when_disabled(self, client: Client, settings: t.Any) -> None:
+        settings.TURNSTILE_SITE_KEY = ""
+        settings.TURNSTILE_SECRET_KEY = ""
+        assert client.get(VERSION_URL).json()["turnstile_site_key"] is None
+
+    def test_null_when_half_configured(self, client: Client, settings: t.Any) -> None:
+        settings.TURNSTILE_SITE_KEY = "site-key"
+        settings.TURNSTILE_SECRET_KEY = ""
+        assert client.get(VERSION_URL).json()["turnstile_site_key"] is None
+
+    def test_exposed_when_enabled(self, client: Client, settings: t.Any) -> None:
+        settings.TURNSTILE_SITE_KEY = "site-key"
+        settings.TURNSTILE_SECRET_KEY = "secret-key"
+        data = client.get(VERSION_URL).json()
+        assert data["turnstile_site_key"] == "site-key"
+        assert "secret-key" not in str(data)

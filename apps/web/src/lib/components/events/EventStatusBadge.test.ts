@@ -1,0 +1,340 @@
+import { render, screen } from '@testing-library/svelte';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import EventStatusBadge from './EventStatusBadge.svelte';
+import type { EventDetailSchema } from '$lib/api/generated/types.gen';
+
+/**
+ * Helper to create a mock event with default values
+ */
+function createMockEvent(overrides: Partial<EventDetailSchema> = {}): EventDetailSchema {
+	return {
+		id: '123e4567-e89b-12d3-a456-426614174000',
+		name: 'Test Event',
+		slug: 'test-event',
+		description: 'A test event',
+		invitation_message: null,
+		start: '2025-12-01T18:00:00Z',
+		end: '2025-12-01T22:00:00Z',
+		rsvp_before: null,
+		max_attendees: 0,
+		attendee_count: 0,
+		waitlist_open: false,
+		event_type: 'public',
+		visibility: 'public',
+		status: 'open',
+		requires_ticket: false,
+		potluck_open: false,
+		logo: null,
+		cover_art: null,
+		address: null,
+		city: null,
+		tags: [],
+		organization: {
+			id: '456',
+			name: 'Test Org',
+			slug: 'test-org',
+			logo: null,
+			description: 'Test organization',
+			website: null,
+			instagram: null,
+			facebook: null,
+			linkedin: null,
+			twitter: null,
+			member_count: 10
+		},
+		event_series: null,
+		...overrides
+	};
+}
+
+describe('EventStatusBadge', () => {
+	beforeEach(() => {
+		// Reset timers before each test
+		vi.useFakeTimers();
+	});
+
+	describe('Cancelled Status', () => {
+		it('shows "Cancelled" when event status is cancelled', () => {
+			const event = createMockEvent({
+				status: 'cancelled',
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Cancelled');
+			expect(screen.getByRole('status')).toHaveClass('bg-highlight');
+		});
+	});
+
+	// #690: the badge reads the backend's always-public `is_full` (#825) rather
+	// than deriving fullness from `max_attendees`/`attendee_count`, which the
+	// organizer can withhold — a discreet sold-out event used to read "not full".
+	describe('Full Status', () => {
+		it('shows "Full" when the backend flags the event as full', () => {
+			vi.setSystemTime(new Date('2025-12-01T10:00:00Z'));
+
+			const event = createMockEvent({
+				is_full: true,
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Full');
+			expect(screen.getByRole('status')).toHaveClass('bg-destructive');
+		});
+
+		it('shows "Full" even when capacity and count are withheld', () => {
+			vi.setSystemTime(new Date('2025-12-01T10:00:00Z'));
+
+			const event = createMockEvent({
+				is_full: true,
+				max_attendees: null,
+				attendee_count: null,
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Full');
+		});
+
+		it('does not show "Full" when the flag is false, whatever the numbers say', () => {
+			vi.setSystemTime(new Date('2025-12-01T10:00:00Z'));
+
+			const event = createMockEvent({
+				is_full: false,
+				max_attendees: 50,
+				attendee_count: 50,
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).not.toHaveTextContent('Full');
+		});
+
+		it('does not show "Full" when the flag is absent', () => {
+			vi.setSystemTime(new Date('2025-12-01T10:00:00Z'));
+
+			const event = createMockEvent({
+				is_full: undefined,
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).not.toHaveTextContent('Full');
+		});
+	});
+
+	describe('Past Status', () => {
+		it('shows "Past" when event has ended', () => {
+			vi.setSystemTime(new Date('2025-12-02T10:00:00Z'));
+
+			const event = createMockEvent({
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Past');
+			expect(screen.getByRole('status')).toHaveClass('bg-muted');
+		});
+	});
+
+	describe('Ongoing Status', () => {
+		it('shows "Ongoing" when current time is during the event', () => {
+			vi.setSystemTime(new Date('2025-12-01T20:00:00Z'));
+
+			const event = createMockEvent({
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Ongoing');
+			expect(screen.getByRole('status')).toHaveClass('bg-success');
+		});
+
+		it('shows "Ongoing" at the exact start time', () => {
+			vi.setSystemTime(new Date('2025-12-01T18:00:00Z'));
+
+			const event = createMockEvent({
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Ongoing');
+		});
+
+		it('shows "Ongoing" at the exact end time', () => {
+			vi.setSystemTime(new Date('2025-12-01T22:00:00Z'));
+
+			const event = createMockEvent({
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Ongoing');
+		});
+	});
+
+	describe('Happening Today Status', () => {
+		it('shows "Happening Today" when event starts today but has not started yet', () => {
+			vi.setSystemTime(new Date('2025-12-01T12:00:00Z'));
+
+			const event = createMockEvent({
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Happening Today');
+			expect(screen.getByRole('status')).toHaveClass('bg-success');
+		});
+
+		it('does not show "Happening Today" for events starting tomorrow', () => {
+			vi.setSystemTime(new Date('2025-12-01T12:00:00Z'));
+
+			const event = createMockEvent({
+				start: '2025-12-02T18:00:00Z',
+				end: '2025-12-02T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).not.toHaveTextContent('Happening Today');
+			expect(screen.getByRole('status')).toHaveTextContent('Upcoming');
+		});
+	});
+
+	describe('Upcoming Status', () => {
+		it('shows "Upcoming" for future events not starting today', () => {
+			vi.setSystemTime(new Date('2025-12-01T12:00:00Z'));
+
+			const event = createMockEvent({
+				start: '2025-12-15T18:00:00Z',
+				end: '2025-12-15T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Upcoming');
+			expect(screen.getByRole('status')).toHaveClass('bg-primary');
+		});
+	});
+
+	describe('Priority Order', () => {
+		it('prioritizes "Cancelled" over "Full"', () => {
+			const event = createMockEvent({
+				status: 'cancelled',
+				is_full: true,
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Cancelled');
+		});
+
+		it('prioritizes "Full" over "Happening Today"', () => {
+			vi.setSystemTime(new Date('2025-12-01T12:00:00Z'));
+
+			const event = createMockEvent({
+				is_full: true,
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Full');
+		});
+
+		it('prioritizes "Past" over "Full" (an ended event is over, regardless of capacity)', () => {
+			vi.setSystemTime(new Date('2025-12-02T10:00:00Z'));
+
+			const event = createMockEvent({
+				is_full: true,
+				start: '2025-12-01T18:00:00Z',
+				end: '2025-12-01T22:00:00Z'
+			});
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveTextContent('Past');
+		});
+	});
+
+	describe('Accessibility', () => {
+		it('has role="status" for screen readers', () => {
+			const event = createMockEvent();
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toBeInTheDocument();
+		});
+
+		it('has aria-live="polite" for dynamic updates', () => {
+			const event = createMockEvent();
+
+			render(EventStatusBadge, { props: { event } });
+
+			expect(screen.getByRole('status')).toHaveAttribute('aria-live', 'polite');
+		});
+
+		it('icons have aria-hidden="true"', () => {
+			const event = createMockEvent();
+
+			const { container } = render(EventStatusBadge, { props: { event } });
+
+			const icon = container.querySelector('svg');
+			expect(icon).toHaveAttribute('aria-hidden', 'true');
+		});
+
+		it('status is conveyed by text, not just color', () => {
+			const event = createMockEvent();
+
+			render(EventStatusBadge, { props: { event } });
+
+			const badge = screen.getByRole('status');
+			// Text content should be meaningful
+			expect(badge.textContent).toMatch(/Upcoming|Happening Today|Ongoing|Past|Full|Cancelled/);
+		});
+	});
+
+	describe('Custom className', () => {
+		it('applies custom className', () => {
+			const event = createMockEvent();
+
+			render(EventStatusBadge, { props: { event, class: 'custom-class mb-4' } });
+
+			expect(screen.getByRole('status')).toHaveClass('custom-class', 'mb-4');
+		});
+
+		it('merges custom className with base classes', () => {
+			const event = createMockEvent();
+
+			render(EventStatusBadge, { props: { event, class: 'ml-2' } });
+
+			const badge = screen.getByRole('status');
+			expect(badge).toHaveClass('ml-2');
+			expect(badge).toHaveClass('inline-flex', 'items-center', 'rounded-full');
+		});
+	});
+});

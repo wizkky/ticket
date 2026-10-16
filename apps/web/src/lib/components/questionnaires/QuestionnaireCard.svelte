@@ -1,0 +1,392 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import {
+		Card,
+		CardContent,
+		CardDescription,
+		CardHeader,
+		CardTitle
+	} from '$lib/components/ui/card';
+	import { Button } from '$lib/components/ui/button';
+	import { Badge } from '$lib/components/ui/badge';
+	import {
+		Edit,
+		Eye,
+		FileText,
+		Trash2,
+		CalendarCheck,
+		AlertCircle,
+		Copy,
+		Layers,
+		Settings
+	} from '@lucide/svelte';
+	import { resolve } from '$app/paths';
+	import type {
+		OrganizationQuestionnaireInListSchema,
+		OrganizationQuestionnaireSchema
+	} from '$lib/api/generated';
+	import {
+		questionnaireDeleteOrgQuestionnaire,
+		questionnaireGetOrgQuestionnaire
+	} from '$lib/api/generated/sdk.gen';
+	import { invalidateAll } from '$app/navigation';
+	import QuestionnaireAssignmentModal from './QuestionnaireAssignmentModal.svelte';
+	import DuplicateQuestionnaireModal from './DuplicateQuestionnaireModal.svelte';
+	import QuestionnaireStatusBadge from './QuestionnaireStatusBadge.svelte';
+	import {
+		Tooltip,
+		TooltipContent,
+		TooltipProvider,
+		TooltipTrigger
+	} from '$lib/components/ui/tooltip';
+
+	interface Props {
+		questionnaire: OrganizationQuestionnaireInListSchema;
+		organizationSlug: string;
+		organizationId: string;
+		accessToken: string;
+	}
+
+	const { questionnaire, organizationSlug, organizationId, accessToken }: Props = $props();
+
+	// Delete state
+	let isDeleting = $state(false);
+	let isDuplicateModalOpen = $state(false);
+
+	// Assignment modal state
+	let isAssignmentModalOpen = $state(false);
+	let fullQuestionnaire = $state<OrganizationQuestionnaireSchema | null>(null);
+	let isLoadingFullQuestionnaire = $state(false);
+
+	// Open assignment modal (load full questionnaire data)
+	async function openAssignmentModal() {
+		isLoadingFullQuestionnaire = true;
+		isAssignmentModalOpen = true;
+
+		try {
+			const response = await questionnaireGetOrgQuestionnaire({
+				path: { org_questionnaire_id: questionnaire.id },
+				headers: { Authorization: `Bearer ${accessToken}` }
+			});
+
+			if (response.data) {
+				fullQuestionnaire = response.data;
+			}
+		} catch (err) {
+			console.error('Failed to load questionnaire:', err);
+			alert(m['questionnaireCard.error_failedToLoad']());
+			isAssignmentModalOpen = false;
+		} finally {
+			isLoadingFullQuestionnaire = false;
+		}
+	}
+
+	// Format questionnaire type for display
+	const typeLabels: Record<string, () => string> = {
+		admission: () => m['questionnaireCard.type_admission'](),
+		membership: () => m['questionnaireCard.type_membership'](),
+		feedback: () => m['questionnaireCard.type_feedback'](),
+		generic: () => m['questionnaireCard.type_generic']()
+	};
+
+	const typeLabel = $derived(
+		typeLabels[questionnaire.questionnaire_type]?.() || questionnaire.questionnaire_type
+	);
+
+	// Get type badge variant
+	const typeVariants: Record<string, 'default' | 'secondary' | 'outline'> = {
+		admission: 'default',
+		membership: 'secondary',
+		feedback: 'outline',
+		generic: 'outline'
+	};
+
+	const typeVariant = $derived(typeVariants[questionnaire.questionnaire_type] || 'outline');
+
+	// Status labels and variants
+	const statusLabels: Record<string, () => string> = {
+		draft: () => m['questionnaireCard.status_draft'](),
+		ready: () => m['questionnaireCard.status_ready'](),
+		published: () => m['questionnaireCard.status_published']()
+	};
+
+	const statusLabel = $derived(
+		statusLabels[questionnaire.questionnaire.status]?.() || questionnaire.questionnaire.status
+	);
+
+	// Event assignment count (events + series)
+	const assignmentCount = $derived(
+		(questionnaire.events?.length || 0) + (questionnaire.event_series?.length || 0)
+	);
+
+	// Create tooltip text for assigned events
+	const assignmentTooltip = $derived.by(() => {
+		const events = questionnaire.events || [];
+		const series = questionnaire.event_series || [];
+		const allAssignments = [
+			...events.map((e) => e.name),
+			...series.map((s) => `${s.name} (series)`)
+		];
+
+		if (allAssignments.length === 0) return m['questionnaireCard.notAssignedToAnyEvents']();
+		if (allAssignments.length <= 3)
+			return m['questionnaireCard.assignedTo']({ assignments: allAssignments.join(', ') });
+
+		const first = allAssignments.slice(0, 2).join(', ');
+		const remaining = allAssignments.length - 2;
+		return m['questionnaireCard.assignedToAndMore']({ first, remaining: remaining.toString() });
+	});
+
+	// Membership questionnaires are never linked to events or series: they are
+	// referenced from the other side, by MembershipTier.membership_questionnaire
+	// and Organization.default_membership_questionnaire. So the event-assignment
+	// count and the "Assign to Events" action are meaningless for them (#721).
+	const isMembership = $derived(questionnaire.questionnaire_type === 'membership');
+	const tiers = $derived(questionnaire.tiers ?? []);
+	const isOrganizationDefault = $derived(questionnaire.is_organization_default === true);
+
+	// Short, visible summary of tier usage (the names live in the tooltip)
+	const tierUsageLabel = $derived(
+		tiers.length === 0
+			? m['questionnaireCard.notUsedByAnyTier']()
+			: tiers.length === 1
+				? m['questionnaireCard.usedByOneTier']()
+				: m['questionnaireCard.usedByTierCount']({ count: tiers.length.toString() })
+	);
+
+	const tierUsageTooltip = $derived.by(() => {
+		const names = tiers.map((tier) => tier.name);
+
+		if (names.length === 0) return m['questionnaireCard.notUsedByAnyTierTooltip']();
+		if (names.length <= 3) return m['questionnaireCard.usedByTiers']({ tiers: names.join(', ') });
+
+		const first = names.slice(0, 2).join(', ');
+		const remaining = names.length - 2;
+		return m['questionnaireCard.usedByTiersAndMore']({ first, remaining: remaining.toString() });
+	});
+
+	// Where membership assignment actually happens
+	const tiersTabHref = $derived(
+		`${resolve('/(auth)/org/[slug]/admin/members', { slug: organizationSlug })}?tab=tiers`
+	);
+	const settingsHref = $derived(
+		resolve('/(auth)/org/[slug]/admin/settings', { slug: organizationSlug })
+	);
+
+	// Handle delete
+	async function handleDelete() {
+		const confirmed = confirm(
+			m['questionnaireCard.confirmDelete']({ name: questionnaire.questionnaire.name })
+		);
+
+		if (!confirmed) return;
+
+		isDeleting = true;
+
+		try {
+			const response = await questionnaireDeleteOrgQuestionnaire({
+				path: { org_questionnaire_id: questionnaire.id }
+			});
+
+			if (response.error) {
+				throw new Error(m['questionnaireCard.error_failedToDelete']());
+			}
+
+			// Refresh the page data
+			await invalidateAll();
+		} catch (err) {
+			console.error('Failed to delete questionnaire:', err);
+			alert(m['questionnaireCard.error_failedToDeleteTryAgain']());
+		} finally {
+			isDeleting = false;
+		}
+	}
+</script>
+
+<Card class="transition-all hover:shadow-md">
+	<CardHeader>
+		<div class="flex items-start justify-between gap-2">
+			<div class="min-w-0 flex-1">
+				<CardTitle class="line-clamp-1">{questionnaire.questionnaire.name}</CardTitle>
+				<CardDescription class="mt-1 flex flex-wrap gap-1">
+					<Badge variant={typeVariant} class="text-xs">
+						{typeLabel}
+					</Badge>
+					<QuestionnaireStatusBadge
+						status={questionnaire.questionnaire.status}
+						label={statusLabel}
+					/>
+				</CardDescription>
+			</div>
+			<FileText class="h-5 w-5 flex-shrink-0 text-muted-foreground" aria-hidden="true" />
+		</div>
+	</CardHeader>
+	<CardContent>
+		<div class="space-y-4">
+			<!-- Pending Evaluations Alert -->
+			{#if questionnaire.pending_evaluations_count && questionnaire.pending_evaluations_count > 0}
+				<div
+					class="flex items-center gap-2 rounded-md border border-highlight bg-highlight/10 px-3 py-2 text-sm text-foreground"
+					role="status"
+				>
+					<AlertCircle
+						class="h-4 w-4 shrink-0 text-highlight-foreground dark:text-highlight"
+						aria-hidden="true"
+					/>
+					<p class="font-medium">
+						{questionnaire.pending_evaluations_count}
+						{questionnaire.pending_evaluations_count === 1
+							? m['questionnaireCard.submissionNeeds']()
+							: m['questionnaireCard.submissionsNeed']()}
+						{m['questionnaireCard.review']()}
+					</p>
+				</div>
+			{/if}
+
+			<!-- Stats with Tooltip -->
+			<div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-muted-foreground">
+				<TooltipProvider>
+					{#if isMembership}
+						<!-- Membership: usage is tier / organization-default, never events -->
+						<Tooltip>
+							<TooltipTrigger class="cursor-help underline decoration-dotted underline-offset-4">
+								<span>{tierUsageLabel}</span>
+							</TooltipTrigger>
+							<TooltipContent>
+								<p class="max-w-xs text-sm">{tierUsageTooltip}</p>
+							</TooltipContent>
+						</Tooltip>
+						{#if isOrganizationDefault}
+							<Tooltip>
+								<TooltipTrigger class="cursor-help underline decoration-dotted underline-offset-4">
+									<span class="inline-flex items-center gap-1">
+										<Settings class="h-3.5 w-3.5" aria-hidden="true" />
+										{m['questionnaireCard.organizationDefault']()}
+									</span>
+								</TooltipTrigger>
+								<TooltipContent>
+									<p class="max-w-xs text-sm">
+										{m['questionnaireCard.organizationDefaultTooltip']()}
+									</p>
+								</TooltipContent>
+							</Tooltip>
+						{/if}
+					{:else}
+						<Tooltip>
+							<TooltipTrigger class="cursor-help underline decoration-dotted underline-offset-4">
+								{#if assignmentCount > 0}
+									<span>
+										<span class="font-medium text-foreground">{assignmentCount}</span>
+										{assignmentCount === 1
+											? m['questionnaireCard.assignment']()
+											: m['questionnaireCard.assignments']()}
+									</span>
+								{:else}
+									<span>{m['questionnaireCard.notAssigned']()}</span>
+								{/if}
+							</TooltipTrigger>
+							<TooltipContent>
+								<p class="max-w-xs text-sm">{assignmentTooltip}</p>
+							</TooltipContent>
+						</Tooltip>
+					{/if}
+				</TooltipProvider>
+			</div>
+
+			<!-- Actions -->
+			<div class="flex gap-2">
+				<Button
+					href="/org/{organizationSlug}/admin/questionnaires/{questionnaire.id}"
+					variant="outline"
+					size="sm"
+					class="flex-1 gap-2"
+				>
+					<Edit class="h-4 w-4" />
+					{m['questionnaireCard.edit']()}
+				</Button>
+				<Button
+					href="/org/{organizationSlug}/admin/questionnaires/{questionnaire.id}/submissions"
+					variant="outline"
+					size="sm"
+					class="relative flex-1 gap-2"
+				>
+					<Eye class="h-4 w-4" />
+					{m['questionnaireCard.submissions']()}
+					{#if questionnaire.pending_evaluations_count && questionnaire.pending_evaluations_count > 0}
+						<Badge
+							variant="destructive"
+							class="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full px-1 text-xs"
+						>
+							{questionnaire.pending_evaluations_count}
+						</Badge>
+					{/if}
+				</Button>
+			</div>
+
+			<!-- Assignment: events for every other type, tiers/settings for membership -->
+			{#if isMembership}
+				<Button href={tiersTabHref} variant="outline" size="sm" class="w-full gap-2">
+					<Layers class="h-4 w-4" aria-hidden="true" />
+					{m['questionnaireCard.assignToTiers']()}
+				</Button>
+				<Button href={settingsHref} variant="outline" size="sm" class="w-full gap-2">
+					<Settings class="h-4 w-4" aria-hidden="true" />
+					{m['questionnaireCard.organizationMembershipSettings']()}
+				</Button>
+			{:else}
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={openAssignmentModal}
+					disabled={isLoadingFullQuestionnaire}
+					class="w-full gap-2"
+				>
+					<CalendarCheck class="h-4 w-4" />
+					{m['questionnaireCard.assignToEvents']()}
+				</Button>
+			{/if}
+
+			<!-- Duplicate Button -->
+			<Button
+				variant="outline"
+				size="sm"
+				onclick={() => (isDuplicateModalOpen = true)}
+				class="w-full gap-2"
+			>
+				<Copy class="h-4 w-4" />
+				{m['questionnaireCard.duplicate']()}
+			</Button>
+
+			<!-- Delete Button -->
+			<Button
+				variant="outline"
+				size="sm"
+				onclick={handleDelete}
+				disabled={isDeleting}
+				class="w-full gap-2 text-destructive hover:bg-destructive hover:text-destructive-foreground"
+			>
+				<Trash2 class="h-4 w-4" />
+				{isDeleting ? m['questionnaireCard.deleting']() : m['questionnaireCard.delete']()}
+			</Button>
+		</div>
+	</CardContent>
+</Card>
+
+<!-- Assignment Modal -->
+{#if isAssignmentModalOpen && fullQuestionnaire}
+	<QuestionnaireAssignmentModal
+		bind:open={isAssignmentModalOpen}
+		questionnaire={fullQuestionnaire}
+		{organizationId}
+		{accessToken}
+		onClose={() => (isAssignmentModalOpen = false)}
+	/>
+{/if}
+
+<DuplicateQuestionnaireModal
+	bind:open={isDuplicateModalOpen}
+	orgQuestionnaireId={questionnaire.id}
+	questionnaireName={questionnaire.questionnaire.name}
+	{organizationSlug}
+	onClose={() => (isDuplicateModalOpen = false)}
+/>

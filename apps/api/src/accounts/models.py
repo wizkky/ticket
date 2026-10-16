@@ -1,0 +1,811 @@
+import os
+import secrets
+import typing as t
+import uuid
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+import pyotp
+from django.conf import settings
+from django.contrib.auth.models import AbstractUser, UserManager
+from django.core.exceptions import ValidationError
+from django.core.validators import (
+    FileExtensionValidator,
+    MaxLengthValidator,
+    MaxValueValidator,
+    MinValueValidator,
+    RegexValidator,
+)
+from django.db import models
+from django.db.models.functions import Lower
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from encrypted_fields.fields import EncryptedTextField
+
+from accounts.utils.email_normalization import (
+    normalize_domain_for_matching,
+    normalize_email_for_matching,
+    normalize_telegram_for_matching,
+)
+from accounts.validators import normalize_phone_number, validate_phone_number
+from common.fields import (
+    ALLOWED_IMAGE_EXTENSIONS,
+    MarkdownField,
+    ProtectedFileField,
+    ProtectedImageField,
+    validate_image_file,
+)
+from common.models import EmailDeliverableMixin, ExifStripMixin, StripeConnectMixin, TimeStampedModel
+
+
+def profile_picture_upload_path(instance: "RevelUser", filename: str) -> str:
+    """Generate upload path for profile pictures."""
+    return f"profile-pictures/{instance.id}/{os.path.basename(filename)}"
+
+
+class RevelUserQueryset(models.QuerySet["RevelUser"]):
+    """Queryset for RevelUser."""
+
+
+class RevelUserManager(UserManager["RevelUser"]):
+    def get_queryset(self) -> RevelUserQueryset:
+        """Get queryset for RevelUser."""
+        return RevelUserQueryset(self.model)
+
+
+class RevelUser(ExifStripMixin, StripeConnectMixin, AbstractUser):
+    IMAGE_FIELDS = ("profile_picture",)
+
+    image_validators = [
+        FileExtensionValidator(allowed_extensions=ALLOWED_IMAGE_EXTENSIONS),
+        validate_image_file,
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    phone_number = models.CharField(
+        max_length=20, unique=True, null=True, blank=True, validators=[validate_phone_number], help_text="Phone number"
+    )
+    preferred_name = models.CharField(db_index=True, max_length=255, blank=True, help_text="Preferred name")
+    pronouns = models.CharField(max_length=100, blank=True, help_text="Pronouns")
+    email_verified = models.BooleanField(default=False)
+    guest = models.BooleanField(default=False, help_text="True if this is a guest user (not fully registered)")
+    totp_secret = EncryptedTextField(default=pyotp.random_base32, editable=False)
+    totp_active = models.BooleanField(default=False)
+    credentials_changed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text="Last password reset; single-use links issued before it are rejected.",
+    )
+    language = models.CharField(
+        max_length=7,
+        choices=settings.LANGUAGES,
+        default=settings.LANGUAGE_CODE,
+        db_index=True,
+        help_text="User's preferred language",
+    )
+    bio = MarkdownField(
+        blank=True,
+        default="",
+        validators=[MaxLengthValidator(500)],
+        help_text="User bio (publicly visible, supports markdown)",
+    )
+    profile_picture = ProtectedImageField(
+        upload_to=profile_picture_upload_path,
+        null=True,
+        blank=True,
+        validators=image_validators,
+    )
+    profile_picture_thumbnail = ProtectedImageField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="150x150 thumbnail (auto-generated).",
+    )
+    profile_picture_preview = ProtectedImageField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="400x400 preview (auto-generated).",
+    )
+
+    objects = RevelUserManager()  # type: ignore[misc]
+
+    class Meta:
+        ordering = ["username"]
+        indexes = [
+            models.Index(
+                fields=["email_verified", "is_active", "guest", "date_joined"],
+                name="user_unverified_lookup_idx",
+            ),
+        ]
+
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Normalize the phone number and strip whitespace from name fields before saving."""
+        if self.phone_number:
+            self.phone_number = normalize_phone_number(self.phone_number)
+        for field in ("first_name", "last_name", "preferred_name"):
+            value = getattr(self, field, None)
+            if isinstance(value, str):
+                setattr(self, field, value.strip())
+        super().save(*args, **kwargs)
+
+    def delete(self, *args: t.Any, **kwargs: t.Any) -> tuple[int, dict[str, int]]:
+        """Delete profile picture thumbnails from storage when user is deleted."""
+        if self.profile_picture_thumbnail:
+            self.profile_picture_thumbnail.delete(save=False)
+        if self.profile_picture_preview:
+            self.profile_picture_preview.delete(save=False)
+        return super().delete(*args, **kwargs)
+
+    @property
+    def display_name(self) -> str:
+        """Display name."""
+        return self.get_display_name()
+
+    def get_display_name(self) -> str:
+        """Returns the user's preferred name, or their full name as a fallback."""
+        return self.preferred_name or self.get_full_name() or self.username
+
+
+class UserDataExport(TimeStampedModel):
+    """Stores the user data export."""
+
+    class UserDataExportStatus(models.TextChoices):
+        PENDING = "PENDING", "Pending"
+        PROCESSING = "PROCESSING", "Processing"
+        READY = "READY", "Ready"
+        FAILED = "FAILED", "Failed"
+
+    user = models.OneToOneField(RevelUser, on_delete=models.CASCADE, related_name="data_export")
+    file = ProtectedFileField(upload_to="user_data_exports/", null=True, blank=True)
+    status = models.CharField(max_length=20, choices=UserDataExportStatus.choices, default=UserDataExportStatus.PENDING)
+    error_message = models.TextField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    def __str__(self) -> str:
+        return f"Data export for {self.user.username}"
+
+
+class EmailVerificationReminderTracking(models.Model):
+    """Tracks email verification reminder state for unverified users.
+
+    This model is created on-demand when the first reminder is sent and deleted
+    when the user successfully verifies their email. It prevents spam by tracking
+    when reminders were sent and ensures the exponential backoff schedule is followed.
+    """
+
+    user = models.OneToOneField(
+        RevelUser, on_delete=models.CASCADE, related_name="verification_reminder_tracking", primary_key=True
+    )
+    last_reminder_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Timestamp when the last verification reminder email was sent",
+    )
+    final_warning_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Timestamp when the final 30-day warning was sent (sent only once)",
+    )
+    deactivation_email_sent_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Timestamp when the account deactivation email was sent (sent only once)",
+    )
+
+    class Meta:
+        verbose_name = "Email Verification Reminder Tracking"
+        verbose_name_plural = "Email Verification Reminder Tracking"
+
+    def __str__(self) -> str:
+        return f"Verification tracking for {self.user.username}"
+
+
+class FoodItem(TimeStampedModel):
+    """Stores reusable food/ingredient names that users can create and search.
+
+    Users can create food items for their dietary restrictions but cannot edit or delete them
+    to prevent breaking references from other users' restrictions.
+    """
+
+    name = models.CharField(max_length=255, db_index=True, help_text="Food or ingredient name")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                Lower("name"),
+                name="unique_food_item_name_case_insensitive",
+            )
+        ]
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class DietaryRestriction(TimeStampedModel):
+    """Links users to specific food items with severity levels and visibility control.
+
+    Stores user-specific dietary restrictions (allergies, intolerances, dislikes) with optional
+    notes and visibility settings for sharing with event organizers and attendees.
+    """
+
+    class RestrictionType(models.TextChoices):
+        DISLIKE = "dislike", "Dislike"
+        INTOLERANT = "intolerant", "Intolerant"
+        ALLERGY = "allergy", "Allergy"
+        SEVERE_ALLERGY = "severe_allergy", "Severe Allergy"
+
+    user = models.ForeignKey(RevelUser, on_delete=models.CASCADE, related_name="dietary_restrictions")
+    food_item = models.ForeignKey(FoodItem, on_delete=models.CASCADE, related_name="user_restrictions")
+    restriction_type = models.CharField(
+        max_length=20,
+        choices=RestrictionType.choices,
+        db_index=True,
+        help_text="Severity level of the restriction",
+    )
+    notes = models.TextField(blank=True, help_text="Optional additional context (e.g., 'carry EpiPen')")
+    is_public = models.BooleanField(
+        default=False,
+        help_text="If True, visible to all event attendees (aggregated); if False, only to organizers",
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "food_item"],
+                name="unique_user_food_item_restriction",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["user", "is_public"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.user.username} - {self.food_item.name} ({self.restriction_type})"
+
+
+class DietaryPreference(TimeStampedModel):
+    """Stores predefined lifestyle dietary choices (system-managed).
+
+    Users can only select from existing preferences; they cannot create, edit, or delete them.
+    Preferences are seeded via data migration.
+    """
+
+    name = models.CharField(
+        max_length=100,
+        unique=True,
+        db_index=True,
+        help_text="Dietary preference name (e.g., 'Vegetarian', 'Vegan', 'Gluten-Free')",
+    )
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self) -> str:
+        return self.name
+
+
+class UserDietaryPreference(TimeStampedModel):
+    """Links users to dietary preferences with optional comments and visibility control.
+
+    Through table for M2M relationship between users and dietary preferences, allowing users
+    to add context and control visibility to event organizers and attendees.
+    """
+
+    user = models.ForeignKey(RevelUser, on_delete=models.CASCADE, related_name="dietary_preferences")
+    preference = models.ForeignKey(DietaryPreference, on_delete=models.CASCADE, related_name="users")
+    comment = models.TextField(
+        blank=True,
+        help_text="Optional context (e.g., 'strictly vegan, no honey')",
+    )
+    is_public = models.BooleanField(
+        default=False,
+        help_text="If True, visible to all event attendees (aggregated); if False, only to organizers",
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "preference"],
+                name="unique_user_dietary_preference",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["user", "is_public"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.user.username} - {self.preference.name}"
+
+
+# Kept for retro-compatibility
+
+
+def generate_otp() -> str:
+    """Generates a random 6-digit OTP."""
+    return f"{secrets.randbelow(10**6):06d}"
+
+
+def get_otp_expiration_time() -> datetime:
+    """Returns the expiration time for OTPs."""
+    return timezone.now() + timedelta(minutes=settings.ACCOUNT_OTP_EXPIRATION_MINUTES)
+
+
+class ImpersonationLog(models.Model):
+    """Audit trail for admin impersonation events.
+
+    Records every impersonation attempt by superusers for security auditing
+    and compliance purposes. Tracks both the request creation and redemption.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    admin_user = models.ForeignKey(
+        "RevelUser",
+        on_delete=models.CASCADE,
+        related_name="impersonations_performed",
+        help_text="The superuser who initiated the impersonation",
+    )
+    target_user = models.ForeignKey(
+        "RevelUser",
+        on_delete=models.CASCADE,
+        related_name="impersonations_received",
+        help_text="The user being impersonated",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    ip_address = models.GenericIPAddressField(
+        null=True,
+        blank=True,
+        help_text="IP address from which the impersonation was initiated",
+    )
+    user_agent = models.TextField(
+        blank=True,
+        default="",
+        help_text="Browser/client user agent string",
+    )
+    token_jti = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text="JWT ID of the impersonation request token",
+    )
+    redeemed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Timestamp when the request token was exchanged for an access token",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Impersonation Log"
+        verbose_name_plural = "Impersonation Logs"
+        indexes = [
+            models.Index(fields=["admin_user", "created_at"]),
+            models.Index(fields=["target_user", "created_at"]),
+        ]
+
+    def __str__(self) -> str:
+        status = "redeemed" if self.redeemed_at else "pending"
+        return f"{self.admin_user} -> {self.target_user} ({status})"
+
+    @property
+    def is_redeemed(self) -> bool:
+        """Check if the impersonation token has been redeemed."""
+        return self.redeemed_at is not None
+
+
+class ExternalIdentity(TimeStampedModel):
+    """A linked OpenID Connect identity (issuer + subject) for a user.
+
+    ``provider`` is the operator-configured key from ``settings.OIDC_PROVIDERS``;
+    ``subject`` is the ID token ``sub`` claim, which is stable per issuer+client.
+    """
+
+    user = models.ForeignKey(RevelUser, on_delete=models.CASCADE, related_name="external_identities")
+    provider = models.CharField(max_length=64)  # provider-only lookups use the composite unique index below
+    subject = models.CharField(max_length=255)
+    email = models.EmailField(blank=True, help_text="Email claim at link time (informational).")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["provider", "subject"], name="uniq_external_identity_provider_subject"),
+            # One identity per provider per account; a rotated ``sub`` replaces the row (see oidc._resolve_user).
+            models.UniqueConstraint(fields=["user", "provider"], name="uniq_external_identity_user_provider"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.provider}:{self.subject} → {self.user.email}"
+
+
+REFERRAL_CODE_VALIDATOR = RegexValidator(
+    regex=r"^[A-Za-z0-9_-]{3,20}$",
+    message=_("Referral codes use 3 to 20 letters, digits, dashes or underscores."),
+)
+
+
+class ReferralCode(TimeStampedModel):
+    """Tracks a unique referral code assigned 1:1 to a user.
+
+    Codes are case-insensitive (unique on ``Lower(code)``), stored as typed and immutable
+    after creation. Management is admin-only.
+    """
+
+    user = models.OneToOneField(RevelUser, on_delete=models.PROTECT, related_name="referral_code")
+    code = models.CharField(
+        max_length=20,
+        validators=[REFERRAL_CODE_VALIDATOR],
+        help_text="Referral code (case-insensitive, immutable)",
+    )
+    is_active = models.BooleanField(default=True)
+    revenue_share_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Overrides settings.DEFAULT_REFERRAL_SHARE_PERCENT for referrals this code produces.",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [models.UniqueConstraint(Lower("code"), name="unique_referral_code_ci")]
+
+    def __str__(self) -> str:
+        return f"{self.user.username} — {self.code}"
+
+
+class Referral(TimeStampedModel):
+    """Records that a referred user signed up via a referral code.
+
+    ``referrer`` is denormalized from ``referral_code.user`` for query performance.
+    ``revenue_share_percent`` is snapshotted from ``settings.DEFAULT_REFERRAL_SHARE_PERCENT``
+    at creation time so future settings changes don't affect existing referrals.
+    """
+
+    referral_code = models.ForeignKey(ReferralCode, on_delete=models.PROTECT, related_name="referrals")
+    referrer = models.ForeignKey(
+        RevelUser,
+        on_delete=models.PROTECT,
+        related_name="referrals_made",
+        editable=False,
+        help_text="Denormalized from referral_code.user; set automatically on save",
+    )
+    referred_user = models.OneToOneField(
+        RevelUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="referral",
+        help_text="Nulled when the referred user deletes their account; the referrer's payout history survives.",
+    )
+    revenue_share_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=settings.DEFAULT_REFERRAL_SHARE_PERCENT,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Snapshotted from settings.DEFAULT_REFERRAL_SHARE_PERCENT at creation time",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(referrer=models.F("referred_user")),
+                name="referral_no_self_referral",
+            )
+        ]
+
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Derive referrer and snapshot the share percent before persisting.
+
+        On create, a code-level override replaces the field default; an explicit
+        non-default value passed by the caller wins. Existing rows are never rewritten.
+        """
+        self.referrer = self.referral_code.user
+        # ponytail: "untouched" is detected by value, so a caller that explicitly passes exactly
+        # the global default for a code with an override gets the override. Only the admin's
+        # manual Referral form can do that today; a None default with a save-time fill would
+        # distinguish the two if it ever matters.
+        if self._state.adding and self.revenue_share_percent == settings.DEFAULT_REFERRAL_SHARE_PERCENT:
+            override = self.referral_code.revenue_share_percent
+            if override is not None:
+                self.revenue_share_percent = override
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        referred = self.referred_user
+        referred_name = referred.username if referred is not None else "(deleted user)"
+        return f"{self.referrer.username} → {referred_name} ({self.revenue_share_percent}%)"
+
+
+class ReferralApplication(TimeStampedModel):
+    """A request to join the referral program, or an admin invite into it.
+
+    Both flows share one lifecycle: a public application starts ``PENDING`` and an admin
+    decides; an admin invite is created ``PENDING`` and approved in the same step
+    (``source=INVITE``). ``user`` is set once a ``ReferralCode`` exists for the applicant —
+    at approval when the account exists, or at signup otherwise (email match).
+    """
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        APPROVED = "approved", "Approved"
+        REJECTED = "rejected", "Rejected"
+        BLOCKED = "blocked", "Blocked"
+
+    class Source(models.TextChoices):
+        APPLICATION = "application", "Application"
+        INVITE = "invite", "Invite"
+
+    email = models.EmailField(help_text="Applicant email, lowercased")
+    normalized_email = models.CharField(
+        max_length=255, db_index=True, editable=False, help_text="Normalized for matching (same rules as GlobalBan)"
+    )
+    code = models.CharField(max_length=20, validators=[REFERRAL_CODE_VALIDATOR], help_text="Desired referral code")
+    revenue_share_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=settings.DEFAULT_REFERRAL_SHARE_PERCENT,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Share percent the referral code will carry once approved",
+    )
+    note = models.TextField(blank=True, help_text="Applicant's note (plain text). Required for public applications.")
+    admin_note = models.TextField(
+        blank=True,
+        help_text="Included in the rejection email, or in the invite email of any approved application, when present.",
+    )
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PENDING, db_index=True)
+    source = models.CharField(max_length=20, choices=Source.choices, default=Source.APPLICATION)
+    decided_by = models.ForeignKey(RevelUser, on_delete=models.SET_NULL, null=True, blank=True, related_name="+")
+    decided_at = models.DateTimeField(null=True, blank=True)
+    user = models.ForeignKey(
+        RevelUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="referral_applications",
+        help_text="Set once the applicant is enrolled (a ReferralCode exists)",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["normalized_email"],
+                condition=models.Q(status="pending"),
+                name="unique_pending_referral_application_per_email",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.email} — {self.code} ({self.status})"
+
+    def clean(self) -> None:
+        """Public applications must carry a note; invites may leave it blank."""
+        if self.source == self.Source.APPLICATION and not self.note.strip():
+            raise ValidationError({"note": _("A note is required.")})
+
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Lowercase the email and derive ``normalized_email`` before validation runs."""
+        self.email = self.email.strip().lower()
+        self.normalized_email = normalize_email_for_matching(self.email)
+        super().save(*args, **kwargs)
+
+
+class ReferralPayout(TimeStampedModel):
+    """Monthly calculated earnings for a referrer from a specific referral.
+
+    Created by the payout calculation task in the events app, which aggregates
+    net platform fees (excluding VAT) from the referred user's organizations.
+    The disbursement (Stripe transfer) is handled separately by the accounts app.
+    """
+
+    class ReferralPayoutStatus(models.TextChoices):
+        CALCULATED = "calculated", "Calculated"
+        PENDING = "pending", "Pending"
+        PAID = "paid", "Paid"
+        FAILED = "failed", "Failed"
+        ROLLED_OVER = "rolled_over", "Rolled Over"
+
+    referral = models.ForeignKey(
+        Referral,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="payouts",
+        help_text="Nulled when the referrer deletes their account; PAID payouts and their statements are retained.",
+    )
+    period_start = models.DateField(db_index=True)
+    period_end = models.DateField(db_index=True)
+    net_platform_fees = models.DecimalField(
+        max_digits=10, decimal_places=2, help_text="Sum of platform_fee_net for the period (excludes VAT)"
+    )
+    payout_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        help_text="net_platform_fees * revenue_share_percent / 100 + rolled_over_amount",
+    )
+    rolled_over_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        default=Decimal("0.00"),
+        help_text="Amount carried forward from prior below-threshold periods.",
+    )
+    currency = models.CharField(max_length=3, default=settings.DEFAULT_CURRENCY)
+    status = models.CharField(
+        max_length=20, choices=ReferralPayoutStatus.choices, default=ReferralPayoutStatus.CALCULATED, db_index=True
+    )
+    stripe_transfer_id = models.CharField(max_length=255, blank=True, db_index=True)
+
+    class Meta:
+        ordering = ["-period_start"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["referral", "period_start"],
+                name="unique_referral_payout_per_period",
+            )
+        ]
+
+    def __str__(self) -> str:
+        referral = self.referral
+        label = str(referral) if referral is not None else "(detached referral)"
+        return f"{label} | {self.period_start} | {self.payout_amount} {self.currency} ({self.status})"
+
+
+class ReferralPayoutStatement(EmailDeliverableMixin, TimeStampedModel):
+    """PDF document for a referral payout (Gutschrift or payout statement).
+
+    Either a self-billing invoice (Gutschrift, B2B with validated VAT ID)
+    or a payout statement (B2C/individual).
+    Snapshots referrer and platform business details at generation time.
+    """
+
+    class DocumentType(models.TextChoices):
+        SELF_BILLING_INVOICE = "self_billing_invoice", "Self-Billing Invoice (Gutschrift)"
+        PAYOUT_STATEMENT = "payout_statement", "Payout Statement"
+
+    payout = models.OneToOneField(ReferralPayout, on_delete=models.PROTECT, related_name="statement")
+    document_type = models.CharField(max_length=30, choices=DocumentType.choices)
+    document_number = models.CharField(
+        max_length=30, unique=True, help_text="Sequential number (e.g., RVL-RP-2026-000001)."
+    )
+
+    # Fee breakdown
+    amount_gross = models.DecimalField(max_digits=10, decimal_places=2, help_text="Payout amount (VAT-inclusive).")
+    amount_net = models.DecimalField(max_digits=10, decimal_places=2, help_text="Payout excluding VAT.")
+    amount_vat = models.DecimalField(max_digits=10, decimal_places=2, help_text="VAT portion.")
+    vat_rate = models.DecimalField(max_digits=5, decimal_places=2, help_text="VAT rate applied.")
+    currency = models.CharField(max_length=3, default=settings.DEFAULT_CURRENCY)
+    reverse_charge = models.BooleanField(default=False, help_text="EU cross-border B2B reverse charge.")
+
+    # Referrer snapshot
+    referrer_name = models.CharField(max_length=255)
+    referrer_address = models.TextField(blank=True, default="")
+    referrer_vat_id = models.CharField(max_length=20, blank=True, default="")
+    referrer_country = models.CharField(max_length=2, blank=True, default="")
+
+    # Platform snapshot
+    platform_business_name = models.CharField(max_length=255)
+    platform_business_address = models.TextField()
+    platform_vat_id = models.CharField(max_length=20)
+
+    # Delivery
+    issued_at = models.DateTimeField(null=True, blank=True)
+    pdf_file = ProtectedFileField(upload_to="invoices/referral_payouts/", null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.document_number} ({self.get_document_type_display()})"
+
+
+class UserBillingProfile(TimeStampedModel):
+    """Billing information for a user (e.g., referrers receiving payouts).
+
+    Created on-demand — not every user needs billing info.
+    Mirrors the organization billing info pattern but lives in the accounts app.
+    """
+
+    user = models.OneToOneField(RevelUser, on_delete=models.CASCADE, related_name="billing_profile")
+
+    # Identity
+    billing_name = models.CharField(max_length=255, blank=True, default="", help_text="Legal name for invoicing")
+
+    # VAT / country
+    vat_id = models.CharField(
+        max_length=20, blank=True, default="", db_index=True, help_text="EU VAT ID with country prefix"
+    )
+    vat_country_code = models.CharField(
+        max_length=2,
+        blank=True,
+        default="",
+        help_text="ISO 3166-1 alpha-2 country code. Synced from VAT ID prefix when set, otherwise user-provided.",
+    )
+    vat_id_validated = models.BooleanField(default=False)
+    vat_id_validated_at = models.DateTimeField(null=True, blank=True)
+    vies_request_identifier = models.CharField(max_length=50, blank=True, default="")
+
+    # Address
+    billing_address = models.TextField(blank=True)
+
+    # Contact
+    billing_email = models.EmailField(blank=True, help_text="Billing email (falls back to user.email in service logic)")
+
+    # Self-billing agreement (required before we issue Gutschrift / payout statements)
+    self_billing_agreed = models.BooleanField(
+        default=False,
+        help_text="User has agreed to self-billing (Gutschrift). Required before payouts are processed.",
+    )
+
+    class Meta:
+        verbose_name = "User Billing Profile"
+        verbose_name_plural = "User Billing Profiles"
+
+    def __str__(self) -> str:
+        return f"Billing profile for {self.user.username}"
+
+
+class GlobalBan(TimeStampedModel):
+    """Platform-wide ban by email, domain, or Telegram username.
+
+    When created, a signal handler automatically deactivates matching users
+    and sends notifications. Domain bans are processed asynchronously via Celery.
+    """
+
+    class BanType(models.TextChoices):
+        EMAIL = "email", "Specific Email"
+        DOMAIN = "domain", "Email Domain"
+        TELEGRAM = "telegram", "Telegram Username"
+
+    ban_type = models.CharField(max_length=20, choices=BanType.choices, db_index=True)
+    value = models.CharField(max_length=255, db_index=True, help_text="Original input value")
+    normalized_value = models.CharField(max_length=255, db_index=True, help_text="Normalized value for matching")
+    user = models.ForeignKey(
+        RevelUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="global_bans",
+        help_text="The user affected by this ban (linked automatically)",
+    )
+    reason = models.TextField(blank=True, help_text="Reason for the ban")
+    created_by = models.ForeignKey(
+        RevelUser,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        help_text="Admin who created this ban",
+    )
+
+    class Meta:
+        verbose_name = _("Global Ban")
+        verbose_name_plural = _("Global Bans")
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ban_type", "normalized_value"],
+                name="unique_global_ban",
+            )
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.get_ban_type_display()}: {self.value}"
+
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Compute normalized_value before saving."""
+        if self.ban_type == self.BanType.EMAIL:
+            self.normalized_value = normalize_email_for_matching(self.value)
+        elif self.ban_type == self.BanType.DOMAIN:
+            self.normalized_value = normalize_domain_for_matching(self.value)
+        elif self.ban_type == self.BanType.TELEGRAM:
+            self.normalized_value = normalize_telegram_for_matching(self.value)
+        super().save(*args, **kwargs)

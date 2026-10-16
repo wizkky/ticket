@@ -1,0 +1,913 @@
+import typing as t
+from datetime import datetime, timedelta
+from uuid import UUID
+
+from django.conf import settings
+from django.contrib.auth.models import AnonymousUser
+from django.contrib.gis.db import models
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db.models import BooleanField, Exists, OuterRef, Prefetch, Q, Value
+from django.utils import timezone
+from django.utils.translation import gettext_lazy as _
+from pydantic import ValidationError as PydanticValidationError
+
+from accounts.models import RevelUser
+from common.fields import MarkdownField
+from common.models import TagAssignment, TaggableMixin, TimeStampedModel
+from events.utils.schedule import validate_schedule
+from events.utils.visibility import (
+    get_excluded_org_ids,
+    get_invited_event_ids,
+    get_rsvp_event_ids,
+    get_ticketed_event_ids,
+    get_valid_member_org_ids,
+    not_excluded_q,
+    owner_or_staff_q,
+)
+from events.utils.visibility_settings import EventVisibilitySettings, validate_visibility_settings
+
+from .event_series import EventSeries
+from .mixins import (
+    LocationMixin,
+    LogoCoverValidationMixin,
+    ResourceVisibility,
+    SlugFromNameMixin,
+    VisibilityMixin,
+)
+from .organization import Organization, OrganizationMember
+from .ticket import _get_payment_default_expiry  # noqa: F401  # Re-export for migration compatibility
+from .venue import Venue
+
+
+class EventQuerySet(models.QuerySet["Event"]):
+    def exclude_templates(self) -> t.Self:
+        """Exclude recurring-series template events from the queryset.
+
+        Templates are internal blueprints used by the recurring-event generator
+        and should never appear in user-facing listings, counts, exports, or
+        attendee aggregations. Prefer this helper over ad-hoc
+        ``.filter(is_template=False)`` so the intent is searchable.
+        """
+        return self.filter(is_template=False)
+
+    def with_tags(self) -> t.Self:
+        """Prefetch tags and related tag objects for max performance."""
+        return self.prefetch_related(
+            Prefetch(
+                "tags",  # the GenericRelation on Event
+                queryset=TagAssignment.objects.select_related("tag"),
+                to_attr="prefetched_tagassignments",  # Optional: if you want to use a custom attribute
+            )
+        )
+
+    def with_city(self) -> t.Self:
+        """Select the city as well."""
+        return self.select_related("city")
+
+    def with_organization(self) -> t.Self:
+        """Returns a queryset prefetching an organization and its members."""
+        return self.select_related("organization").prefetch_related("organization__staff_members")
+
+    def with_venue(self) -> t.Self:
+        """Select the venue (without sectors/seats) to avoid N+1."""
+        return self.select_related("venue")
+
+    def with_user_bookmark(self, user: RevelUser | AnonymousUser) -> t.Self:
+        """Annotate ``user_has_bookmarked`` for the given user.
+
+        Read by ``EventBaseSchema.resolve_is_bookmarked`` to render the
+        per-event bookmark state without an N+1 query. Anonymous users never
+        have bookmarks, so the annotation is a constant ``False``.
+        """
+        if user.is_anonymous:
+            return self.annotate(user_has_bookmarked=Value(False, output_field=BooleanField()))
+        from .bookmark import EventBookmark
+
+        return self.annotate(user_has_bookmarked=Exists(EventBookmark.objects.filter(event=OuterRef("pk"), user=user)))
+
+    def for_user(
+        self, user: RevelUser | AnonymousUser, include_past: bool = False, allowed_ids: list[UUID] | None = None
+    ) -> t.Self:
+        """Get the queryset based on the user, using an efficient subquery strategy.
+
+        Membership status handling:
+        - BANNED/blacklisted users: Cannot see events from organizations where they are banned,
+          whatever branch would otherwise grant access (public, membership, staff, invitation,
+          RSVP, token). Two carve-outs: events of an organization the user owns, and events the
+          user holds a ticket for (even cancelled), so they can still open the event their
+          ticket and any refund refer to.
+        - CANCELLED users: Treated as if they have no membership
+        - PAUSED/ACTIVE users: Can see events based on visibility rules
+        """
+        base_qs = self.select_related("organization", "event_series", "venue").filter(is_template=False)
+
+        is_allowed_special = Q(id__in=allowed_ids) if allowed_ids else Q()
+
+        if not include_past:
+            today = timezone.localdate()
+            base_qs = base_qs.filter(Q(start__date__gte=today) | Q(start__isnull=True) | is_allowed_special)
+
+        if user.is_superuser or user.is_staff:
+            return base_qs
+
+        if user.is_anonymous:
+            # UNLISTED events are accessible like PUBLIC (e.g. via direct link);
+            # discovery listings use discoverable_for_user() to hide them.
+            return base_qs.filter(
+                Q(
+                    visibility__in=Event.Visibility.publicly_accessible(),
+                    status__in=[Event.EventStatus.OPEN, Event.EventStatus.CLOSED],
+                )
+                | is_allowed_special
+            )
+
+        # --- Get banned and blacklisted organization IDs ---
+        # Users banned/blacklisted from an organization cannot see its events, whatever the branch
+        excluded_org_ids = get_excluded_org_ids(user)
+
+        # --- Subquery Strategy ---
+        # 1. Get IDs of all non-public events this user has a specific relationship with.
+
+        # Events where they are a valid member of the organization (not cancelled, not banned)
+        member_event_ids = self.filter(
+            visibility=Event.Visibility.MEMBERS_ONLY, organization_id__in=get_valid_member_org_ids(user)
+        ).values_list("id", flat=True)
+
+        # Listing visibility is deliberately lenient: any ticket (even cancelled) and any
+        # RSVP row count. Fine-grained checks (address, cancellation reason) are stricter.
+        ticketed_event_ids = set(get_ticketed_event_ids(user, include_cancelled=True))
+        allowed_non_public_ids = (
+            set(get_invited_event_ids(user))
+            | set(member_event_ids)
+            | ticketed_event_ids
+            | set(get_rsvp_event_ids(user, confirmed_only=False))
+            | set(allowed_ids or [])  # allow specific extra ids (e.g., when an EventToken is used).
+        )
+
+        # 2. Build the final query
+        is_owner_or_staff = owner_or_staff_q(user)
+        # UNLISTED events are accessible like PUBLIC (e.g. via direct link);
+        # discovery listings use discoverable_for_user() to hide them.
+        is_public = Q(visibility__in=Event.Visibility.publicly_accessible())
+        is_allowed_non_public = Q(id__in=list(allowed_non_public_ids))
+
+        # Users see events if they are public, if they are staff/owner,
+        # or if they have a specific permission (invite/member)
+        final_qs = base_qs.filter(is_public | is_owner_or_staff | is_allowed_non_public)
+
+        # A ban/blacklist trumps every branch above, except for ticket holders (see docstring).
+        if excluded_org_ids:
+            final_qs = final_qs.filter(not_excluded_q(user, excluded_org_ids) | Q(id__in=list(ticketed_event_ids)))
+
+        # Only staff/owners can see drafts
+        if not (user.is_staff or user.is_superuser):
+            final_qs = final_qs.exclude(~is_owner_or_staff & Q(status=Event.EventStatus.DRAFT))
+
+        return final_qs.distinct()
+
+    def discoverable_for_user(
+        self, user: RevelUser | AnonymousUser, include_past: bool = False, allowed_ids: list[UUID] | None = None
+    ) -> t.Self:
+        """Get queryset for discovery listings (browse/search).
+
+        Wraps for_user() and additionally hides UNLISTED events
+        from users who are not the owner or staff of the event's organization.
+        """
+        qs = self.for_user(user, include_past=include_past, allowed_ids=allowed_ids)
+        if user.is_superuser or user.is_staff:
+            return qs
+        if user.is_anonymous:
+            return qs.exclude(visibility=Event.Visibility.UNLISTED)
+        return qs.exclude(Q(visibility=Event.Visibility.UNLISTED) & ~owner_or_staff_q(user))
+
+
+class EventManager(models.Manager["Event"]):
+    def get_queryset(self) -> EventQuerySet:
+        """Get base queryset for events."""
+        return EventQuerySet(self.model, using=self._db)
+
+    def exclude_templates(self) -> EventQuerySet:
+        """Return a queryset that excludes recurring-series template events."""
+        return self.get_queryset().exclude_templates()
+
+    def with_organization(self) -> EventQuerySet:
+        """Returns a queryset prefetching an organization and its members."""
+        return self.get_queryset().with_organization()
+
+    def with_city(self) -> EventQuerySet:
+        """Returns a queryset selecting the related city for the events."""
+        return self.get_queryset().with_city()
+
+    def with_tags(self) -> EventQuerySet:
+        """Returns a queryset prefetching the tags."""
+        return self.get_queryset().with_tags()
+
+    def with_venue(self) -> EventQuerySet:
+        """Returns a queryset selecting the related venue (without sectors/seats)."""
+        return self.get_queryset().with_venue()
+
+    def with_user_bookmark(self, user: RevelUser | AnonymousUser) -> EventQuerySet:
+        """Returns a queryset annotating the user's bookmark state per event."""
+        return self.get_queryset().with_user_bookmark(user)
+
+    def full(self) -> EventQuerySet:
+        """Returns a queryset prefetching the full events.
+
+        ``venue__city`` and ``organization__city`` feed ``EventDetailSchema.compliance``
+        (the event's venue country and the org's resolved country).
+        """
+        return (
+            self.get_queryset()
+            .with_organization()
+            .with_city()
+            .with_tags()
+            .with_venue()
+            .select_related("venue__city", "organization__city")
+        )
+
+    def for_user(
+        self, user: RevelUser | AnonymousUser, include_past: bool = False, allowed_ids: list[UUID] | None = None
+    ) -> EventQuerySet:
+        """Get the queryset based on the user."""
+        return self.get_queryset().for_user(user, include_past=include_past, allowed_ids=allowed_ids)
+
+    def discoverable_for_user(
+        self, user: RevelUser | AnonymousUser, include_past: bool = False, allowed_ids: list[UUID] | None = None
+    ) -> EventQuerySet:
+        """Get queryset for discovery listings."""
+        return self.get_queryset().discoverable_for_user(user, include_past=include_past, allowed_ids=allowed_ids)
+
+
+class Event(
+    SlugFromNameMixin, TimeStampedModel, VisibilityMixin, LocationMixin, LogoCoverValidationMixin, TaggableMixin
+):
+    # Slug uniqueness is scoped to organization
+    slug_scope_field = "organization"
+    # Use event start date as human-readable slug suffix on collision
+    slug_date_field = "start"
+
+    class EventType(models.TextChoices):
+        PUBLIC = "public"
+        PRIVATE = "private"
+        MEMBERS_ONLY = "members-only"
+
+    class EventStatus(models.TextChoices):
+        OPEN = "open"
+        CLOSED = "closed"
+        DRAFT = "draft"
+        CANCELLED = "cancelled"
+
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="events")
+    status = models.CharField(choices=EventStatus.choices, max_length=10, default=EventStatus.DRAFT)
+    cancellation_reason = models.CharField(max_length=1000, blank=True, default="")
+    tickets_refund_started_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+        help_text="Stamped when the bulk cancel-and-refund sweep was dispatched. "
+        "Non-null blocks un-cancelling the event. Staff-only — never expose in public schemas.",
+    )
+    name = models.CharField(max_length=255, db_index=True)
+    slug = models.SlugField(max_length=255, db_index=True)
+    description = MarkdownField(blank=True, null=True)
+    invitation_message = MarkdownField(
+        blank=True,
+        null=True,
+        help_text="Invitation message to override the one automatically generated using name and description.",
+    )
+    event_type = models.CharField(choices=EventType.choices, max_length=20, db_index=True, default=EventType.PRIVATE)
+    event_series = models.ForeignKey(
+        EventSeries, on_delete=models.CASCADE, null=True, blank=True, related_name="events"
+    )
+    max_attendees = models.PositiveIntegerField(default=0)
+    schedule = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Ordered list of timeline sessions (relative offsets from event start). Display-only.",
+    )
+    visibility_settings = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "Granular disclosure settings: boolean toggles for attendee count, capacity, guest "
+            "list, and pronoun distribution, plus an address_visibility level (public/private/"
+            "members-only/staff-only/attendees-only). An empty object means every toggle keeps "
+            "its own default — visible for all of them except pronoun distribution, which "
+            "defaults to hidden; address_visibility defaults to public."
+        ),
+    )
+    waitlist_open = models.BooleanField(default=False)
+    waitlist_time_window = models.DurationField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Time window for a batch to claim spots. NULL = legacy passive waitlist "
+            "(no offers, no batching, current default behavior)."
+        ),
+    )
+    waitlist_batch_size = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Number of users to notify per round. 0 = notify all eligible waitlist "
+            "members simultaneously. Only meaningful when waitlist_time_window is set."
+        ),
+    )
+    waitlist_cutoff_date = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=(
+            "After this datetime, batching stops. One final all-hands batch fires, "
+            "then AvailabilityGate behaves normally."
+        ),
+    )
+    waitlist_lottery_mode = models.BooleanField(
+        default=False,
+        help_text="If True, randomly sample batch members instead of FIFO.",
+    )
+    waitlist = models.ManyToManyField(
+        settings.AUTH_USER_MODEL, related_name="waitlist", blank=True, through="EventWaitList"
+    )
+    start = models.DateTimeField(db_index=True)
+    end = models.DateTimeField(db_index=True)
+    is_open_ended = models.BooleanField(
+        default=False,
+        help_text=(
+            "If True, the event has no fixed end shown to attendees. `end` is still set "
+            "(defaulting to start + 24h) and used internally as an operational horizon."
+        ),
+    )
+    rsvp_before = models.DateTimeField(
+        null=True, blank=True, db_index=True, help_text="RSVP deadline for events that do not require tickets"
+    )
+    check_in_starts_at = models.DateTimeField(
+        null=True, blank=True, db_index=True, help_text="When check-in opens for this event"
+    )
+    check_in_ends_at = models.DateTimeField(
+        null=True, blank=True, db_index=True, help_text="When check-in closes for this event"
+    )
+    requires_ticket = models.BooleanField(default=True)  # If False, managed via RSVPs
+    requires_full_profile = models.BooleanField(
+        default=False, help_text="Whether this event requires full profile information (profile pic, name, pronouns)"
+    )
+    potluck_open = models.BooleanField(default=False)
+    accept_rsvp_notes = models.BooleanField(
+        default=False,
+        help_text="Allow attendees to attach a short plain-text note to their RSVP.",
+    )
+    accept_invitation_requests = models.BooleanField(default=False)
+    apply_before = models.DateTimeField(
+        null=True, blank=True, db_index=True, help_text="Deadline for submitting invitation requests or questionnaires"
+    )
+
+    @property
+    def effective_apply_deadline(self) -> datetime:
+        """The apply deadline, falling back to event start if not set."""
+        return self.apply_before or self.start
+
+    can_attend_without_login = models.BooleanField(
+        default=True, help_text="Allow users to RSVP or purchase tickets without creating an account"
+    )
+    require_ticket_names = models.BooleanField(
+        default=True,
+        help_text="Require a holder name for every ticket at checkout. "
+        "When off, names are optional and checkout is faster.",
+    )
+
+    attendee_count = models.PositiveIntegerField(default=0, editable=False)
+    max_tickets_per_user = models.PositiveIntegerField(
+        default=1,
+        null=True,
+        blank=True,
+        help_text="Maximum tickets a user can purchase for this event, across all tiers. Null = unlimited.",
+    )
+
+    venue = models.ForeignKey(
+        Venue,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="events",
+        help_text="Optional venue for this event.",
+    )
+
+    # Place of supply for VAT (#869). Physical admission is taxed where the
+    # event takes place (Art. 53/54(1) VAT Directive); virtual attendance
+    # follows the post-2025 rules (Directive (EU) 2022/542).
+    is_virtual = models.BooleanField(
+        default=False,
+        help_text="Virtual (streamed) attendance — changes the VAT place-of-supply rules.",
+    )
+    vat_country_code = models.CharField(
+        max_length=2,
+        blank=True,
+        default="",
+        help_text="Explicit VAT country override (ISO 3166-1 alpha-2). Blank = derived from the "
+        "venue's city, then the event's city, falling back to the organization's VAT country.",
+    )
+
+    @property
+    def effective_vat_country(self) -> str:
+        """The country whose VAT applies to admission to this event (#869).
+
+        Resolution order: explicit ``vat_country_code`` override → venue city →
+        event city → organization VAT country. Callers on hot paths should have
+        ``venue__city``, ``city`` and ``organization`` selected.
+        """
+        if self.vat_country_code:
+            return self.vat_country_code.upper()
+        if self.venue is not None and self.venue.city is not None:
+            return self.venue.city.iso2.upper()
+        if self.city is not None:
+            return self.city.iso2.upper()
+        return self.organization.vat_country_code.upper()
+
+    # Recurring event fields
+    # NOTE: when adding new fields to Event, check whether they should be
+    # excluded from duplication in ``events.service.duplication._EXCLUDED_FROM_COPY``.
+    # Fields in the exclusion set are NOT copied from template to occurrence;
+    # everything else is copied by default via ``_meta.concrete_fields`` introspection.
+    is_template = models.BooleanField(default=False, db_index=True)
+    is_modified = models.BooleanField(default=False)
+    occurrence_index = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "Monotonic count of materializations for this event's series "
+            "(0-based). This is NOT the position of the event in the RRULE "
+            "sequence: cancelled/excluded dates are skipped and do not "
+            "consume an index. Useful for audit and ordering, not for "
+            "mapping back to the original recurrence pattern."
+        ),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["organization", "slug"], name="unique_organization_slug"),
+            # Templates are internal blueprints for recurring series and must
+            # never be published. Enforce at the DB layer so a stray update
+            # (admin action, data migration) can't accidentally expose a
+            # template to users. Templates stay in DRAFT for their entire life.
+            models.CheckConstraint(
+                condition=models.Q(is_template=False) | models.Q(status="draft"),
+                name="template_events_must_be_draft",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["visibility", "status"], name="idx_visibility_status"),
+            models.Index(fields=["organization", "status"], name="idx_org_status"),
+            models.Index(fields=["organization", "visibility"], name="idx_org_visibility"),
+            models.Index(fields=["event_type", "start"], name="idx_type_start"),
+            models.Index(fields=["status", "start"], name="idx_status_start"),
+            models.Index(fields=["visibility", "organization"], name="idx_visibility_organization"),
+        ]
+        ordering = ["start"]
+
+    objects = EventManager()
+
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Override save to set default end date if not provided."""
+        if self.start and not self.end:
+            self.end = self.start + timedelta(days=1)
+        super().save(*args, **kwargs)
+
+    def __str__(self) -> str:
+        return f"{self.name} ({self.organization.name})"
+
+    @property
+    def effective_capacity(self) -> int:
+        """The effective capacity considering both max_attendees and venue capacity.
+
+        Returns the minimum of max_attendees and venue.capacity when both are set,
+        or whichever is set if only one exists. Returns 0 (unlimited) if neither is set.
+
+        This is a soft limit that can be overridden by invitations with
+        overrides_max_attendees=True. For hard limits, see sector capacity.
+
+        Note:
+            Ensure the venue is prefetched (via select_related or with_venue())
+            before accessing this property to avoid N+1 queries.
+
+        Returns:
+            Effective capacity as int. 0 means unlimited.
+        """
+        capacities = [cap for cap in [self.max_attendees, self.venue.capacity if self.venue else None] if cap]
+        return min(capacities) if capacities else 0
+
+    @property
+    def is_full(self) -> bool:
+        """Whether confirmed attendees have reached the effective capacity.
+
+        Deliberately **not** gated by ``visibility_settings``: "full yes/no" is
+        what the frontend needs for sold-out badges and to explain a blocked
+        RSVP, and it discloses no exact number. Only the counts behind it are
+        sensitive.
+
+        Reads the denormalized ``attendee_count`` (no query) and
+        ``effective_capacity`` (needs ``venue`` loaded). Pending waitlist offers
+        are NOT counted here — they reserve seats but do not make the event full,
+        and counting them would cost a per-event query in list views. The
+        authoritative, offer-aware check lives in ``AvailabilityGate``.
+
+        Returns:
+            False for uncapped events (``effective_capacity == 0``), otherwise
+            whether ``attendee_count`` has reached that capacity.
+        """
+        capacity = self.effective_capacity
+        return capacity > 0 and self.attendee_count >= capacity
+
+    @property
+    def visibility_flags(self) -> EventVisibilitySettings:
+        """The parsed ``visibility_settings`` blob, with defaults filled in.
+
+        Parsed on every access rather than cached so a freshly-assigned
+        ``visibility_settings`` never serves stale flags. Validating three
+        booleans is cheap; the alternative caching bug is not.
+        """
+        return validate_visibility_settings(self.visibility_settings)
+
+    def bypasses_visibility_settings(self, user: RevelUser | AnonymousUser) -> bool:
+        """Whether the user sees an event's real numbers regardless of its toggles.
+
+        True for Django superusers/staff, the organization owner, and
+        organization staff members — the people who need the operational view.
+
+        Results are cached on the instance keyed by user id, mirroring
+        :meth:`can_user_see_address`; the cache resets when the instance is
+        re-fetched from the DB.
+
+        Args:
+            user: The user to check.
+
+        Returns:
+            True if the user bypasses every ``visibility_settings`` toggle.
+        """
+        cache_key = getattr(user, "id", None)
+        if not hasattr(self, "_visibility_bypass_cache"):
+            self._visibility_bypass_cache: dict[t.Any, bool] = {}
+        if cache_key in self._visibility_bypass_cache:
+            return self._visibility_bypass_cache[cache_key]
+
+        result = self._compute_bypasses_visibility_settings(user)
+        self._visibility_bypass_cache[cache_key] = result
+        return result
+
+    def _compute_bypasses_visibility_settings(self, user: RevelUser | AnonymousUser) -> bool:
+        """Compute the visibility bypass without caching."""
+        if user.is_superuser or user.is_staff:
+            return True
+        if user.is_anonymous:
+            return False
+        if self.organization.owner_id == user.id:
+            return True
+        # Use .all() to leverage prefetched data when available (from with_organization()).
+        return any(m.id == user.id for m in self.organization.staff_members.all())
+
+    def can_user_see_attendee_count(self, user: RevelUser | AnonymousUser) -> bool:
+        """Whether ``attendee_count`` may be disclosed to this user."""
+        return self.visibility_flags.show_attendee_count or self.bypasses_visibility_settings(user)
+
+    def can_user_see_capacity(self, user: RevelUser | AnonymousUser) -> bool:
+        """Whether capacity figures may be disclosed to this user.
+
+        Covers ``max_attendees``, held seats, derived spots-left, and a ticket
+        tier's ``total_available``.
+        """
+        # ponytail: this does not cover seated ticketed events. The seat picker
+        # (``GET /events/{id}/seating/availability``) returns an anonymous
+        # per-seat sold/held map, and a seat map that hides occupancy cannot
+        # function as a seat map — so occupancy stays inferable there. Closing
+        # it needs a separate "blind seating" mode (server-side assignment only,
+        # no map), which is a product decision rather than a gating one.
+        # Until then, organizers running seated events must be told that
+        # ``show_capacity`` only hides the tier/capacity numbers.
+        return self.visibility_flags.show_capacity or self.bypasses_visibility_settings(user)
+
+    def can_user_see_attendee_list(self, user: RevelUser | AnonymousUser) -> bool:
+        """Whether the guest list may be disclosed to this user at all.
+
+        This is only the event-level half of the decision: it is ANDed with each
+        attendee's own ``show_me_on_attendee_list`` preference in
+        :meth:`attendees`, so it can hide people who opted in but never reveal
+        people who opted out.
+        """
+        return self.visibility_flags.show_attendee_list or self.bypasses_visibility_settings(user)
+
+    def can_user_see_pronoun_distribution(self, user: RevelUser | AnonymousUser) -> bool:
+        """Whether the aggregated pronoun distribution may be disclosed to this user.
+
+        Opt-in per event, unlike its siblings: ``show_pronoun_distribution``
+        defaults to ``False``. ANDed with :meth:`can_user_see_attendee_count` at
+        the point of use — the distribution's per-pronoun counts sum straight
+        back to the head count, so opting into the distribution must not
+        sidestep an event that hides its counts.
+        """
+        return self.visibility_flags.show_pronoun_distribution or self.bypasses_visibility_settings(user)
+
+    def can_user_see_address(self, user: RevelUser | AnonymousUser) -> bool:
+        """Check if the user can see the event address based on address_visibility.
+
+        Uses the same visibility rules as ResourceVisibility:
+        - PUBLIC: Everyone can see
+        - PRIVATE: Invited users, ticket holders, or RSVPs
+        - MEMBERS_ONLY: Organization members
+        - STAFF_ONLY: Organization staff/owners
+        - ATTENDEES_ONLY: Only ticket holders or RSVPs (not just invited)
+
+        Results are cached on the instance to avoid repeated queries when called
+        multiple times (e.g., from schema resolution). Cache resets when instance
+        is re-fetched from DB.
+
+        Args:
+            user: The user to check access for.
+
+        Returns:
+            True if the user can see the address, False otherwise.
+        """
+        # Instance-level cache keyed by user id
+        cache_key = getattr(user, "id", None)
+        if not hasattr(self, "_address_visibility_cache"):
+            self._address_visibility_cache: dict[t.Any, bool] = {}
+        if cache_key in self._address_visibility_cache:
+            return self._address_visibility_cache[cache_key]
+
+        result = self._compute_can_user_see_address(user)
+        self._address_visibility_cache[cache_key] = result
+        return result
+
+    def _compute_can_user_see_address(self, user: RevelUser | AnonymousUser) -> bool:
+        """Compute address visibility without caching."""
+        from .invitation import EventInvitation
+        from .rsvp import EventRSVP
+        from .ticket import Ticket
+
+        address_visibility = self.visibility_flags.address_visibility
+
+        # Staff/superusers always see everything
+        if user.is_superuser or user.is_staff:
+            return True
+
+        # PUBLIC / UNLISTED is visible to everyone
+        if address_visibility in ResourceVisibility.publicly_accessible():
+            return True
+
+        # Anonymous users can only see PUBLIC / UNLISTED addresses
+        if user.is_anonymous:
+            return False
+
+        # Check organization roles
+        is_owner = self.organization.owner_id == user.id
+        # Use .all() to leverage prefetched data when available (from with_organization())
+        # instead of .filter().exists() which always creates a new query
+        is_staff_member = any(m.id == user.id for m in self.organization.staff_members.all())
+
+        # STAFF_ONLY: Only staff/owners
+        if address_visibility == ResourceVisibility.STAFF_ONLY:
+            return is_owner or is_staff_member
+
+        # Staff and owners can see everything
+        if is_owner or is_staff_member:
+            return True
+
+        # Check if user is an organization member
+        is_org_member = (
+            OrganizationMember.objects.for_visibility().filter(user=user, organization=self.organization).exists()
+        )
+
+        # MEMBERS_ONLY: Organization members
+        if address_visibility == ResourceVisibility.MEMBERS_ONLY:
+            return is_org_member
+
+        # Check event relationships
+        has_ticket = Ticket.objects.filter(user=user, event=self).exclude(status=Ticket.TicketStatus.CANCELLED).exists()
+        has_rsvp = EventRSVP.objects.filter(user=user, event=self, status=EventRSVP.RsvpStatus.YES).exists()
+        has_invitation = EventInvitation.objects.filter(user=user, event=self).exists()
+
+        # ATTENDEES_ONLY: Only ticket holders or RSVPs (not just invited)
+        if address_visibility == ResourceVisibility.ATTENDEES_ONLY:
+            return has_ticket or has_rsvp
+
+        # PRIVATE: Invited users, ticket holders, or RSVPs
+        if address_visibility == ResourceVisibility.PRIVATE:
+            return has_ticket or has_rsvp or has_invitation
+
+        return False
+
+    def can_user_see_cancellation_reason(self, user: RevelUser | AnonymousUser) -> bool:
+        """Whether the user may see this event's cancellation reason.
+
+        The reason is addressed to people who were actually going to attend, so
+        it is limited to ticket holders and confirmed RSVPs — plus the event's
+        own staff/owners and superusers. This mirrors the ATTENDEES_ONLY tier of
+        :meth:`can_user_see_address`; a merely-invited or anonymous user does not
+        qualify.
+
+        Args:
+            user: The user to check access for.
+
+        Returns:
+            True if the user may see the cancellation reason, False otherwise.
+        """
+        from .rsvp import EventRSVP
+        from .ticket import Ticket
+
+        if user.is_superuser or user.is_staff:
+            return True
+        if user.is_anonymous:
+            return False
+        if self.organization.owner_id == user.id:
+            return True
+        # Use .all() to leverage prefetched data when available (from with_organization()).
+        if any(m.id == user.id for m in self.organization.staff_members.all()):
+            return True
+
+        has_ticket = Ticket.objects.filter(user=user, event=self).exclude(status=Ticket.TicketStatus.CANCELLED).exists()
+        has_rsvp = EventRSVP.objects.filter(user=user, event=self, status=EventRSVP.RsvpStatus.YES).exists()
+        return has_ticket or has_rsvp
+
+    def attendees(self, viewer: RevelUser) -> models.QuerySet[RevelUser]:
+        """Return attendees based on who wants to see them.
+
+        The event-level ``show_attendee_list`` toggle is ANDed with the per-user
+        ``AttendeeVisibilityFlag`` matrix (itself derived from each attendee's
+        ``show_me_on_attendee_list`` preference): turning the event toggle off
+        hides everyone from non-privileged viewers, turning it on reveals nobody
+        who has not opted in.
+        """
+        from .rsvp import EventRSVP
+        from .ticket import Ticket
+
+        # Use .all() to leverage prefetched data when available (from with_organization())
+        is_staff_member = any(m.id == viewer.id for m in self.organization.staff_members.all())
+        if viewer.is_superuser or viewer.is_staff or self.organization.owner_id == viewer.id or is_staff_member:
+            return RevelUser.objects.filter(
+                Q(tickets__event=self, tickets__status=Ticket.TicketStatus.ACTIVE)
+                | Q(rsvps__event=self, rsvps__status=EventRSVP.RsvpStatus.YES)
+            ).distinct()
+        if not self.can_user_see_attendee_list(viewer):
+            return RevelUser.objects.none()
+        return RevelUser.objects.filter(
+            id__in=AttendeeVisibilityFlag.objects.filter(event=self, user=viewer, is_visible=True).values_list(
+                "target_id", flat=True
+            )
+        )
+
+    def clean(self) -> None:
+        """Enforce same ownership of organization and validate time windows."""
+        super().clean()
+        if self.event_series and self.event_series.organization_id != self.organization_id:
+            raise DjangoValidationError(
+                {
+                    "event_series": _("Event series must belong to the same organization as the event."),
+                }
+            )
+        if self.end and self.end < self.start:
+            raise DjangoValidationError({"end": _("End date must be after start date.")})
+
+        # Validate check-in window
+        if self.check_in_starts_at and self.check_in_ends_at:
+            if self.check_in_ends_at <= self.check_in_starts_at:
+                raise DjangoValidationError(
+                    {"check_in_ends_at": _("Check-in end time must be after check-in start time.")}
+                )
+
+        # Validate venue belongs to the same organization
+        venue = self.venue
+        if venue and venue.organization_id != self.organization_id:
+            raise DjangoValidationError({"venue": _("Venue must belong to the same organization as the event.")})
+
+        # Validate the display-only schedule blob (also guards the admin raw-JSON widget).
+        try:
+            validate_schedule(self.schedule)
+        except PydanticValidationError as exc:
+            raise DjangoValidationError({"schedule": str(exc)}) from exc
+
+        # Validate the visibility toggles (also guards the admin raw-JSON widget).
+        try:
+            validate_visibility_settings(self.visibility_settings)
+        except PydanticValidationError as exc:
+            raise DjangoValidationError({"visibility_settings": str(exc)}) from exc
+
+        self._clean_waitlist_config()
+
+    def _clean_waitlist_config(self) -> None:
+        if self.waitlist_time_window is not None:
+            if self.waitlist_time_window < timedelta(hours=1):
+                raise DjangoValidationError({"waitlist_time_window": _("Time window must be at least 1 hour.")})
+            if self.waitlist_time_window > timedelta(days=7):
+                raise DjangoValidationError({"waitlist_time_window": _("Time window cannot exceed 7 days.")})
+
+        if self.waitlist_cutoff_date is None:
+            return
+        if self.waitlist_time_window is None:
+            raise DjangoValidationError(
+                {"waitlist_cutoff_date": _("Cutoff date requires waitlist_time_window to be set.")}
+            )
+        if self.start and self.waitlist_cutoff_date >= self.start:
+            raise DjangoValidationError({"waitlist_cutoff_date": _("Cutoff date must be before event start.")})
+
+    def ics(self) -> bytes:
+        """Generates an iCalendar (.ics) file for this event.
+
+        Returns:
+            The .ics file content as bytes.
+        """
+        from ics import Calendar
+        from ics import Event as ICSEvent
+
+        c = Calendar()
+        e = ICSEvent()
+
+        e.name = self.name
+        e.begin = self.start
+        e.end = self.end
+        e.location = self.address or (self.city.name if self.city else "See event details")
+        # e.description = ticket.event.description or f"Your ticket for {ticket.event.name}."
+        e.uid = f"{self.id}@letsrevel.io"  # Unique ID for the calendar event
+
+        c.events.add(e)
+
+        # The ics library returns a string, so we encode it to bytes
+        return t.cast(bytes, c.serialize().encode("utf-8"))
+
+
+class EventWaitList(TimeStampedModel):
+    event = models.ForeignKey(Event, on_delete=models.CASCADE)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["event", "user"], name="unique_event_waitlist")]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return f"{self.user_id} on waitlist for {self.event_id}"
+
+
+class WaitlistOffer(TimeStampedModel):
+    """Temporary offer granting a user the right to claim a reserved spot.
+
+    Pending unexpired offers count toward the event's capacity in both the
+    AvailabilityGate (prefetched) and EventManager._assert_capacity (row-locked).
+    See docs/superpowers/specs/2026-05-19-advanced-waitlist-design.md.
+    """
+
+    class WaitlistOfferStatus(models.TextChoices):
+        PENDING = "pending", "Pending"
+        CLAIMED = "claimed", "Claimed"
+        EXPIRED = "expired", "Expired"
+        REVOKED = "revoked", "Revoked"
+
+    event = models.ForeignKey(Event, on_delete=models.CASCADE, related_name="waitlist_offers")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="waitlist_offers")
+    status = models.CharField(
+        max_length=10,
+        choices=WaitlistOfferStatus.choices,
+        default=WaitlistOfferStatus.PENDING,
+        db_index=True,
+    )
+    expires_at = models.DateTimeField(db_index=True)
+    batch_id = models.UUIDField(db_index=True)
+    notified_at = models.DateTimeField(null=True, blank=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    is_cutoff_batch = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["event", "user"],
+                condition=models.Q(status="pending"),
+                name="unique_pending_waitlist_offer",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["event", "status", "expires_at"]),
+            models.Index(fields=["batch_id"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f"WaitlistOffer({self.user_id}, {self.event_id}, {self.status})"
+
+
+class AttendeeVisibilityFlag(TimeStampedModel):
+    user = models.ForeignKey(RevelUser, on_delete=models.CASCADE, related_name="visible_attendees")
+    event = models.ForeignKey(Event, on_delete=models.CASCADE)
+    target = models.ForeignKey(RevelUser, on_delete=models.CASCADE, related_name="visible_to")
+
+    is_visible = models.BooleanField(default=False)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "event", "target"],
+                name="unique_attendee_visibility_constraint",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["user", "event"]),
+            models.Index(fields=["event", "target"]),
+        ]
+
+    def __str__(self) -> str:
+        visibility = "visible" if self.is_visible else "hidden"
+        return f"{self.target_id} {visibility} to {self.user_id}"

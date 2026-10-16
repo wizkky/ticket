@@ -1,0 +1,205 @@
+"""Signal handlers for rsvp notifications."""
+
+import typing as t
+
+import structlog
+from django.db import transaction
+from django.db.models.signals import post_delete, post_save, pre_save
+from django.dispatch import receiver
+
+from events.models import Event, EventRSVP
+from events.tasks import build_attendee_visibility_flags
+from notifications.enums import NotificationType
+from notifications.service.eligibility import get_organization_staff_and_owners
+from notifications.service.notification_helpers import format_event_datetime, notify_org_staff
+
+logger = structlog.get_logger(__name__)
+
+
+def _build_rsvp_context(rsvp: EventRSVP) -> dict[str, t.Any]:
+    """Build notification context for RSVP."""
+    from common.models import SiteSettings
+
+    event = rsvp.event
+    frontend_base_url = SiteSettings.get_solo().frontend_base_url
+
+    event_start_formatted = format_event_datetime(event.start, event)
+    event_location = event.full_address()
+
+    context = {
+        "rsvp_id": str(rsvp.id),
+        "event_id": str(event.id),
+        "event_name": event.name,
+        "event_start": event.start.isoformat() if event.start else "",
+        "event_start_formatted": event_start_formatted,
+        "event_location": event_location,
+        "event_url": f"{frontend_base_url}/events/{event.id}",
+        "response": rsvp.status,
+        "user_name": rsvp.user.get_display_name(),
+        "user_email": rsvp.user.email,
+    }
+
+    # Add optional fields if available in the model
+    if hasattr(rsvp, "guest_count"):
+        context["guest_count"] = rsvp.guest_count
+    if hasattr(rsvp, "dietary_restrictions") and rsvp.dietary_restrictions:
+        context["dietary_restrictions"] = rsvp.dietary_restrictions
+    if rsvp.note:
+        context["rsvp_note"] = rsvp.note
+
+    return context
+
+
+def _notify_staff_about_rsvp(rsvp: EventRSVP, notification_type: NotificationType, context: dict[str, t.Any]) -> None:
+    """Notify staff/owners about RSVP event.
+
+    Excludes the RSVP user from notifications if they are staff/owner,
+    since they already know about their own action.
+    """
+    organization_id = rsvp.event.organization_id
+    notify_org_staff(
+        organization_id=organization_id,
+        notification_type=notification_type,
+        context=context,
+        sender=EventRSVP,
+        # Don't notify user about their own RSVP action
+        recipients=list(get_organization_staff_and_owners(organization_id).exclude(id=rsvp.user_id)),
+    )
+
+
+def _send_rsvp_confirmation_notifications(rsvp: EventRSVP) -> None:
+    """Send notifications when RSVP is created."""
+    context = _build_rsvp_context(rsvp)
+    _notify_staff_about_rsvp(rsvp, NotificationType.RSVP_CONFIRMATION, context)
+
+
+def _send_rsvp_updated_notifications(rsvp: EventRSVP) -> None:
+    """Send notifications when RSVP is updated."""
+    from common.models import SiteSettings
+
+    # EventRSVP.status is nullable, so a captured _old_status of None is still a real
+    # change — only the *absence* of the attribute means the status didn't change.
+    status_changed = hasattr(rsvp, "_old_status")
+    note_changed = hasattr(rsvp, "_old_note")
+    if not status_changed and not note_changed:
+        return  # Nothing observable changed
+    old_status = getattr(rsvp, "_old_status", rsvp.status)  # Note-only change: old == new response
+
+    event = rsvp.event
+    frontend_base_url = SiteSettings.get_solo().frontend_base_url
+
+    event_start_formatted = format_event_datetime(event.start, event)
+    event_location = event.full_address()
+
+    context = {
+        "rsvp_id": str(rsvp.id),
+        "event_id": str(event.id),
+        "event_name": event.name,
+        "event_start_formatted": event_start_formatted,
+        "event_location": event_location,
+        "event_url": f"{frontend_base_url}/events/{event.id}",
+        "old_response": old_status,
+        "new_response": rsvp.status,
+        "user_name": rsvp.user.get_display_name(),
+        "user_email": rsvp.user.email,
+    }
+    if rsvp.note:
+        context["rsvp_note"] = rsvp.note
+
+    # Add optional fields if available
+    if hasattr(rsvp, "guest_count"):
+        context["guest_count"] = rsvp.guest_count
+
+    _notify_staff_about_rsvp(rsvp, NotificationType.RSVP_UPDATED, context)
+
+
+@receiver(pre_save, sender=EventRSVP)
+def capture_rsvp_old_status(sender: type[EventRSVP], instance: EventRSVP, **kwargs: t.Any) -> None:
+    """Capture old status/note before save for change detection in post_save."""
+    if not instance.pk:
+        return
+    try:
+        old_instance = EventRSVP.objects.get(pk=instance.pk)
+    except EventRSVP.DoesNotExist:
+        logger.debug("rsvp_not_found_for_old_status", pk=instance.pk)
+        return
+    if old_instance.status != instance.status:
+        instance._old_status = old_instance.status  # type: ignore[attr-defined]
+    if old_instance.note != instance.note:
+        instance._old_note = old_instance.note  # type: ignore[attr-defined]
+
+
+@receiver(post_save, sender=EventRSVP)
+def handle_event_rsvp_save(sender: type[EventRSVP], instance: EventRSVP, created: bool, **kwargs: t.Any) -> None:
+    """Send notifications after RSVP is changed or created.
+
+    Sends notifications to:
+    - Organization staff and owners (NOT the user who RSVPed)
+    """
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(str(instance.event_id)))
+
+    def send_notifications() -> None:
+        if created:
+            _send_rsvp_confirmation_notifications(instance)
+        else:
+            _send_rsvp_updated_notifications(instance)
+        # Clear the pre_save change markers after dispatch: a later save of this
+        # same in-memory instance registers its own on_commit callback, which
+        # would otherwise re-read the stale markers and emit a duplicate.
+        # (Clearing must happen here, not in pre_save — callbacks only run at
+        # commit, so clearing earlier would drop the legitimate notification.)
+        for attr in ("_old_status", "_old_note"):
+            if hasattr(instance, attr):
+                delattr(instance, attr)
+
+    transaction.on_commit(send_notifications)
+
+
+@receiver(post_delete, sender=EventRSVP)
+def handle_event_rsvp_delete(sender: type[EventRSVP], instance: EventRSVP, **kwargs: t.Any) -> None:
+    """Send notifications after RSVP is deleted.
+
+    Sends notifications to:
+    - Organization staff and owners (the user already knows they cancelled)
+    """
+    transaction.on_commit(lambda: build_attendee_visibility_flags.delay(str(instance.event_id)))
+
+    # Send notifications after transaction commits
+    def send_notifications() -> None:
+        from common.models import SiteSettings
+
+        event = Event.objects.filter(pk=instance.event_id).first()
+        if event is None:
+            # RSVP cascaded away by event.delete(): nobody to tell about a cancellation (#937)
+            return
+        user = instance.user
+        frontend_base_url = SiteSettings.get_solo().frontend_base_url
+
+        event_start_formatted = format_event_datetime(event.start, event)
+        event_location = event.full_address()
+
+        notification_type = NotificationType.RSVP_CANCELLED
+        context = {
+            "event_id": str(event.id),
+            "event_name": event.name,
+            "event_start_formatted": event_start_formatted,
+            "event_location": event_location,
+            "event_url": f"{frontend_base_url}/events/{event.id}",
+            "user_name": user.display_name,
+        }
+
+        # Add optional cancellation_reason if available
+        if hasattr(instance, "cancellation_reason") and instance.cancellation_reason:
+            context["cancellation_reason"] = instance.cancellation_reason
+
+        # Notify organization staff and owners only (user already knows they cancelled)
+        notify_org_staff(
+            organization_id=event.organization_id,
+            notification_type=notification_type,
+            context=context,
+            sender=sender,
+            # Don't notify user about their own RSVP cancellation
+            recipients=list(get_organization_staff_and_owners(event.organization_id).exclude(id=user.id)),
+        )
+
+    transaction.on_commit(send_notifications)

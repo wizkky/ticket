@@ -1,0 +1,471 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import * as m from '$lib/paraglide/messages.js';
+	import {
+		Dialog,
+		DialogContent,
+		DialogHeader,
+		DialogTitle,
+		DialogDescription,
+		DialogFooter
+	} from '$lib/components/ui/dialog';
+	import { Button } from '$lib/components/ui/button';
+	import { Input } from '$lib/components/ui/input';
+	import { Label } from '$lib/components/ui/label';
+	import { Textarea } from '$lib/components/ui/textarea';
+	import { RadioGroup, RadioGroupItem } from '$lib/components/ui/radio-group';
+	import { Alert, AlertDescription } from '$lib/components/ui/alert';
+	import { UserPlus, CheckCircle2, AlertCircle } from '@lucide/svelte';
+	import { z } from 'zod';
+	import { guestRsvpSchema, type GuestRsvpData } from '$lib/schemas/guestAttendance';
+	import { eventpublicguestGuestRsvp } from '$lib/api';
+	import { handleGuestAttendanceError } from '$lib/utils/guestAttendance';
+	import { isGuestActionError } from '$lib/utils/api-error-detail';
+	import { authStore } from '$lib/stores/auth.svelte';
+
+	interface Props {
+		open: boolean;
+		eventId: string;
+		/** Invitation-link token id when the page was loaded with `?et=` — sent
+		 * as `X-Event-Token` so the backend claims the link for the guest before
+		 * eligibility checks run (backend #923). */
+		eventToken?: string | null;
+		/** Whether the event accepts an optional note with RSVPs. */
+		acceptsNotes?: boolean;
+		onClose: () => void;
+		onSuccess?: () => void;
+	}
+
+	let {
+		open = $bindable(),
+		eventId,
+		eventToken = null,
+		acceptsNotes = false,
+		onClose,
+		onSuccess
+	}: Props = $props();
+
+	// Form state
+	let formData = $state<GuestRsvpData>({
+		email: '',
+		first_name: '',
+		last_name: '',
+		answer: 'yes'
+	});
+
+	// Optional note for the organizers (only when the event accepts notes)
+	let note = $state('');
+
+	// UI state
+	let isSubmitting = $state(false);
+	let showSuccess = $state(false);
+	let errorMessage = $state<string | null>(null);
+	let requiresAccount = $state(false);
+
+	// Next steps that guests can perform without an account
+	const GUEST_COMPATIBLE_STEPS = new Set([
+		'purchase_ticket',
+		'rsvp',
+		'wait_for_event_to_open',
+		'wait_for_open_spot'
+	]);
+
+	// Validation errors (field-specific)
+	let fieldErrors = $state<Partial<Record<keyof GuestRsvpData, string>>>({});
+
+	// Close dialog if user becomes authenticated (e.g. token refresh after page load)
+	$effect(() => {
+		if (open && authStore.isAuthenticated) {
+			open = false;
+			onClose();
+		}
+	});
+
+	// Reset state when dialog opens/closes
+	$effect(() => {
+		if (!open) {
+			formData = {
+				email: '',
+				first_name: '',
+				last_name: '',
+				answer: 'yes'
+			};
+			note = '';
+			fieldErrors = {};
+			errorMessage = null;
+			showSuccess = false;
+			requiresAccount = false;
+		}
+	});
+
+	// Validate individual field
+	function validateField(field: keyof GuestRsvpData) {
+		try {
+			const fieldSchema = guestRsvpSchema.shape[field];
+			fieldSchema.parse(formData[field]);
+			fieldErrors[field] = '';
+		} catch (error) {
+			if (error instanceof z.ZodError && error.issues.length > 0) {
+				fieldErrors[field] = error.issues[0].message;
+			}
+		}
+	}
+
+	// Handle input blur for validation
+	function handleBlur(field: keyof GuestRsvpData) {
+		validateField(field);
+	}
+
+	// Validate entire form
+	function validateForm(): boolean {
+		fieldErrors = {};
+		errorMessage = null;
+
+		try {
+			guestRsvpSchema.parse(formData);
+			return true;
+		} catch (error) {
+			if (error instanceof z.ZodError) {
+				error.issues.forEach((err) => {
+					const field = err.path[0] as keyof GuestRsvpData;
+					if (!fieldErrors[field]) {
+						fieldErrors[field] = err.message;
+					}
+				});
+			}
+			return false;
+		}
+	}
+
+	async function handleSubmit(e: SubmitEvent) {
+		e.preventDefault();
+		if (!validateForm()) return;
+
+		isSubmitting = true;
+		errorMessage = null;
+		// A fresh attempt (possibly with a corrected email) must not inherit the
+		// previous refusal's account affordance — only this response decides it.
+		requiresAccount = false;
+
+		try {
+			const response = await eventpublicguestGuestRsvp({
+				path: { event_id: eventId, answer: formData.answer },
+				...(eventToken ? { headers: { 'X-Event-Token': eventToken } } : {}),
+				body: {
+					email: formData.email,
+					first_name: formData.first_name,
+					last_name: formData.last_name,
+					...(acceptsNotes && note.trim() ? { note: note.trim() } : {})
+				}
+			});
+
+			// Check for API error (400, 422, etc.) - client doesn't throw on HTTP errors
+			if (response.error) {
+				// The runtime error payload can carry eligibility fields (next_step, reason)
+				// that are not part of the declared ResponseMessage type, so narrow from unknown.
+				const err: unknown = response.error;
+
+				// Machine-readable code first (backend #952, issue #912): the email
+				// already belongs to a non-guest account. Keyed on `code`, never the
+				// translated detail — the legacy text-matching in getLocalizedError
+				// only ever worked when the backend answered in English. An unknown
+				// code falls through and degrades to the verbatim detail below.
+				if (isGuestActionError(err) && err.code === 'guest_account_exists') {
+					requiresAccount = true;
+					errorMessage = m['guest_attendance.account_exists']();
+					return;
+				}
+				const nextStep =
+					typeof err === 'object' && err !== null && 'next_step' in err ? err.next_step : undefined;
+				const detail =
+					typeof err === 'object' && err !== null && 'detail' in err ? err.detail : undefined;
+				const reason =
+					typeof err === 'object' && err !== null && 'reason' in err ? err.reason : undefined;
+
+				// Check for eligibility response with next_step
+				if (typeof nextStep === 'string' && !GUEST_COMPATIBLE_STEPS.has(nextStep)) {
+					requiresAccount = true;
+				}
+
+				const errorDetail =
+					(typeof detail === 'string' && detail) ||
+					(typeof reason === 'string' && reason) ||
+					m['guestRsvpDialog.failedToSubmit']();
+				throw new Error(
+					typeof errorDetail === 'string' ? errorDetail : m['guestRsvpDialog.failedToSubmit']()
+				);
+			}
+
+			// Success - show confirmation message
+			showSuccess = true;
+			onSuccess?.();
+		} catch (error) {
+			errorMessage = handleGuestAttendanceError(error);
+		} finally {
+			isSubmitting = false;
+		}
+	}
+
+	function handleKeydown(e: KeyboardEvent) {
+		if (e.key === 'Enter' && !isSubmitting && !showSuccess) {
+			e.preventDefault();
+			// Create a synthetic submit event
+			const form = (e.target as HTMLElement).closest('form');
+			if (form) {
+				form.requestSubmit();
+			}
+		}
+	}
+
+	// Get RSVP answer display text
+	function getRsvpAnswerText(answer: 'yes' | 'no' | 'maybe'): string {
+		switch (answer) {
+			case 'yes':
+				return m['guest_attendance.rsvp_yes']();
+			case 'no':
+				return m['guest_attendance.rsvp_no']();
+			case 'maybe':
+				return m['guest_attendance.rsvp_maybe']();
+		}
+	}
+
+	// Split the translated "Already have an account? <a>Log in</a>" string around
+	// its <a> markers so we can render a real anchor instead of {@html}-injecting
+	// translator-editable content (latent XSS channel). Mirrors GuestTicketFooter.
+	const orLoginParts = $derived.by(() => {
+		const message = m['guest_attendance.or_login']();
+		const match = message.match(/^(.*)<a>(.*)<\/a>(.*)$/s);
+		if (!match) return { before: message, link: '', after: '' };
+		return { before: match[1], link: match[2], after: match[3] };
+	});
+
+	// The login/register server actions read `returnUrl` (`safeReturnUrl`) —
+	// the old `redirect` param was silently ignored and stranded the guest on
+	// the dashboard after signing in (issue #912). The entered email prefills
+	// the sign-in form (the account that refused the RSVP belongs to it).
+	const returnUrlSuffix = $derived(`?returnUrl=${encodeURIComponent(window.location.pathname)}`);
+	const loginHref = $derived.by(() => {
+		const email = formData.email.trim();
+		const emailSuffix = email ? `&email=${encodeURIComponent(email)}` : '';
+		return `${resolve('/(public)/login', {})}${returnUrlSuffix}${emailSuffix}`;
+	});
+</script>
+
+<Dialog bind:open>
+	<DialogContent class="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+		<DialogHeader>
+			<DialogTitle class="flex items-center gap-2 text-xl">
+				<UserPlus class="h-5 w-5 text-primary" aria-hidden="true" />
+				{m['guest_attendance.rsvp_title']()}
+			</DialogTitle>
+			<DialogDescription>
+				{m['guest_attendance.rsvp_description']()}
+			</DialogDescription>
+		</DialogHeader>
+
+		{#if showSuccess}
+			<!-- Success State -->
+			<div class="space-y-4 py-6">
+				<div class="flex flex-col items-center justify-center space-y-3 text-center">
+					<div class="rounded-full bg-primary/10 p-3">
+						<CheckCircle2 class="h-8 w-8 text-primary" aria-hidden="true" />
+					</div>
+					<div class="space-y-1">
+						<h3 class="text-lg font-semibold">{m['guest_attendance.rsvp_email_sent_title']()}</h3>
+						<p class="text-sm text-muted-foreground">
+							{m['guest_attendance.rsvp_email_sent_body']({ email: formData.email })}
+						</p>
+					</div>
+				</div>
+			</div>
+
+			<DialogFooter>
+				<Button onclick={onClose} class="w-full">
+					{m['guest_attendance.common_close']()}
+				</Button>
+			</DialogFooter>
+		{:else}
+			<!-- Form State -->
+			<form onsubmit={handleSubmit}>
+				<div class="space-y-4 py-2">
+					<!-- Email Field -->
+					<div class="space-y-2">
+						<Label for="guest-email">{m['guest_attendance.email_label']()}</Label>
+						<Input
+							id="guest-email"
+							type="email"
+							bind:value={formData.email}
+							onkeydown={handleKeydown}
+							onblur={() => handleBlur('email')}
+							placeholder={m['guest_attendance.email_placeholder']()}
+							disabled={isSubmitting}
+							aria-invalid={fieldErrors.email ? 'true' : 'false'}
+							aria-describedby={fieldErrors.email ? 'email-error email-hint' : 'email-hint'}
+							autocomplete="email"
+							required
+						/>
+						<p id="email-hint" class="text-xs text-muted-foreground">
+							{m['guest_attendance.email_hint']()}
+						</p>
+						{#if fieldErrors.email}
+							<p id="email-error" class="text-sm text-destructive" role="alert">
+								{fieldErrors.email}
+							</p>
+						{/if}
+					</div>
+
+					<!-- First Name and Last Name (side by side on larger screens) -->
+					<div class="grid gap-4 sm:grid-cols-2">
+						<div class="space-y-2">
+							<Label for="guest-first-name">{m['guest_attendance.first_name_label']()}</Label>
+							<Input
+								id="guest-first-name"
+								type="text"
+								bind:value={formData.first_name}
+								onkeydown={handleKeydown}
+								onblur={() => handleBlur('first_name')}
+								placeholder={m['guest_attendance.first_name_placeholder']()}
+								disabled={isSubmitting}
+								aria-invalid={fieldErrors.first_name ? 'true' : 'false'}
+								aria-describedby={fieldErrors.first_name ? 'first-name-error' : undefined}
+								autocomplete="given-name"
+								required
+							/>
+							{#if fieldErrors.first_name}
+								<p id="first-name-error" class="text-sm text-destructive" role="alert">
+									{fieldErrors.first_name}
+								</p>
+							{/if}
+						</div>
+
+						<div class="space-y-2">
+							<Label for="guest-last-name">{m['guest_attendance.last_name_label']()}</Label>
+							<Input
+								id="guest-last-name"
+								type="text"
+								bind:value={formData.last_name}
+								onkeydown={handleKeydown}
+								onblur={() => handleBlur('last_name')}
+								placeholder={m['guest_attendance.last_name_placeholder']()}
+								disabled={isSubmitting}
+								aria-invalid={fieldErrors.last_name ? 'true' : 'false'}
+								aria-describedby={fieldErrors.last_name ? 'last-name-error' : undefined}
+								autocomplete="family-name"
+								required
+							/>
+							{#if fieldErrors.last_name}
+								<p id="last-name-error" class="text-sm text-destructive" role="alert">
+									{fieldErrors.last_name}
+								</p>
+							{/if}
+						</div>
+					</div>
+
+					<!-- RSVP Answer -->
+					<div class="space-y-3">
+						<Label>{m['guest_attendance.rsvp_answer_label']()}</Label>
+						<RadioGroup bind:value={formData.answer} disabled={isSubmitting} class="space-y-2">
+							{#each ['yes', 'no', 'maybe'] as option (option)}
+								<div class="flex items-center space-x-2">
+									<RadioGroupItem value={option} id="rsvp-{option}" />
+									<Label
+										for="rsvp-{option}"
+										class="cursor-pointer text-base font-normal leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70"
+									>
+										{getRsvpAnswerText(option as 'yes' | 'no' | 'maybe')}
+									</Label>
+								</div>
+							{/each}
+						</RadioGroup>
+						{#if fieldErrors.answer}
+							<p class="text-sm text-destructive" role="alert">
+								{fieldErrors.answer}
+							</p>
+						{/if}
+					</div>
+
+					<!-- Optional note for the organizers -->
+					{#if acceptsNotes}
+						<div class="space-y-2">
+							<Label for="guest-rsvp-note">{m['rsvpNoteDialog.noteLabel']()}</Label>
+							<Textarea
+								id="guest-rsvp-note"
+								bind:value={note}
+								maxlength={500}
+								rows={3}
+								disabled={isSubmitting}
+								placeholder={m['rsvpNoteDialog.notePlaceholder']()}
+								aria-describedby="guest-rsvp-note-counter"
+							/>
+							<p
+								id="guest-rsvp-note-counter"
+								class="text-right text-xs text-muted-foreground"
+								aria-live="polite"
+							>
+								{m['rsvpNoteDialog.counter']({ count: note.length, max: 500 })}
+							</p>
+						</div>
+					{/if}
+
+					<!-- Error Message -->
+					{#if errorMessage}
+						<Alert variant="destructive">
+							<AlertCircle class="h-4 w-4" />
+							<AlertDescription>
+								{errorMessage}
+								{#if requiresAccount}
+									<p class="mt-2">
+										<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+										<a href={loginHref} class="font-medium underline hover:no-underline">
+											{m['guestRsvpDialog.logIn']()}
+										</a>
+										<!-- eslint-enable svelte/no-navigation-without-resolve -->
+										{m['guestRsvpDialog.or']()}
+										<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+										<a
+											href={`${resolve('/(public)/register', {})}${returnUrlSuffix}`}
+											class="font-medium underline hover:no-underline"
+										>
+											{m['guestRsvpDialog.createAnAccount']()}
+										</a>
+										<!-- eslint-enable svelte/no-navigation-without-resolve -->
+										{m['guestRsvpDialog.toContinue']()}
+									</p>
+								{/if}
+							</AlertDescription>
+						</Alert>
+					{/if}
+				</div>
+
+				<DialogFooter class="gap-2 pt-4 sm:gap-0">
+					<Button
+						type="button"
+						variant="outline"
+						onclick={onClose}
+						disabled={isSubmitting}
+						class="flex-1 sm:flex-initial"
+					>
+						{m['guest_attendance.common_cancel']()}
+					</Button>
+					<Button type="submit" disabled={isSubmitting} class="flex-1 sm:flex-initial">
+						{#if isSubmitting}
+							{m['guest_attendance.submitting']()}
+						{:else}
+							{m['guest_attendance.submit_rsvp']()}
+						{/if}
+					</Button>
+				</DialogFooter>
+
+				<!-- Subtle login link -->
+				<div class="border-t pt-3 text-center text-xs text-muted-foreground">
+					<p>
+						{orLoginParts.before}{#if orLoginParts.link}<a
+								href={resolve('/(public)/login', {})}
+								class="text-primary hover:underline">{orLoginParts.link}</a
+							>{/if}{orLoginParts.after}
+					</p>
+				</div>
+			</form>
+		{/if}
+	</DialogContent>
+</Dialog>

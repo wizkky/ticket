@@ -1,0 +1,613 @@
+"""Admin interface for accounts app.
+
+This module provides comprehensive admin interfaces for all accounts models
+including user management, authentication, and security features.
+"""
+
+import typing as t
+
+from django.contrib import admin, messages
+from django.contrib.auth.admin import UserAdmin
+from django.db.models import Count, Exists, IntegerField, OuterRef, QuerySet, Subquery
+from django.db.models.functions import Coalesce
+from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
+from django.shortcuts import get_object_or_404
+from django.template.response import TemplateResponse
+from django.urls import path, reverse
+from django.utils.html import format_html
+from django.utils.safestring import mark_safe
+from django.utils.translation import gettext_lazy as _
+from django.utils.translation import ngettext
+from django_google_sso.admin import GoogleSSOInlineAdmin, get_current_user_and_admin
+from unfold.admin import ModelAdmin, TabularInline
+
+from accounts.admin import formatters
+from accounts.admin.user_extras import (
+    ExternalIdentityInline,
+    GlobalBanInline,
+    IsOrganizationOwnerFilter,
+    ReferralCodeInline,
+)
+from accounts.models import (
+    DietaryRestriction,
+    EmailVerificationReminderTracking,
+    GlobalBan,
+    RevelUser,
+    UserBillingProfile,
+    UserDataExport,
+    UserDietaryPreference,
+)
+from accounts.service.account import request_password_reset, send_verification_email_for_user
+from accounts.service.impersonation import can_impersonate, create_impersonation_request
+from accounts.utils.email_normalization import normalize_email_for_matching
+from common.client_ip import get_client_ip
+from common.models import SiteSettings
+from events.models import GeneralUserPreferences
+
+# Monkey patch the missing attribute
+GoogleSSOInlineAdmin.ordering_field = "google_id"
+
+CurrentUserModel, last_admin, LastUserAdmin = get_current_user_and_admin()
+
+
+if admin.site.is_registered(CurrentUserModel):
+    admin.site.unregister(CurrentUserModel)
+
+
+class GeneralUserPreferencesInline(TabularInline):  # type: ignore[misc]
+    """Inline for user preferences."""
+
+    model = GeneralUserPreferences
+    extra = 0
+    can_delete = False
+    fields = ["city"]
+    autocomplete_fields = ["city"]
+
+
+class UserDataExportInline(TabularInline):  # type: ignore[misc]
+    """Inline for user data export."""
+
+    model = UserDataExport
+    extra = 0
+    can_delete = False
+    readonly_fields = ["status", "completed_at", "error_message", "file"]
+    fields = ["status", "completed_at", "file", "error_message"]
+
+
+class DietaryRestrictionInline(TabularInline):  # type: ignore[misc]
+    """Inline for user dietary restrictions."""
+
+    model = DietaryRestriction
+    extra = 0
+    autocomplete_fields = ["food_item"]
+    fields = ["food_item", "restriction_type", "notes", "is_public"]
+
+
+class UserDietaryPreferenceInline(TabularInline):  # type: ignore[misc]
+    """Inline for user dietary preferences."""
+
+    model = UserDietaryPreference
+    extra = 0
+    autocomplete_fields = ["preference"]
+    fields = ["preference", "comment", "is_public"]
+
+
+class EmailVerificationReminderTrackingInline(TabularInline):  # type: ignore[misc]
+    """Inline for email verification reminder tracking."""
+
+    model = EmailVerificationReminderTracking
+    extra = 0
+    can_delete = False
+    readonly_fields = ["last_reminder_sent_at", "final_warning_sent_at", "deactivation_email_sent_at"]
+    fields = ["last_reminder_sent_at", "final_warning_sent_at", "deactivation_email_sent_at"]
+
+
+class UserBillingProfileInline(TabularInline):  # type: ignore[misc]
+    """Inline for user billing profile."""
+
+    model = UserBillingProfile
+    extra = 0
+    can_delete = False
+    readonly_fields = [
+        "billing_name",
+        "vat_id",
+        "vat_country_code",
+        "vat_id_validated",
+        "vat_id_validated_at",
+        "vies_request_identifier",
+        "billing_address",
+        "billing_email",
+        "self_billing_agreed",
+    ]
+    fields = readonly_fields
+
+
+@admin.register(RevelUser)
+class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
+    """Enhanced admin for RevelUser with comprehensive user management."""
+
+    # List view configuration
+    list_display = [
+        "profile_thumbnail_display",
+        "display_name_display",
+        "email_link",
+        "pronouns",
+        "email_verified_display",
+        "totp_active_display",
+        "is_staff",
+        "is_active",
+        "guest",
+        "date_joined",
+        "event_count",
+        "organization_count",
+        "impersonate_link",
+    ]
+    list_display_links = ["profile_thumbnail_display", "display_name_display"]
+    list_filter = [
+        IsOrganizationOwnerFilter,
+        "is_staff",
+        "is_superuser",
+        "is_active",
+        "email_verified",
+        "totp_active",
+        "guest",
+        "language",
+        "date_joined",
+        "last_login",
+    ]
+    search_fields = ["username", "first_name", "last_name", "email", "preferred_name", "phone_number"]
+    ordering = ["-date_joined"]
+    date_hierarchy = "date_joined"
+
+    # Detail view configuration
+    readonly_fields = [
+        "id",
+        "date_joined",
+        "last_login",
+        "display_name_display",
+        "profile_image_preview_display",
+        "event_participation_display",
+        "organization_participation_display",
+        "stripe_account_id",
+        "stripe_account_email",
+        "stripe_charges_enabled",
+        "stripe_details_submitted",
+    ]
+
+    fieldsets = (
+        (
+            "Personal Information",
+            {
+                "fields": (
+                    "id",
+                    ("username", "email"),
+                    ("first_name", "last_name"),
+                    ("preferred_name", "pronouns"),
+                    "phone_number",
+                    "language",
+                    "bio",
+                )
+            },
+        ),
+        (
+            "Profile Picture",
+            {
+                "fields": (
+                    "profile_picture",
+                    "profile_image_preview_display",
+                ),
+            },
+        ),
+        (
+            "Authentication & Security",
+            {
+                "fields": (
+                    "password",
+                    ("email_verified", "totp_active"),
+                    ("date_joined", "last_login"),
+                    "guest",
+                )
+            },
+        ),
+        (
+            "Permissions",
+            {
+                "fields": (
+                    ("is_active", "is_staff", "is_superuser"),
+                    "groups",
+                    "user_permissions",
+                ),
+                "classes": ["collapse"],
+            },
+        ),
+        (
+            "Stripe Connect",
+            {
+                "fields": (
+                    "stripe_account_id",
+                    "stripe_account_email",
+                    ("stripe_charges_enabled", "stripe_details_submitted"),
+                ),
+                "classes": ["collapse"],
+            },
+        ),
+        (
+            "Participation Summary",
+            {
+                "fields": (
+                    "event_participation_display",
+                    "organization_participation_display",
+                ),
+                "classes": ["collapse"],
+            },
+        ),
+    )
+
+    # Inlines
+    inlines = [
+        GeneralUserPreferencesInline,
+        UserBillingProfileInline,
+        ReferralCodeInline,
+        GlobalBanInline,
+        ExternalIdentityInline,
+        DietaryRestrictionInline,
+        UserDietaryPreferenceInline,
+        UserDataExportInline,
+        EmailVerificationReminderTrackingInline,
+    ]
+
+    # Autocomplete
+    autocomplete_fields = ["groups"]
+
+    # Actions
+    actions = [
+        "send_verification_email",
+        "send_password_reset_email",
+        "ban_selected_users",
+        "clear_stripe_connect_account",
+    ]
+
+    @admin.action(description="Clear stale Stripe Connect account (superuser only)")
+    def clear_stripe_connect_account(self, request: HttpRequest, queryset: QuerySet[RevelUser]) -> None:
+        """Detach a stale Connect account so the referrer can re-onboard from scratch.
+
+        Nothing is deleted at Stripe — this only drops the local link. Account
+        status sync deliberately flags rather than clears the id (a misconfigured
+        platform key would otherwise wipe every live connection), so an account
+        that is genuinely gone at Stripe is unlinked here by a human.
+        """
+        if not request.user.is_superuser:
+            self.message_user(request, "Superuser required.", level=messages.ERROR)
+            return
+        cleared = 0
+        for target_user in queryset.exclude(stripe_account_id__isnull=True):
+            target_user.stripe_account_id = None
+            target_user.stripe_charges_enabled = False
+            target_user.stripe_details_submitted = False
+            target_user.save(
+                update_fields=target_user._stripe_update_fields(
+                    "stripe_account_id", "stripe_charges_enabled", "stripe_details_submitted"
+                )
+            )
+            cleared += 1
+        self.message_user(request, f"Cleared the Stripe Connect account of {cleared} user(s).")
+
+    @admin.action(description="Send verification email")
+    def send_verification_email(self, request: HttpRequest, queryset: QuerySet[RevelUser]) -> None:
+        """Send verification email to selected users."""
+        sent_count = 0
+        skipped_count = 0
+        for user in queryset:
+            if user.email_verified:
+                skipped_count += 1
+                continue
+            send_verification_email_for_user(user)
+            sent_count += 1
+
+        if sent_count:
+            self.message_user(
+                request,
+                ngettext(
+                    "Verification email sent to %d user.",
+                    "Verification emails sent to %d users.",
+                    sent_count,
+                )
+                % sent_count,
+                messages.SUCCESS,
+            )
+        if skipped_count:
+            self.message_user(
+                request,
+                ngettext(
+                    "Skipped %d user (already verified).",
+                    "Skipped %d users (already verified).",
+                    skipped_count,
+                )
+                % skipped_count,
+                messages.WARNING,
+            )
+
+    @admin.action(description="Send password reset email")
+    def send_password_reset_email(self, request: HttpRequest, queryset: QuerySet[RevelUser]) -> None:
+        """Send password reset email to selected users."""
+        sent_count = 0
+        skipped_count = 0
+        for user in queryset:
+            result = request_password_reset(user.email)
+            if result:
+                sent_count += 1
+            else:
+                skipped_count += 1
+
+        if sent_count:
+            self.message_user(
+                request,
+                ngettext(
+                    "Password reset email sent to %d user.",
+                    "Password reset emails sent to %d users.",
+                    sent_count,
+                )
+                % sent_count,
+                messages.SUCCESS,
+            )
+        if skipped_count:
+            self.message_user(
+                request,
+                ngettext(
+                    "Skipped %d user (Google SSO or not found).",
+                    "Skipped %d users (Google SSO or not found).",
+                    skipped_count,
+                )
+                % skipped_count,
+                messages.WARNING,
+            )
+
+    @admin.action(description=_("Ban selected users (global ban by email)"))
+    def ban_selected_users(self, request: HttpRequest, queryset: QuerySet[RevelUser]) -> None:
+        """Create global email bans for selected users, deactivating them."""
+        banned_count = 0
+        skipped_count = 0
+        for target_user in queryset:
+            if target_user.is_superuser or target_user.is_staff:
+                skipped_count += 1
+                continue
+            _ban, created = GlobalBan.objects.get_or_create(
+                ban_type=GlobalBan.BanType.EMAIL,
+                normalized_value=normalize_email_for_matching(target_user.email),
+                defaults={
+                    "value": target_user.email,
+                    "reason": str(_("Violation of terms of service")),
+                    "created_by": t.cast(RevelUser, request.user),
+                    "user": target_user,
+                },
+            )
+            if created:
+                banned_count += 1
+            else:
+                skipped_count += 1
+
+        if banned_count:
+            self.message_user(
+                request,
+                ngettext(
+                    "Banned %d user.",
+                    "Banned %d users.",
+                    banned_count,
+                )
+                % banned_count,
+                messages.SUCCESS,
+            )
+        if skipped_count:
+            self.message_user(
+                request,
+                ngettext(
+                    "Skipped %d user (staff/superuser or already banned).",
+                    "Skipped %d users (staff/superuser or already banned).",
+                    skipped_count,
+                )
+                % skipped_count,
+                messages.WARNING,
+            )
+
+    # Custom displays (rendering logic lives in accounts/admin/formatters.py)
+    @admin.display(description="")
+    def profile_thumbnail_display(self, obj: RevelUser) -> str:
+        """Display profile picture thumbnail in list view."""
+        return formatters.profile_thumbnail(obj)
+
+    @admin.display(description="Profile Picture Preview")
+    def profile_image_preview_display(self, obj: RevelUser) -> str:
+        """Display profile picture preview in detail view."""
+        return formatters.profile_image_preview(obj)
+
+    @admin.display(description="Name", ordering="preferred_name")
+    def display_name_display(self, obj: RevelUser) -> str:
+        name = obj.get_display_name()
+        # Crown marks organization owners (see _is_owner annotation in get_queryset).
+        if getattr(obj, "_is_owner", False):
+            return f"👑 {name}"
+        return name
+
+    @admin.display(description="Email", ordering="email")
+    def email_link(self, obj: RevelUser) -> str:
+        return format_html('<a href="mailto:{}">{}</a>', obj.email, obj.email)
+
+    @admin.display(description="Email Verified", boolean=True)
+    def email_verified_display(self, obj: RevelUser) -> bool:
+        return obj.email_verified
+
+    @admin.display(description="2FA Active", boolean=True)
+    def totp_active_display(self, obj: RevelUser) -> bool:
+        return obj.totp_active
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[RevelUser]:
+        """Annotate event/organization counts to avoid per-row queries on the changelist."""
+        from events.models import EventRSVP, Organization, OrganizationMember, OrganizationStaff, Ticket
+
+        def sub(qs: QuerySet[t.Any]) -> Coalesce:
+            return Coalesce(Subquery(qs.values("c"), output_field=IntegerField()), 0)
+
+        ticket_events = (
+            Ticket.objects.filter(user=OuterRef("pk"))
+            .order_by()
+            .values("user")
+            .annotate(c=Count("event", distinct=True))
+        )
+        rsvp_events = (
+            EventRSVP.objects.filter(user=OuterRef("pk"))
+            .order_by()
+            .values("user")
+            .annotate(c=Count("event", distinct=True))
+        )
+        owned = Organization.objects.filter(owner=OuterRef("pk")).order_by().values("owner").annotate(c=Count("pk"))
+        member = (
+            OrganizationMember.objects.filter(user=OuterRef("pk")).order_by().values("user").annotate(c=Count("pk"))
+        )
+        staff = OrganizationStaff.objects.filter(user=OuterRef("pk")).order_by().values("user").annotate(c=Count("pk"))
+
+        qs: QuerySet[RevelUser] = super().get_queryset(request)
+        return t.cast(
+            QuerySet[RevelUser],
+            qs.annotate(
+                _event_count=sub(ticket_events) + sub(rsvp_events),
+                _organization_count=sub(owned) + sub(member) + sub(staff),
+                _is_owner=Exists(Organization.objects.filter(owner=OuterRef("pk"))),
+            ),
+        )
+
+    @admin.display(description="Events", ordering="_event_count")
+    def event_count(self, obj: RevelUser) -> int:
+        return int(getattr(obj, "_event_count", 0))
+
+    @admin.display(description="Organizations", ordering="_organization_count")
+    def organization_count(self, obj: RevelUser) -> int:
+        return int(getattr(obj, "_organization_count", 0))
+
+    @admin.display(description="Event Participation")
+    def event_participation_display(self, obj: RevelUser) -> str:
+        """Display user's event participation details."""
+        return formatters.event_participation(obj)
+
+    @admin.display(description="Organization Participation")
+    def organization_participation_display(self, obj: RevelUser) -> str:
+        """Display user's organization participation details."""
+        return formatters.organization_participation(obj)
+
+    def get_list_display(self, request: HttpRequest) -> list[str]:  # type: ignore[override]
+        list_display = list(super().get_list_display(request))
+        if not request.user.is_superuser and "impersonate_link" in list_display:
+            list_display.remove("impersonate_link")
+        return list_display  # type: ignore[return-value]
+
+    # Impersonation functionality
+    @admin.display(description=_("Impersonate"))
+    def impersonate_link(self, obj: RevelUser) -> str:
+        """Display impersonation link for eligible users."""
+        return formatters.impersonate_link(obj)
+
+    def get_urls(self) -> list[t.Any]:
+        """Add custom URLs for impersonation."""
+        urls = super().get_urls()
+        custom_urls = [
+            path(
+                "<uuid:user_id>/impersonate/",
+                self.admin_site.admin_view(self.impersonate_view),
+                name="accounts_reveluser_impersonate",
+            ),
+        ]
+        return custom_urls + urls
+
+    def impersonate_view(
+        self, request: HttpRequest, user_id: t.Any
+    ) -> HttpResponse | HttpResponseRedirect | TemplateResponse:
+        """Handle impersonation confirmation and token generation."""
+        target_user = get_object_or_404(RevelUser, pk=user_id)
+        admin_user = t.cast(RevelUser, request.user)
+
+        # Check permissions
+        allowed, error = can_impersonate(admin_user, target_user)
+
+        if request.method == "POST" and allowed:
+            # Get client info for audit
+            ip_address = get_client_ip(request) or None
+            user_agent = request.META.get("HTTP_USER_AGENT", "")
+
+            # Generate impersonation token
+            token, _log = create_impersonation_request(
+                admin=admin_user,
+                target=target_user,
+                ip_address=ip_address,
+                user_agent=user_agent,
+            )
+
+            # Redirect to frontend with token
+            site_settings = SiteSettings.get_solo()
+            frontend_url = f"{site_settings.frontend_base_url}/impersonate?token={token}"
+            return HttpResponseRedirect(frontend_url)
+
+        # GET: Show confirmation page
+        context = {
+            **self.admin_site.each_context(request),
+            "title": _("Impersonate User"),
+            "target_user": target_user,
+            "opts": self.model._meta,
+            "error": error if not allowed else None,
+        }
+        return TemplateResponse(request, "admin/accounts/impersonate_confirm.html", context)
+
+
+@admin.register(UserDataExport)
+class UserDataExportAdmin(ModelAdmin):  # type: ignore[misc]
+    """Admin for user data exports with GDPR compliance features."""
+
+    list_display = ["user_link", "status", "status_display", "completed_at", "file_size", "created_at"]
+    list_select_related = ["user"]
+    list_filter = ["status", "created_at", "completed_at"]
+    search_fields = ["user__username", "user__email"]
+    readonly_fields = [
+        "id",
+        "user",
+        "file",
+        "status",
+        "error_message",
+        "completed_at",
+        "created_at",
+        "updated_at",
+        "file_size",
+    ]
+    date_hierarchy = "created_at"
+    ordering = ["-created_at"]
+
+    def user_link(self, obj: UserDataExport) -> str:
+        url = reverse("admin:accounts_reveluser_change", args=[obj.user.id])
+        return format_html('<a href="{}">{}</a>', url, obj.user.username)
+
+    user_link.short_description = "User"  # type: ignore[attr-defined]
+    user_link.admin_order_field = "user__username"  # type: ignore[attr-defined]
+
+    @admin.display(description="Status")
+    def status_display(self, obj: UserDataExport) -> str:
+        colors = {
+            UserDataExport.UserDataExportStatus.PENDING: "orange",
+            UserDataExport.UserDataExportStatus.PROCESSING: "blue",
+            UserDataExport.UserDataExportStatus.READY: "green",
+            UserDataExport.UserDataExportStatus.FAILED: "red",
+        }
+        color = colors.get(obj.status, "gray")  # type: ignore[call-overload]
+        return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
+
+    def file_size(self, obj: UserDataExport) -> str:
+        if obj.file:
+            size = obj.file.size
+            if size < 1024:
+                return f"{size} B"
+            elif size < 1024 * 1024:
+                return f"{size // 1024} KB"
+            else:
+                return f"{size // (1024 * 1024)} MB"
+        return "-"
+
+    file_size.short_description = "File Size"  # type: ignore[attr-defined]
+
+    def has_add_permission(self, request: t.Any) -> bool:
+        return False

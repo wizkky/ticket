@@ -1,0 +1,38 @@
+from decouple import config
+
+INTERNAL_CATCHALL_EMAIL = config("INTERNAL_CATCHALL_EMAIL", default="internal@example.com")
+
+EMAIL_HOST = config("EMAIL_HOST", default="smtp.google.com")
+EMAIL_PORT = config("EMAIL_PORT", default=587, cast=int)
+EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="<EMAIL>")
+EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="<PASSWORD>")
+EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
+EMAIL_USE_TLS = config("EMAIL_USE_TLS", default=False, cast=bool)
+DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="Let's Revel <revel@letsrevel.io>")  # Project domain default
+
+# Billing-specific email addresses.
+# DEFAULT_BILLING_EMAIL is used as the "From" address for all invoice / payout emails.
+# DEFAULT_REPLY_TO_EMAIL is added as the "Reply-To" header on those same emails.
+# Both fall back to DEFAULT_FROM_EMAIL when not explicitly configured.
+DEFAULT_BILLING_EMAIL = config("DEFAULT_BILLING_EMAIL", default=DEFAULT_FROM_EMAIL)
+DEFAULT_REPLY_TO_EMAIL = config("DEFAULT_REPLY_TO_EMAIL", default=DEFAULT_FROM_EMAIL)
+
+# Domain for org-sent mail ("<Org> via Revel" <slug@ORG_EMAIL_DOMAIN>). Empty → falls back to
+# the apex domain of DEFAULT_FROM_EMAIL (see common.utils.org_email_domain).
+ORG_EMAIL_DOMAIN = config("ORG_EMAIL_DOMAIN", default="")
+# Reply-To on Revel's org-setup nudges (events.service.org_nudge_service) so replies reach a
+# human. Empty → no Reply-To. ORG_NUDGE_SIGNATURE signs the personal check-in nudge.
+ORG_NUDGE_REPLY_TO = config("ORG_NUDGE_REPLY_TO", default="")
+ORG_NUDGE_SIGNATURE = config("ORG_NUDGE_SIGNATURE", default="The Revel team")
+# Shared secret for the provider (Brevo) bounce/complaint webhook. Empty → endpoint disabled.
+EMAIL_WEBHOOK_SECRET = config("EMAIL_WEBHOOK_SECRET", default="")
+# Per-org, per-UTC-day budget of invitation emails to addresses without a Revel account (cold
+# mail; see events.service.invitation_service). 0 → unlimited. Not affected by DISABLE_THROTTLING.
+PENDING_INVITATION_DAILY_CAP = config("PENDING_INVITATION_DAILY_CAP", default=200, cast=int)
+
+EMAIL_DRY_RUN = config("EMAIL_DRY_RUN", default=False, cast=bool)
+
+if EMAIL_DRY_RUN:
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+else:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"

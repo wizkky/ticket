@@ -1,0 +1,586 @@
+"""Apple Wallet pass generator.
+
+This module generates .pkpass files for event tickets. A .pkpass file is
+a ZIP archive containing:
+- pass.json: The pass definition
+- manifest.json: SHA-1 hashes of all files
+- signature: PKCS#7 signature of the manifest
+- Images: icon, logo, etc.
+"""
+
+import io
+import json
+import typing as t
+import zipfile
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import structlog
+from django.conf import settings
+
+from events.compliance import TicketComplianceField
+from events.compliance.enforcement import ticket_fields
+from events.models import HeldSeriesPass, OrganizationMember, Ticket
+from events.utils import get_event_timezone, get_organization_timezone
+from wallet.apple.formatting import (
+    PassColors,
+    format_date_compact,
+    format_date_full,
+    format_date_year,
+    format_iso_date,
+    format_price,
+    get_theme_colors,
+)
+from wallet.apple.images import (
+    BACKGROUND_SIZES,
+    ICON_SIZES,
+    LOGO_SIZES,
+    generate_colored_icon,
+    generate_fallback_logo,
+    generate_gradient_background,
+    parse_rgb_color,
+    resize_image,
+    resolve_cover_art,
+    resolve_org_logo,
+)
+from wallet.apple.signer import ApplePassSigner, ApplePassSignerError
+from wallet.pricing import resolve_ticket_price
+from wallet.resolution import resolve_series_window, resolve_ticket_location
+
+logger = structlog.get_logger(__name__)
+
+# Grace period after event.end before the pass expires in Apple Wallet.
+# Gives attendees time after the event officially ends (e.g. encores, delays).
+PASS_EXPIRATION_GRACE_PERIOD = timedelta(hours=12)
+
+# Platform attribution on the back of every pass — the wallet equivalent of the
+# PDF footer's "Powered by revel." lockup. Product URL, not the instance URL:
+# attribution points at the project even on self-hosted deployments. Also used
+# by the Google rail (linksModuleData) so both rails stay in sync.
+POWERED_BY_LABEL = "Powered by"
+POWERED_BY_VALUE = "Revel — https://letsrevel.io"
+POWERED_BY_URL = "https://letsrevel.io"
+
+
+@dataclass
+class PassData:
+    """Data structure for building a pass."""
+
+    serial_number: str
+    description: str
+    organization_name: str
+    event_name: str
+    event_start: datetime
+    event_end: datetime
+    address: str | None  # Full address for back of pass
+    ticket_tier: str
+    ticket_price: str
+    colors: PassColors
+    logo_image: bytes
+    event_tz: ZoneInfo = ZoneInfo("UTC")
+    barcode_message: str = ""
+    relevant_date: datetime | None = None
+    expiration_date: datetime | None = None
+    guest_name: str | None = None
+    venue_name: str | None = None  # Venue name for front of pass
+    sector_name: str | None = None
+    seat_label: str | None = None
+    # Fiscal lines from the organizer's country policy (EU layer 1); tickets only.
+    compliance_fields: list[TicketComplianceField] = field(default_factory=list)
+
+
+@dataclass
+class MembershipPassData:
+    """Data structure for building a generic-style membership card."""
+
+    serial_number: str
+    description: str
+    organization_name: str
+    member_name: str
+    member_since: datetime
+    tier_name: str | None
+    colors: PassColors
+    logo_image: bytes
+    org_tz: ZoneInfo
+    barcode_message: str
+
+
+class ApplePassGeneratorError(Exception):
+    """Raised when pass generation fails."""
+
+
+class ApplePassGenerator:
+    """Generates Apple Wallet .pkpass files for event tickets."""
+
+    CONTENT_TYPE = "application/vnd.apple.pkpass"
+    FILE_EXTENSION = "pkpass"
+
+    def __init__(self, signer: ApplePassSigner | None = None) -> None:
+        """Initialize the generator.
+
+        Args:
+            signer: The signer to use. If not provided, a default is created.
+        """
+        self.signer = signer or ApplePassSigner()
+        self._pass_type_id = settings.APPLE_WALLET_PASS_TYPE_ID
+        self._team_id = settings.APPLE_WALLET_TEAM_ID
+
+    def generate_pass(self, ticket: Ticket) -> bytes:
+        """Generate a .pkpass file for a ticket.
+
+        Args:
+            ticket: The ticket to generate a pass for.
+
+        Returns:
+            The .pkpass file as bytes.
+
+        Raises:
+            ApplePassGeneratorError: If pass generation fails.
+        """
+        try:
+            pass_data = self._build_pass_data(ticket)
+            files = self._generate_files(self._build_pass_json(pass_data), pass_data.colors, pass_data.logo_image)
+
+            # Create manifest and sign
+            manifest = self.signer.create_manifest(files)
+            files["manifest.json"] = manifest
+            files["signature"] = self.signer.sign_manifest(manifest)
+
+            pkpass_bytes = self._create_archive(files)
+
+            logger.info(
+                "pass_generated",
+                ticket_id=str(ticket.id),
+                event_id=str(ticket.event_id),
+                size=len(pkpass_bytes),
+            )
+
+            return pkpass_bytes
+
+        except ApplePassSignerError:
+            raise
+        except Exception as e:
+            logger.error("pass_generation_failed", ticket_id=str(ticket.id), error=str(e))
+            raise ApplePassGeneratorError(f"Failed to generate pass: {e}")
+
+    def generate_series_pass(self, held_pass: HeldSeriesPass) -> bytes:
+        """Generate a .pkpass file for a series pass.
+
+        Args:
+            held_pass: The series pass to generate a wallet pass for.
+
+        Returns:
+            The .pkpass file as bytes.
+
+        Raises:
+            ApplePassGeneratorError: If pass generation fails.
+        """
+        try:
+            pass_data = self._build_series_pass_data(held_pass)
+            files = self._generate_files(self._build_pass_json(pass_data), pass_data.colors, pass_data.logo_image)
+
+            manifest = self.signer.create_manifest(files)
+            files["manifest.json"] = manifest
+            files["signature"] = self.signer.sign_manifest(manifest)
+
+            pkpass_bytes = self._create_archive(files)
+
+            logger.info(
+                "series_pass_generated",
+                held_pass_id=str(held_pass.id),
+                series_pass_id=str(held_pass.series_pass_id),
+                size=len(pkpass_bytes),
+            )
+
+            return pkpass_bytes
+
+        except ApplePassSignerError:
+            raise
+        except Exception as e:
+            logger.error("series_pass_generation_failed", held_pass_id=str(held_pass.id), error=str(e))
+            raise ApplePassGeneratorError(f"Failed to generate pass: {e}")
+
+    def generate_membership_pass(self, member: OrganizationMember) -> bytes:
+        """Generate a .pkpass membership card for an organization member."""
+        try:
+            data = self._build_membership_pass_data(member)
+            files = self._generate_files(self._build_membership_pass_json(data), data.colors, data.logo_image)
+            manifest = self.signer.create_manifest(files)
+            files["manifest.json"] = manifest
+            files["signature"] = self.signer.sign_manifest(manifest)
+            pkpass_bytes = self._create_archive(files)
+            logger.info("membership_pass_generated", member_id=str(member.id), size=len(pkpass_bytes))
+            return pkpass_bytes
+        except ApplePassSignerError:
+            raise
+        except Exception as e:
+            logger.error("membership_pass_generation_failed", member_id=str(member.id), error=str(e))
+            raise ApplePassGeneratorError(f"Failed to generate pass: {e}")
+
+    def _build_membership_pass_data(self, member: OrganizationMember) -> MembershipPassData:
+        org = member.organization
+        logo_image = resolve_org_logo(org) or generate_fallback_logo(org)
+        return MembershipPassData(
+            serial_number=str(member.id),
+            description=f"Membership card for {org.name}",
+            organization_name=org.name,
+            member_name=member.user.get_display_name(),
+            member_since=member.created_at,
+            tier_name=member.tier.name if member.tier else None,
+            colors=get_theme_colors(),
+            logo_image=logo_image,
+            org_tz=get_organization_timezone(org),
+            barcode_message=member.qr_payload,
+        )
+
+    def _build_membership_pass_json(self, data: MembershipPassData) -> bytes:
+        """Build pass.json for the generic (membership card) style.
+
+        No relevantDate / expirationDate: the card is evergreen — validity is
+        resolved live at scan time, never baked into the pass.
+        """
+        secondary_fields: list[dict[str, t.Any]] = []
+        if data.tier_name:
+            secondary_fields.append({"key": "tier", "label": "TIER", "value": data.tier_name})
+        secondary_fields.append(
+            {
+                "key": "member_since",
+                "label": "MEMBER SINCE",
+                "value": format_date_year(data.member_since, tz=data.org_tz),
+            }
+        )
+
+        pass_dict: dict[str, t.Any] = {
+            "formatVersion": 1,
+            "passTypeIdentifier": self._pass_type_id,
+            "serialNumber": data.serial_number,
+            "teamIdentifier": self._team_id,
+            "organizationName": data.organization_name,
+            "description": data.description,
+            "backgroundColor": data.colors.background,
+            "foregroundColor": data.colors.foreground,
+            "labelColor": data.colors.label,
+            "barcodes": [
+                {
+                    "format": "PKBarcodeFormatQR",
+                    "message": data.barcode_message,
+                    "messageEncoding": "iso-8859-1",
+                }
+            ],
+            "generic": {
+                "primaryFields": [
+                    {"key": "member", "label": data.organization_name, "value": data.member_name},
+                ],
+                "secondaryFields": secondary_fields,
+                "backFields": [
+                    {"key": "member_id", "label": "Member ID", "value": data.serial_number},
+                    {"key": "org", "label": "Organization", "value": data.organization_name},
+                    {"key": "powered_by", "label": POWERED_BY_LABEL, "value": POWERED_BY_VALUE},
+                ],
+            },
+        }
+        return json.dumps(pass_dict, indent=2).encode("utf-8")
+
+    def _build_series_pass_data(self, held_pass: HeldSeriesPass) -> PassData:
+        """Build PassData from a HeldSeriesPass model.
+
+        A series pass has no single covered event, so event-shaped fields are
+        derived from the covered events as a whole by
+        :func:`wallet.resolution.resolve_series_window` (shared with the Google
+        rail): ``event_start``/``relevant_date`` use the soonest upcoming
+        covered event (falling back to the most recent past one once all events
+        have elapsed), while ``event_end``/``expiration_date`` use the
+        latest-ending covered event so the pass stays valid until the series is
+        fully over. Only the logo is rail-specific — Apple embeds the bytes.
+        """
+        series_pass = held_pass.series_pass
+        event_series = series_pass.event_series
+        org = event_series.organization
+
+        window = resolve_series_window(held_pass)
+        representative_event = window.representative_event
+        logo_image = (resolve_cover_art(representative_event) if representative_event else None) or (
+            generate_fallback_logo(org)
+        )
+
+        return PassData(
+            serial_number=str(held_pass.id),
+            description=f"Series Pass for {event_series.name}",
+            organization_name=org.name,
+            event_name=series_pass.name,
+            event_start=window.start,
+            event_end=window.end,
+            event_tz=window.tz,
+            address=window.address,
+            ticket_tier="Series Pass",
+            ticket_price=format_price(held_pass.price_paid, series_pass.currency),
+            colors=get_theme_colors(),
+            logo_image=logo_image,
+            barcode_message=held_pass.qr_payload,
+            relevant_date=window.start,
+            expiration_date=window.end + PASS_EXPIRATION_GRACE_PERIOD,
+            venue_name=window.venue_name,
+        )
+
+    def _build_pass_data(self, ticket: Ticket) -> PassData:
+        """Build PassData from a Ticket model."""
+        event = ticket.event
+        org = event.organization
+
+        # Resolve logo image (cover_art with fallback to generated)
+        logo_image = resolve_cover_art(event) or generate_fallback_logo(org)
+
+        # Resolve actual price paid:
+        # 1. ticket.price_paid (offline/at_the_door PWYC)
+        # 2. ticket.payment.amount (online Stripe payment)
+        # 3. the seat's category price, else tier.price (see resolve_ticket_price)
+        price, currency = resolve_ticket_price(ticket)
+
+        # Venue, sector and seat resolution is shared with the Google rail.
+        location = resolve_ticket_location(ticket)
+
+        return PassData(
+            serial_number=str(ticket.id),
+            description=f"Ticket for {event.name}",
+            organization_name=org.name,
+            event_name=event.name,
+            event_start=event.start,
+            event_end=event.end,
+            event_tz=get_event_timezone(event),
+            address=location.address,
+            ticket_tier=ticket.tier.name,
+            ticket_price=format_price(price, currency),
+            colors=get_theme_colors(),
+            logo_image=logo_image,
+            barcode_message=str(ticket.id),
+            relevant_date=event.start,
+            expiration_date=event.end + PASS_EXPIRATION_GRACE_PERIOD,
+            guest_name=ticket.guest_name,
+            venue_name=location.venue_name,
+            sector_name=location.sector.name if location.sector else None,
+            seat_label=location.seat_label,
+            compliance_fields=ticket_fields(ticket),
+        )
+
+    def _generate_files(self, pass_json: bytes, colors: PassColors, logo_image: bytes) -> dict[str, bytes]:
+        """Generate all files needed for a pass."""
+        files: dict[str, bytes] = {}
+
+        # pass.json
+        files["pass.json"] = pass_json
+
+        # Icons
+        icon_color = parse_rgb_color(colors.background)
+        for filename, size in ICON_SIZES.items():
+            files[filename] = generate_colored_icon(size, icon_color)
+
+        # Logos
+        for filename, size in LOGO_SIZES.items():
+            files[filename] = resize_image(logo_image, size)
+
+        # Vertical brand-gradient background (iOS blurs it behind the pass)
+        for filename, size in BACKGROUND_SIZES.items():
+            files[filename] = generate_gradient_background(size)
+
+        return files
+
+    def _build_pass_json(self, data: PassData) -> bytes:
+        """Build the pass.json content.
+
+        Apple Wallet eventTicket layout:
+        - headerFields: Top row (date)
+        - primaryFields: Org name as label, event name as value
+        - secondaryFields: Venue, address, section, seat
+        - auxiliaryFields: Ticket tier, price, guest name
+        - backFields: Detailed info (tap (i) button)
+
+        Guest name is placed at the end of auxiliaryFields to allow it to
+        use remaining space without being squeezed between other fields.
+        """
+        # Build secondary fields: venue/address > section > seat
+        # Venue name is used as the label (small text) and address as the value,
+        # mirroring the primary field pattern (org name label, event name value).
+        secondary_fields: list[dict[str, t.Any]] = []
+
+        if data.venue_name and data.address:
+            secondary_fields.append(
+                {
+                    "key": "venue",
+                    "label": data.venue_name.upper(),
+                    "value": data.address,
+                }
+            )
+        elif data.venue_name:
+            secondary_fields.append(
+                {
+                    "key": "venue",
+                    "label": "VENUE",
+                    "value": data.venue_name,
+                }
+            )
+        elif data.address:
+            secondary_fields.append(
+                {
+                    "key": "address",
+                    "label": "ADDRESS",
+                    "value": data.address,
+                }
+            )
+
+        if data.sector_name:
+            secondary_fields.append(
+                {
+                    "key": "sector",
+                    "label": "SECTION",
+                    "value": data.sector_name,
+                }
+            )
+
+        if data.seat_label:
+            secondary_fields.append(
+                {
+                    "key": "seat",
+                    "label": "SEAT",
+                    "value": data.seat_label,
+                    "textAlignment": "PKTextAlignmentRight",
+                }
+            )
+
+        # Build auxiliary fields: ticket tier, price, then guest name (if present)
+        # Guest name is last so it can use more horizontal space for long names
+        auxiliary_fields: list[dict[str, t.Any]] = [
+            {"key": "tier", "label": "TICKET", "value": data.ticket_tier},
+            {
+                "key": "price",
+                "label": "PRICE",
+                "value": data.ticket_price,
+            },
+        ]
+
+        # Add guest name at the end - right-aligned so it flows naturally
+        if data.guest_name:
+            auxiliary_fields.append(
+                {
+                    "key": "guest",
+                    "label": "GUEST",
+                    "value": data.guest_name,
+                    "textAlignment": "PKTextAlignmentRight",
+                }
+            )
+
+        pass_dict: dict[str, t.Any] = {
+            "formatVersion": 1,
+            "passTypeIdentifier": self._pass_type_id,
+            "serialNumber": data.serial_number,
+            "teamIdentifier": self._team_id,
+            "organizationName": data.organization_name,
+            "description": data.description,
+            "backgroundColor": data.colors.background,
+            "foregroundColor": data.colors.foreground,
+            "labelColor": data.colors.label,
+            "barcodes": [
+                {
+                    "format": "PKBarcodeFormatQR",
+                    "message": data.barcode_message,
+                    "messageEncoding": "iso-8859-1",
+                }
+            ],
+            "eventTicket": {
+                "headerFields": [
+                    {
+                        "key": "date",
+                        "value": format_date_compact(data.event_start, tz=data.event_tz),
+                    },
+                ],
+                "primaryFields": [
+                    {"key": "event", "label": data.organization_name, "value": data.event_name},
+                ],
+                "secondaryFields": secondary_fields,
+                "auxiliaryFields": auxiliary_fields,
+                "backFields": self._build_back_fields(data),
+            },
+        }
+
+        # Add relevant date for lock screen
+        if data.relevant_date:
+            pass_dict["relevantDate"] = format_iso_date(data.relevant_date, tz=data.event_tz)
+
+        # Expire pass after event ends (+ grace period)
+        if data.expiration_date:
+            pass_dict["expirationDate"] = format_iso_date(data.expiration_date, tz=data.event_tz)
+
+        return json.dumps(pass_dict, indent=2).encode("utf-8")
+
+    def _build_back_fields(self, data: PassData) -> list[dict[str, str]]:
+        """Build the back fields for the pass."""
+        fields: list[dict[str, str]] = [
+            {"key": "ticket_id", "label": "Ticket ID", "value": data.serial_number},
+        ]
+
+        # Add guest name
+        if data.guest_name:
+            fields.append({"key": "guest_name", "label": "Guest", "value": data.guest_name})
+
+        fields.append(
+            {
+                "key": "event_details",
+                "label": "Event Details",
+                "value": (
+                    f"{data.event_name}\n\n"
+                    f"Start: {format_date_full(data.event_start, tz=data.event_tz)}\n"
+                    f"End: {format_date_full(data.event_end, tz=data.event_tz)}"
+                ),
+            }
+        )
+
+        # Add venue and address
+        if data.venue_name:
+            fields.append(
+                {
+                    "key": "venue_name",
+                    "label": "Venue",
+                    "value": data.venue_name,
+                }
+            )
+
+        if data.address:
+            fields.append(
+                {
+                    "key": "full_address",
+                    "label": "Address",
+                    "value": data.address,
+                }
+            )
+
+        # Add seating info
+        if data.sector_name or data.seat_label:
+            seating_parts = []
+            if data.sector_name:
+                seating_parts.append(f"Section: {data.sector_name}")
+            if data.seat_label:
+                seating_parts.append(f"Seat: {data.seat_label}")
+            fields.append(
+                {
+                    "key": "seating",
+                    "label": "Seating",
+                    "value": "\n".join(seating_parts),
+                }
+            )
+
+        fields.extend(
+            {"key": f"compliance_{item.key}", "label": item.label, "value": item.value}
+            for item in data.compliance_fields
+        )
+
+        fields.append({"key": "powered_by", "label": POWERED_BY_LABEL, "value": POWERED_BY_VALUE})
+
+        return fields
+
+    def _create_archive(self, files: dict[str, bytes]) -> bytes:
+        """Create the .pkpass ZIP archive."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for filename, content in files.items():
+                zf.writestr(filename, content)
+        return buffer.getvalue()

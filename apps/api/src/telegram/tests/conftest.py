@@ -1,0 +1,178 @@
+# src/telegram/tests/conftest.py
+import random
+import typing as t
+from datetime import timedelta
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+from aiogram import Bot, Dispatcher
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Chat, Message
+from aiogram.types import User as AiogramUser
+from django.utils import timezone
+
+from accounts.models import RevelUser
+from events.models import Event, EventInvitation, Organization
+from telegram.bot import get_dispatcher
+from telegram.models import TelegramUser
+
+
+@pytest.fixture
+def bot() -> Bot:
+    """Fixture for the aiogram Bot instance."""
+    return Bot(token="123456:AAHtest-token-value")
+
+
+@pytest.fixture
+def storage() -> MemoryStorage:
+    """Fixture for in-memory FSM storage."""
+    return MemoryStorage()
+
+
+@pytest.fixture
+def dispatcher(storage: MemoryStorage) -> t.Iterator[Dispatcher]:
+    """Fixture for the aiogram Dispatcher.
+
+    The routers are module-level singletons and aiogram lets a router attach to only one parent,
+    so detach them on teardown to allow the next test to build a fresh dispatcher.
+    """
+    dp = get_dispatcher(storage)
+    yield dp
+    for router in dp.sub_routers:
+        router._parent_router = None
+    dp.sub_routers.clear()
+
+
+@pytest.fixture
+def aiogram_user() -> AiogramUser:
+    """Fixture for a standard Aiogram user."""
+    return AiogramUser(
+        id=random.randint(1, 1_000_000), is_bot=False, first_name="Test", last_name="User", username="testuser"
+    )
+
+
+@pytest.fixture
+def aiogram_superuser() -> AiogramUser:
+    """Fixture for a superuser Aiogram user."""
+    return AiogramUser(id=123, is_bot=False, first_name="Super", last_name="User")
+
+
+@pytest.fixture
+def chat() -> Chat:
+    """Fixture for an Aiogram chat object."""
+    return Chat(id=54321, type="private")
+
+
+@pytest_asyncio.fixture
+async def django_user(aiogram_user: AiogramUser) -> t.AsyncIterator[RevelUser]:
+    """Fixture for a standard Django user linked to a Telegram user."""
+    user, _ = await RevelUser.objects.aget_or_create(
+        username="testuser", defaults={"first_name": "Test", "last_name": "User", "password": "<PASSWORD>"}
+    )
+    await TelegramUser.objects.aget_or_create(user=user, telegram_id=aiogram_user.id)
+    yield user
+    await user.adelete()
+
+
+@pytest_asyncio.fixture
+async def django_superuser(aiogram_superuser: AiogramUser) -> t.AsyncIterator[RevelUser]:
+    """Fixture for a Django superuser linked to a Telegram superuser."""
+    user, _ = await RevelUser.objects.aget_or_create(
+        username="super_user", defaults={"is_superuser": True, "is_staff": True, "password": "<PASSWORD>"}
+    )
+    await TelegramUser.objects.aget_or_create(user=user, telegram_id=aiogram_superuser.id)
+    yield user
+    await user.adelete()
+
+
+@pytest_asyncio.fixture
+async def django_inactive_user(aiogram_user: AiogramUser) -> t.AsyncIterator[RevelUser]:
+    """Fixture for a Django inactive user linked to a Telegram user."""
+    inactive_user = await RevelUser.objects.acreate(username="inactive", is_active=False, password="<PASSWORD>")
+    await TelegramUser.objects.acreate(user=inactive_user, telegram_id=aiogram_user.id)
+    yield inactive_user
+    await inactive_user.adelete()
+
+
+@pytest_asyncio.fixture
+async def organization(django_superuser: RevelUser) -> t.AsyncIterator[Organization]:
+    """Fixture for an Event organizer."""
+    org = await Organization.objects.acreate(name="Test Organization", slug="test-org", owner=django_superuser)
+    yield org
+    await org.adelete()
+
+
+@pytest_asyncio.fixture
+async def private_event(organization: Organization) -> t.AsyncIterator[Event]:
+    """Fixture for a private Event."""
+    now = timezone.now()
+    event = await Event.objects.acreate(
+        organization=organization,
+        name="Test Event",
+        slug="test-event",
+        event_type=Event.EventType.PRIVATE,
+        start=now + timedelta(days=7),
+        end=now + timedelta(days=7, hours=3),
+    )
+    yield event
+    await event.adelete()
+
+
+@pytest_asyncio.fixture
+async def event_invitation(django_user: RevelUser, private_event: Event) -> t.AsyncIterator[EventInvitation]:
+    """Fixture for a Django event invitation linked to a Telegram user."""
+    invitation = await EventInvitation.objects.acreate(event=private_event, user=django_user)
+    yield invitation
+    await invitation.adelete()
+
+
+def _make_mock_message(chat: Chat) -> AsyncMock:
+    """Create a mock Message that passes ``isinstance(msg, Message)`` checks.
+
+    We use ``spec=Message`` so that ``isinstance`` works (handlers assert
+    this), but explicitly override async methods because ``unittest.mock``
+    fails to detect aiogram's methods as coroutines.
+    """
+    msg = AsyncMock(spec=Message)
+    msg.chat = chat
+    msg.answer = AsyncMock(name="Message.answer")
+    msg.reply = AsyncMock(name="Message.reply")
+    msg.edit_text = AsyncMock(name="Message.edit_text")
+    msg.delete = AsyncMock(name="Message.delete")
+    return msg
+
+
+@pytest.fixture
+def mock_callback_query(aiogram_user: AiogramUser, chat: Chat) -> AsyncMock:
+    """Reusable mock CallbackQuery fixture."""
+    cb = AsyncMock()
+    cb.id = "test_callback"
+    cb.from_user = aiogram_user
+    cb.chat_instance = "test"
+    cb.message = _make_mock_message(chat)
+    cb.data = ""
+    return cb
+
+
+@pytest.fixture
+def mock_message(aiogram_user: AiogramUser, chat: Chat) -> AsyncMock:
+    """Reusable mock Message fixture."""
+    msg = _make_mock_message(chat)
+    msg.message_id = 1
+    msg.from_user = aiogram_user
+    msg.text = ""
+    return msg
+
+
+@pytest.fixture
+def mock_fsm_context() -> AsyncMock:
+    """Mock FSMContext for unit tests."""
+    ctx = AsyncMock(spec=FSMContext)
+    ctx.get_state = AsyncMock(return_value=None)
+    ctx.set_state = AsyncMock()
+    ctx.update_data = AsyncMock()
+    ctx.get_data = AsyncMock(return_value={})
+    ctx.clear = AsyncMock()
+    return ctx

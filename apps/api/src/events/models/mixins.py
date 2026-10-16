@@ -1,0 +1,297 @@
+import secrets
+import string
+import typing as t
+
+from django.conf import settings
+from django.contrib.gis.db import models
+from django.core.files.uploadedfile import UploadedFile
+from django.core.validators import FileExtensionValidator
+from django.utils.text import slugify
+
+from common.fields import ALLOWED_IMAGE_EXTENSIONS, validate_image_file
+from common.models import ExifStripMixin, TimeStampedModel
+
+# Re-exported for backward compatibility: the canonical definition lives in
+# ``events.utils.visibility_settings`` because ``EventVisibilitySettings``
+# needs it at class-definition time and cannot import this module (circular).
+from events.utils.visibility_settings import ResourceVisibility as ResourceVisibility  # noqa: F401
+from geo.models import City
+
+
+class VisibilityMixin(models.Model):
+    class Visibility(models.TextChoices):
+        """Base visibility enum for events and resources."""
+
+        PUBLIC = "public"  # everyone can see
+        UNLISTED = "unlisted"  # accessible via direct link, but hidden from discovery listings
+        PRIVATE = "private"  # only invited people can see
+        MEMBERS_ONLY = "members-only"  # only members can see
+        STAFF_ONLY = "staff-only"  # only staff members can see
+
+        @classmethod
+        def publicly_accessible(cls) -> list["VisibilityMixin.Visibility"]:
+            """Visibilities that grant access to anyone (PUBLIC + UNLISTED)."""
+            return [cls.PUBLIC, cls.UNLISTED]
+
+    visibility = models.CharField(choices=Visibility.choices, max_length=20, db_index=True, default=Visibility.PRIVATE)
+
+    class Meta:
+        abstract = True
+
+
+SLUG_SUFFIX_ALPHABET = string.ascii_lowercase + string.digits  # [a-z0-9]
+SLUG_SUFFIX_LENGTH = 5
+MAX_SLUG_COLLISION_RETRIES = 10
+
+
+def generate_slug_suffix() -> str:
+    """Generate a short random suffix for slug collision resolution."""
+    return "".join(secrets.choice(SLUG_SUFFIX_ALPHABET) for _ in range(SLUG_SUFFIX_LENGTH))
+
+
+class SlugFromNameMixin(models.Model):
+    """Mixin that auto-generates a slug from the name field.
+
+    Handles slug collisions by appending a date-based suffix first, then a
+    random suffix if needed.
+    Subclasses can define `slug_scope_field` to specify a field that
+    defines the uniqueness scope (e.g., 'organization' for Event).
+    Subclasses can define `slug_date_field` to specify a DateTimeField used
+    as a human-readable suffix before falling back to random strings
+    (e.g., 'start' for Event).
+    """
+
+    # Override in subclass to specify the field that scopes slug uniqueness
+    # e.g., slug_scope_field = "organization" means slug must be unique per organization
+    slug_scope_field: str | None = None
+
+    # Override in subclass to specify a date field for human-readable slug suffixes
+    # e.g., slug_date_field = "start" means the event's start date is appended on collision
+    slug_date_field: str | None = None
+
+    class Meta:
+        abstract = True
+
+    def _get_slug_queryset(self) -> models.QuerySet[t.Any]:
+        """Get queryset for checking slug uniqueness within scope."""
+        qs = self.__class__.objects.all()  # type: ignore[attr-defined]
+
+        # Exclude self if already saved
+        if self.pk:
+            qs = qs.exclude(pk=self.pk)
+
+        # Apply scope filter if defined
+        if self.slug_scope_field:
+            scope_value = getattr(self, self.slug_scope_field, None)
+            if scope_value is not None:
+                # Handle both FK and FK_id patterns
+                field_name = self.slug_scope_field
+                if hasattr(scope_value, "pk"):
+                    field_name = f"{self.slug_scope_field}_id"
+                    scope_value = scope_value.pk
+                qs = qs.filter(**{field_name: scope_value})
+
+        return qs  # type: ignore[no-any-return]
+
+    def _get_date_suffix(self) -> str | None:
+        """Get a date suffix from the configured slug_date_field, if available."""
+        if not self.slug_date_field:
+            return None
+        date_value = getattr(self, self.slug_date_field, None)
+        if date_value is None:
+            return None
+        return t.cast(str, date_value.strftime("%Y-%m-%d"))
+
+    def _truncate_base(self, base: str, suffix_len: int) -> str:
+        """Truncate base slug so that base + '-' + suffix fits within max_length."""
+        max_length = t.cast(int, self._meta.get_field("slug").max_length)  # type: ignore[union-attr]
+        max_base = max_length - suffix_len - 1  # 1 for the hyphen
+        return base[:max_base]
+
+    def _generate_unique_slug(self, base_slug: str) -> str:
+        """Generate a unique slug, appending a suffix if necessary.
+
+        Collision resolution order:
+        1. Try the base slug as-is.
+        2. If slug_date_field is set, try base_slug-YYYY-MM-DD.
+        3. Fall back to base_slug(-YYYY-MM-DD)-{random} with retries.
+        """
+        qs = self._get_slug_queryset()
+
+        # Try the base slug first
+        if not qs.filter(slug=base_slug).exists():
+            return base_slug
+
+        # Try date-based suffix if available
+        date_suffix = self._get_date_suffix()
+        if date_suffix:
+            date_candidate = f"{self._truncate_base(base_slug, len(date_suffix))}-{date_suffix}"
+            if not qs.filter(slug=date_candidate).exists():
+                return date_candidate
+            # Date also collided — use date + random as the base for retries
+            base_slug = date_candidate
+
+        # Fall back to random suffix
+        for _ in range(MAX_SLUG_COLLISION_RETRIES):
+            candidate = f"{self._truncate_base(base_slug, SLUG_SUFFIX_LENGTH)}-{generate_slug_suffix()}"
+            if not qs.filter(slug=candidate).exists():
+                return candidate
+
+        # Extremely unlikely - all retries collided
+        raise ValueError(f"Could not generate unique slug after {MAX_SLUG_COLLISION_RETRIES} attempts")
+
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Override save to auto-create slug."""
+        if not self.slug:  # type: ignore[has-type]
+            base_slug = slugify(self.name)  # type: ignore[attr-defined]
+            self.slug = self._generate_unique_slug(base_slug)
+        super().save(*args, **kwargs)
+
+
+class LocationMixin(models.Model):
+    city = models.ForeignKey(City, on_delete=models.SET_NULL, null=True, blank=True)
+    location = models.PointField(geography=True, db_index=True, null=True, blank=True)
+    address = models.CharField(blank=True, null=True, max_length=255)
+    location_maps_url = models.URLField(
+        blank=True,
+        null=True,
+        max_length=2048,
+        help_text="Shareable link to Google Maps (e.g., https://goo.gl/maps/...)",
+    )
+    location_maps_embed = models.URLField(
+        blank=True,
+        null=True,
+        max_length=2048,
+        help_text="Embed URL for iframe src (e.g., https://www.google.com/maps/embed?pb=...)",
+    )
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args: t.Any, **kwargs: t.Any) -> None:
+        """Override save to auto-create location."""
+        if self.city and self.location is None:
+            self.location = self.city.location
+        super().save(*args, **kwargs)
+
+    def full_address(self) -> str:
+        """Get the full address combining address and city.
+
+        Returns:
+            Full address string, or empty string if no location info available.
+        """
+        if self.address and self.city:
+            return f"{self.address}, {self.city}"
+        if self.address:
+            return self.address
+        if self.city:
+            return self.city.name
+        return ""
+
+
+class LogoCoverValidationMixin(ExifStripMixin):
+    IMAGE_FIELDS = (
+        "logo",
+        "cover_art",
+    )
+
+    class Meta:
+        abstract = True
+
+    image_validators: list[t.Callable[[UploadedFile[bytes]], None]] = [
+        FileExtensionValidator(allowed_extensions=ALLOWED_IMAGE_EXTENSIONS),
+        validate_image_file,
+    ]
+
+    logo = models.ImageField(
+        upload_to="logos",
+        null=True,
+        blank=True,
+        validators=image_validators,
+    )
+    logo_thumbnail = models.ImageField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="150x150 logo thumbnail (auto-generated).",
+    )
+    cover_art = models.ImageField(
+        upload_to="cover-art",
+        null=True,
+        blank=True,
+        validators=image_validators,
+    )
+    cover_art_thumbnail = models.ImageField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="150x150 cover art thumbnail (auto-generated).",
+    )
+    cover_art_social = models.ImageField(
+        max_length=255,
+        blank=True,
+        null=True,
+        help_text="1200x630 social preview for cover art (auto-generated).",
+    )
+
+    def delete(self, *args: t.Any, **kwargs: t.Any) -> tuple[int, dict[str, int]]:
+        """Delete thumbnails from storage when model is deleted."""
+        # Delete logo thumbnails
+        if self.logo_thumbnail:
+            self.logo_thumbnail.delete(save=False)
+        # Delete cover art thumbnails
+        if self.cover_art_thumbnail:
+            self.cover_art_thumbnail.delete(save=False)
+        if self.cover_art_social:
+            self.cover_art_social.delete(save=False)
+        return super().delete(*args, **kwargs)
+
+
+CODE_ALPHABET = string.ascii_letters + string.digits  # [a-zA-Z0-9]
+CODE_LENGTH = 8
+
+
+def secure_random_code() -> str:
+    """Generate a secure random alphanumeric code of length CODE_LENGTH."""
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
+
+
+class TokenMixin(TimeStampedModel):
+    id = models.CharField(primary_key=True, max_length=32, editable=False, default=secure_random_code)  # type: ignore[assignment]
+    name = models.CharField(max_length=120, null=True, blank=True)
+    issuer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="%(class)s_tokens")
+    expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    uses = models.IntegerField(default=0)
+    max_uses = models.IntegerField(
+        default=0, help_text="The maximum number of invites allowed for this token. 0 Means unlimited."
+    )
+
+    class Meta:
+        abstract = True
+
+
+class UserRequestMixin(TimeStampedModel):
+    class Status(models.TextChoices):
+        PENDING = "pending"
+        APPROVED = "approved"
+        REJECTED = "rejected"
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    status = models.CharField(max_length=10, choices=Status.choices, default=Status.PENDING)
+    message = models.TextField(null=True, blank=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="%(class)s_decided_by"
+    )
+
+    class Meta:
+        abstract = True
+
+
+class SocialMediaMixin(models.Model):
+    instagram_url = models.URLField("Instagram", blank=True, null=True)
+    facebook_url = models.URLField("Facebook", blank=True, null=True)
+    bluesky_url = models.URLField("Bluesky", blank=True, null=True)
+    telegram_url = models.URLField("Telegram", blank=True, null=True)
+
+    class Meta:
+        abstract = True

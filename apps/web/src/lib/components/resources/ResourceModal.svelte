@@ -1,0 +1,310 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import { createMutation } from '@tanstack/svelte-query';
+	import { organizationadminresourcesUpdateResource } from '$lib/api/generated/sdk.gen';
+	import type {
+		AdditionalResourceSchema,
+		AdditionalResourceUpdateSchema,
+		ResourceVisibility
+	} from '$lib/api/generated/types.gen';
+	import { authStore } from '$lib/stores/auth.svelte';
+	import { getApiUrl } from '$lib/config/api';
+	import { X, AlertTriangle } from '@lucide/svelte';
+	import ResourceForm from './ResourceForm.svelte';
+	import { extractApiErrorDetail } from '$lib/utils/api-error-detail';
+
+	interface Props {
+		resource?: AdditionalResourceSchema | null;
+		organizationSlug: string;
+		organizationId: string;
+		onClose: () => void;
+		onSuccess: () => void;
+	}
+
+	const { resource = null, organizationSlug, organizationId, onClose, onSuccess }: Props = $props();
+
+	const accessToken = $derived(authStore.accessToken);
+	let errorMessage = $state<string | null>(null);
+	let fieldErrors = $state<Record<string, string>>({});
+
+	// Create mutation
+	const createResourceMutation = createMutation(() => ({
+		mutationFn: async (formData: FormData) => {
+			// Extract values
+			const file = formData.get('file') as File | null;
+			const resourceType = formData.get('resource_type') as string;
+
+			// Backend now expects multipart/form-data with individual form fields
+			// Build multipart form data
+			const multipartData = new FormData();
+
+			// Add all schema fields as individual form fields
+			multipartData.append('resource_type', resourceType);
+
+			const name = formData.get('name');
+			if (name) multipartData.append('name', name as string);
+
+			const description = formData.get('description');
+			if (description) multipartData.append('description', description as string);
+
+			const visibility = formData.get('visibility') || 'members-only';
+			multipartData.append('visibility', visibility as string);
+
+			const displayOnOrgPage = formData.get('display_on_organization_page');
+			multipartData.append('display_on_organization_page', displayOnOrgPage || 'true');
+
+			// Add type-specific fields
+			if (resourceType === 'link') {
+				const linkValue = formData.get('link') as string;
+				if (!linkValue || linkValue.trim() === '') {
+					throw new Error(m['resourceModal.error_linkRequired']());
+				}
+				multipartData.append('link', linkValue.trim());
+			} else if (resourceType === 'text') {
+				const textValue = formData.get('text') as string;
+				if (!textValue || textValue.trim() === '') {
+					throw new Error(m['resourceModal.error_textRequired']());
+				}
+				multipartData.append('text', textValue.trim());
+			} else if (resourceType === 'file') {
+				if (!file) {
+					throw new Error(m['resourceModal.error_fileRequired']());
+				}
+				// File will be added as query parameter in URL
+			}
+
+			// Parse and add event_ids if present
+			const eventIdsStr = formData.get('event_ids') as string | null;
+			if (eventIdsStr) {
+				try {
+					const eventIds = JSON.parse(eventIdsStr);
+					// For form-data, arrays need to be sent as multiple fields or JSON string
+					eventIds.forEach((id: string) => {
+						multipartData.append('event_ids', id);
+					});
+				} catch {
+					// Ignore parsing errors
+				}
+			}
+
+			// Add file to form data if present (not as query param)
+			if (file) {
+				multipartData.append('file', file);
+			}
+
+			const url = getApiUrl(`organization-admin/${organizationSlug}/resources`);
+
+			// Use fetch directly (SDK might not handle form-data properly)
+			const response = await fetch(url, {
+				method: 'POST',
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+					// Don't set Content-Type - browser will set it with boundary for multipart
+				},
+				body: multipartData
+			});
+
+			if (!response.ok) {
+				const error = await response.json();
+				throw new Error(error.detail || m['resourceModal.error_failedToCreate']());
+			}
+
+			return await response.json();
+		},
+		onSuccess: () => {
+			onSuccess();
+		},
+		onError: (error: Error) => {
+			errorMessage = error.message;
+		}
+	}));
+
+	// Update mutation
+	const updateResourceMutation = createMutation(() => ({
+		mutationFn: async (formData: FormData) => {
+			if (!resource?.id) {
+				throw new Error(m['resourceModal.error_resourceIdRequired']());
+			}
+
+			// Build JSON body (update schema has all optional fields)
+			const body: AdditionalResourceUpdateSchema = {};
+
+			// Only include fields that are present in the form
+			const name = formData.get('name');
+			if (name !== null && name !== '') {
+				body.name = (name as string).trim();
+			}
+
+			const description = formData.get('description');
+			if (description !== null && description !== '') {
+				body.description = (description as string).trim();
+			}
+
+			const visibility = formData.get('visibility');
+			if (typeof visibility === 'string' && visibility) {
+				body.visibility = visibility as ResourceVisibility;
+			}
+
+			const displayOnOrgPage = formData.get('display_on_organization_page');
+			if (displayOnOrgPage !== null) {
+				body.display_on_organization_page = displayOnOrgPage === 'true';
+			}
+
+			// Add type-specific fields based on the resource type
+			// For updates, only include if the field has a value
+			const link = formData.get('link');
+			if (link !== null && link !== '') {
+				body.link = (link as string).trim();
+			}
+
+			const text = formData.get('text');
+			if (text !== null && text !== '') {
+				body.text = (text as string).trim();
+			}
+
+			// Parse event_ids if present
+			const eventIdsStr = formData.get('event_ids') as string | null;
+			if (eventIdsStr !== null) {
+				try {
+					body.event_ids = JSON.parse(eventIdsStr);
+				} catch {
+					body.event_ids = [];
+				}
+			}
+
+			const response = await organizationadminresourcesUpdateResource({
+				path: { slug: organizationSlug, resource_id: resource.id },
+				body,
+				headers: {
+					Authorization: `Bearer ${accessToken}`
+				}
+			});
+
+			if (response.error) {
+				const errorDetail =
+					extractApiErrorDetail(response.error) ?? m['resourceModal.error_failedToUpdate']();
+				throw new Error(errorDetail);
+			}
+
+			if (!response.data) {
+				throw new Error(m['resourceModal.error_failedToUpdate']());
+			}
+
+			return response.data;
+		},
+		onSuccess: () => {
+			onSuccess();
+		},
+		onError: (error: Error) => {
+			errorMessage = error.message;
+		}
+	}));
+
+	function handleSubmit(formData: FormData) {
+		errorMessage = null;
+		fieldErrors = {};
+
+		if (resource) {
+			updateResourceMutation.mutate(formData);
+		} else {
+			createResourceMutation.mutate(formData);
+		}
+	}
+
+	function handleBackdropClick(event: MouseEvent | KeyboardEvent) {
+		if (event.target === event.currentTarget) {
+			onClose();
+		}
+	}
+
+	function handleKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			onClose();
+		}
+	}
+
+	const isSubmitting = $derived(
+		createResourceMutation.isPending || updateResourceMutation.isPending
+	);
+
+	let backdropElement: HTMLDivElement;
+	let modalElement: HTMLDivElement;
+</script>
+
+<svelte:window onkeydown={handleKeydown} />
+
+<!-- Modal Backdrop -->
+<div
+	bind:this={backdropElement}
+	class="fixed inset-0 z-50 overflow-y-auto bg-black/50 backdrop-blur-sm"
+	onclick={handleBackdropClick}
+	onkeydown={(e) => e.key === 'Enter' && handleBackdropClick(e)}
+	role="dialog"
+	aria-modal="true"
+	aria-labelledby="modal-title"
+	tabindex="-1"
+>
+	<!-- Modal Container with Padding -->
+	<div class="flex min-h-full items-center justify-center p-4 sm:p-6 lg:p-8">
+		<!-- Modal Content -->
+		<div
+			bind:this={modalElement}
+			class="relative my-8 w-full max-w-2xl rounded-lg bg-background p-6 shadow-xl md:p-8"
+			role="document"
+		>
+			<!-- Header -->
+			<div class="mb-6 flex items-start justify-between">
+				<div>
+					<h2 id="modal-title" class="text-2xl font-bold">
+						{resource ? m['resourceModal.editResource']() : m['resourceModal.addResource']()}
+					</h2>
+					<p class="mt-1 text-sm text-muted-foreground">
+						{resource ? m['resourceModal.updateDetails']() : m['resourceModal.createNew']()}
+					</p>
+				</div>
+
+				<button
+					type="button"
+					onclick={onClose}
+					disabled={isSubmitting}
+					class="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+					aria-label={m['resourceModal.closeDialog']()}
+				>
+					<X class="h-5 w-5" aria-hidden="true" />
+				</button>
+			</div>
+
+			<!-- Error Message -->
+			{#if errorMessage}
+				<!-- dark:bg-destructive/25 (AutoEvalRecommendation's pattern): a /10 red
+				     wash is nearly invisible on the dark surface, so dark strengthens the
+				     tint. The icon stays `text-destructive`, which is --destructive-text
+				     since #781. This panel sits on the modal's own bg-background (line
+				     252), so the governing figures are 7.20:1 light on /10 and 5.84:1 dark
+				     on /25; over a bg-card container the same recipe is 8.10:1 / 5.37:1.
+				     All four are audited rows in scripts/audit-brand-themes.py. The old
+				     FILL value measured 2.69-2.95:1 here, under the 3:1 non-text floor. -->
+				<div
+					class="mb-6 flex gap-3 rounded-md border border-destructive/50 bg-destructive/10 p-4 dark:bg-destructive/25"
+					role="alert"
+					aria-live="assertive"
+				>
+					<AlertTriangle class="h-5 w-5 shrink-0 text-destructive" aria-hidden="true" />
+					<div>
+						<p class="font-semibold text-foreground">{m['resourceModal.error']()}</p>
+						<p class="mt-1 text-sm text-foreground">{errorMessage}</p>
+					</div>
+				</div>
+			{/if}
+
+			<!-- Form -->
+			<ResourceForm
+				{resource}
+				{organizationId}
+				onSubmit={handleSubmit}
+				{isSubmitting}
+				errors={fieldErrors}
+			/>
+		</div>
+	</div>
+</div>

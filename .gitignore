@@ -1,0 +1,14 @@
+.local/
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.local
+**/.venv/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+**/*.log
+**/.DS_Store
+apps/api/src/static/
+apps/api/src/media/

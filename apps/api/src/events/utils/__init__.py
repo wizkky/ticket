@@ -1,0 +1,511 @@
+"""Pure utilities for the events app.
+
+Helpers in this package may be imported by both models and services — unlike
+the service layer, they must not themselves import from ``events.service``.
+Model imports are deferred to avoid circular-import issues when submodules
+(e.g. ``recurrence_validators``) are pulled in during model loading.
+"""
+
+import base64
+import mimetypes
+import typing as t
+from collections import defaultdict
+from datetime import datetime
+from io import BytesIO
+from zoneinfo import ZoneInfo
+
+import structlog
+from django.conf import settings
+from django.template.loader import render_to_string
+from django.utils import timezone
+from django.utils.dateformat import format as date_format
+
+if t.TYPE_CHECKING:
+    from accounts.models import RevelUser
+    from events import models
+    from events.models import HeldSeriesPass, Organization, OrganizationMember, Ticket
+
+logger = structlog.get_logger(__name__)
+
+# Default date format for user-facing dates: "Friday, February 6, 2026 at 7:00 PM CET"
+DEFAULT_DATE_FORMAT = "l, F j, Y \\a\\t g:i A T"
+
+
+def get_user_timezone(user: "RevelUser") -> ZoneInfo | None:
+    """Resolve the user's preferred timezone via ``general_preferences.city``.
+
+    Returns ``None`` when the user has no preferences row, no city, an empty
+    timezone, or an unrecognized timezone string. Callers should fall back to
+    the event's timezone (or UTC) when this returns ``None``.
+
+    Args:
+        user: The user whose preferences to inspect.
+
+    Returns:
+        A ``ZoneInfo`` for the user's city timezone, or ``None`` when
+        unresolved.
+    """
+    try:
+        prefs = user.general_preferences
+    except Exception:
+        return None
+    if prefs is None or getattr(prefs, "city_id", None) is None:
+        return None
+    tz_name = prefs.city.timezone if prefs.city else None
+    if not tz_name:
+        return None
+    try:
+        return ZoneInfo(tz_name)
+    except KeyError, ValueError:
+        logger.warning("invalid_timezone_for_user", user_id=user.id, timezone=tz_name)
+        return None
+
+
+def get_event_timezone(event: "models.Event") -> ZoneInfo:
+    """Get the timezone for an event based on its city.
+
+    Falls back to UTC if no city or timezone is set.
+
+    Args:
+        event: Event instance
+
+    Returns:
+        ZoneInfo for the event's timezone
+    """
+    if event.city and event.city.timezone:
+        try:
+            return ZoneInfo(event.city.timezone)
+        except KeyError:
+            logger.warning(
+                "invalid_timezone_for_city",
+                city_id=event.city.id,
+                timezone=event.city.timezone,
+            )
+    return ZoneInfo("UTC")
+
+
+def get_organization_timezone(org: "Organization") -> ZoneInfo:
+    """Return the org's city timezone, falling back to the platform default.
+
+    Args:
+        org: Organization instance.
+
+    Returns:
+        A ``ZoneInfo`` for the org's city timezone, or the platform default
+        (``settings.TIME_ZONE``) when no city or timezone is set.
+    """
+    if org.city and org.city.timezone:
+        return ZoneInfo(org.city.timezone)
+    return ZoneInfo(settings.TIME_ZONE)
+
+
+def format_event_datetime(
+    dt: datetime | None,
+    event: "models.Event",
+    fmt: str = DEFAULT_DATE_FORMAT,
+) -> str:
+    r"""Format a datetime in the event's timezone.
+
+    Args:
+        dt: Datetime to format (must be timezone-aware)
+        event: Event to get timezone from
+        fmt: Date format string (default: "l, F j, Y \a\t g:i A T")
+
+    Returns:
+        Formatted datetime string, or empty string if dt is None
+    """
+    if not dt:
+        return ""
+
+    event_tz = get_event_timezone(event)
+    # Convert the datetime to the event's timezone
+    dt_in_event_tz = dt.astimezone(event_tz)
+    # Use timezone.override to ensure Django's date_format uses the correct timezone
+    with timezone.override(event_tz):
+        return date_format(dt_in_event_tz, fmt)
+
+
+def format_organization_datetime(
+    dt: datetime | None,
+    org: "Organization",
+    fmt: str = DEFAULT_DATE_FORMAT,
+) -> str:
+    r"""Format a datetime in the organization's timezone.
+
+    Mirrors :func:`format_event_datetime` for org-scoped contexts (e.g.
+    membership-subscription notifications, #511/#542 convention: never render
+    raw UTC ISO timestamps into member-facing copy).
+
+    Args:
+        dt: Datetime to format (must be timezone-aware)
+        org: Organization to get the timezone from
+        fmt: Date format string (default: "l, F j, Y \a\t g:i A T")
+
+    Returns:
+        Formatted datetime string, or empty string if dt is None
+    """
+    if not dt:
+        return ""
+
+    org_tz = get_organization_timezone(org)
+    dt_in_org_tz = dt.astimezone(org_tz)
+    with timezone.override(org_tz):
+        return date_format(dt_in_org_tz, fmt)
+
+
+class _SafeAccessStr(str):
+    """Empty string that silently absorbs attribute and item access.
+
+    Used as the defaultdict factory for format_map so that unknown placeholders
+    — including dotted ones like {user.email} or indexed ones like {user[0]} —
+    always resolve to an empty string instead of raising AttributeError/KeyError.
+    """
+
+    def __getattr__(self, name: str) -> "_SafeAccessStr":
+        """Return an empty safe string for any attribute access."""
+        return _SafeAccessStr()
+
+    def __getitem__(self, key: object) -> "_SafeAccessStr":
+        """Return an empty safe string for any item access."""
+        return _SafeAccessStr()
+
+
+def get_invitation_message(display_name: str, event: "models.Event") -> str:
+    """Get invitation message.
+
+    If the event has a custom invitation message, render it using safe string
+    interpolation with a curated allowlist of variables. This prevents SSTI by
+    never executing event.invitation_message as a Django template.
+
+    Supported placeholders: {user_name}, {event_name}, {organization_name}, {event_date}.
+    Unknown placeholders (including dotted ones like {user.email}) resolve to an
+    empty string and never leak sensitive data.
+
+    Otherwise, use the default template.
+
+    Args:
+        display_name: The recipient's display name (user display name or email for pending invitations).
+        event: The event the invitation is for.
+    """
+    if event.invitation_message:
+        safe_context: dict[str, _SafeAccessStr] = {
+            "user_name": _SafeAccessStr(display_name),
+            "event_name": _SafeAccessStr(event.name),
+            "organization_name": _SafeAccessStr(event.organization.name),
+            "event_date": _SafeAccessStr(
+                format_event_datetime(event.start, event, fmt="F j, Y") if event.start else ""
+            ),
+        }
+        try:
+            return event.invitation_message.format_map(defaultdict(_SafeAccessStr, safe_context))
+        except ValueError, AttributeError:
+            logger.warning("invitation_message_format_error", event_id=str(event.id))
+            return event.invitation_message
+
+    context = {"display_name": display_name, "event": event}
+    return render_to_string("events/default_invitation_message.txt", context=context)
+
+
+def _get_logo_initials(name: str) -> str:
+    """Get initials from a name for logo fallback.
+
+    Args:
+        name: Name to extract initials from
+
+    Returns:
+        Up to 2 uppercase initials
+    """
+    words = name.strip().split()
+    if len(words) >= 2:
+        return f"{words[0][0]}{words[1][0]}".upper()
+    elif words:
+        return words[0][:2].upper()
+    return "??"
+
+
+def _get_branding_assets(event: "models.Event") -> tuple[t.Any | None, t.Any | None, str]:
+    """Get logo and cover_art with fallback priority: Event > EventSeries > Organization.
+
+    Prefers optimized variants (logo_thumbnail, cover_art_social) over full-resolution
+    originals to reduce PDF file size, falling back to originals if thumbnails
+    haven't been generated yet.
+
+    Args:
+        event: Event to get branding assets for
+
+    Returns:
+        Tuple of (logo_file, cover_art_file, branding_source_name)
+    """
+    logo_file = None
+    cover_art_file = None
+    branding_source_name = event.name
+
+    # Try Event first (prefer optimized variants to reduce file size)
+    if event.logo_thumbnail or event.logo:
+        logo_file = event.logo_thumbnail or event.logo
+    if event.cover_art_social or event.cover_art:
+        cover_art_file = event.cover_art_social or event.cover_art
+
+    # Try EventSeries if event doesn't have them
+    if event.event_series:
+        if not logo_file and (event.event_series.logo_thumbnail or event.event_series.logo):
+            logo_file = event.event_series.logo_thumbnail or event.event_series.logo
+            branding_source_name = event.event_series.name
+        if not cover_art_file and (event.event_series.cover_art_social or event.event_series.cover_art):
+            cover_art_file = event.event_series.cover_art_social or event.event_series.cover_art
+
+    # Try Organization as final fallback
+    if not logo_file and (event.organization.logo_thumbnail or event.organization.logo):
+        logo_file = event.organization.logo_thumbnail or event.organization.logo
+        branding_source_name = event.organization.name
+    if not cover_art_file and (event.organization.cover_art_social or event.organization.cover_art):
+        cover_art_file = event.organization.cover_art_social or event.organization.cover_art
+
+    return logo_file, cover_art_file, branding_source_name
+
+
+def apple_wallet_configured() -> bool:
+    """Whether Apple Wallet pass generation is configured server-wide.
+
+    Single source of truth for the 5-setting check, shared by
+    ``Ticket.apple_pass_available`` and the series-pass pkpass download endpoint.
+
+    Returns:
+        True if every required ``APPLE_WALLET_*`` setting is set.
+    """
+    return bool(
+        settings.APPLE_WALLET_PASS_TYPE_ID
+        and settings.APPLE_WALLET_TEAM_ID
+        and settings.APPLE_WALLET_CERT_PATH
+        and settings.APPLE_WALLET_KEY_PATH
+        and settings.APPLE_WALLET_WWDR_CERT_PATH
+    )
+
+
+def google_wallet_configured() -> bool:
+    """Whether Google Wallet save-link generation is configured server-wide.
+
+    Single source of truth, shared by ``Ticket.google_pass_available`` and the
+    series-pass save-link endpoint.
+
+    Returns:
+        True if every required ``GOOGLE_WALLET_*`` setting is set.
+    """
+    return bool(settings.GOOGLE_WALLET_ISSUER_ID and settings.GOOGLE_WALLET_SERVICE_ACCOUNT_KEY_PATH)
+
+
+def _file_to_data_uri(file_field: t.Any) -> str | None:
+    """Convert a Django FileField/ImageField to a base64 data URI.
+
+    Args:
+        file_field: Django file field to convert
+
+    Returns:
+        Data URI string or None if conversion fails
+    """
+    if not file_field:
+        return None
+
+    try:
+        file_field.open("rb")
+        file_data = file_field.read()
+        file_field.close()
+
+        # Detect MIME type from file extension
+        mime_type, _ = mimetypes.guess_type(file_field.name)
+        if not mime_type:
+            mime_type = "image/jpeg"  # Default fallback
+
+        file_base64 = base64.b64encode(file_data).decode("utf-8")
+        return f"data:{mime_type};base64,{file_base64}"
+    except Exception:
+        logger.debug("file_to_data_uri_failed", file_name=getattr(file_field, "name", None))
+        return None
+
+
+def _qr_code_base64(payload: str) -> str:
+    """Render ``payload`` as a QR code PNG, base64-encoded (no data-URI prefix).
+
+    Args:
+        payload: The raw string to encode (e.g. a ticket id or a held pass's ``qr_payload``).
+
+    Returns:
+        Base64-encoded PNG bytes. Callers needing a data URI must prefix it themselves —
+        both PDF templates already add their own ``data:image/png;base64,`` prefix.
+    """
+    import qrcode
+
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+
+    buffered = BytesIO()
+    img.save(buffered, "PNG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+
+def create_ticket_pdf(ticket: "Ticket") -> bytes:
+    """Generates a PDF version of a ticket using weasyprint.
+
+    Args:
+        ticket: The Ticket object, expected to have related event, user, tier, etc., prefetched.
+
+    Returns:
+        The PDF content as bytes.
+    """
+    from weasyprint import HTML
+
+    from events.compliance.enforcement import ticket_fields
+
+    event = ticket.event
+
+    qr_code_base64 = _qr_code_base64(str(ticket.id))
+
+    # Cover art with fallback priority: Event > EventSeries > Organization
+    _logo_file, cover_art_file, _branding_source_name = _get_branding_assets(event)
+    cover_art_data_uri = _file_to_data_uri(cover_art_file)
+
+    # Prepare context for the HTML template
+    context_data = {
+        "event_name": event.name,
+        "organization_name": event.organization.name,
+        "user_display_name": ticket.user.get_display_name(),
+        "guest_name": ticket.guest_name,
+        "tier_name": ticket.tier.name,
+        "start_datetime": format_event_datetime(event.start, event),
+        "address": event.full_address(),
+        "qr_code_base64": qr_code_base64,
+        "ticket_id": str(ticket.id),
+        "ticket_id_short": str(ticket.id)[:8].upper(),
+        "cover_art_url": cover_art_data_uri,
+        # Pending tickets get a visible marker so a downloaded PDF can't pass
+        # for a paid ticket. Cleared automatically on activation: the status
+        # flip bumps updated_at, which invalidates the cached file.
+        "is_pending": ticket.status == ticket.TicketStatus.PENDING,
+        # Venue/seating info
+        "venue_name": ticket.venue.name if ticket.venue else None,
+        "sector_name": ticket.sector.name if ticket.sector else None,
+        "seat_label": ticket.seat.label if ticket.seat else None,
+        "seat_row": ticket.seat.row_label if ticket.seat else None,
+        "seat_number": ticket.seat.number if ticket.seat else None,
+        # Fiscal lines the organizer's country policy requires (EU layer 1): organizer
+        # legal identity, price or "Free", sequential number, not-a-tax-document notice.
+        "compliance_fields": ticket_fields(ticket),
+        # Brand assets (absolute paths for WeasyPrint file:// resolution)
+        "font_dir": str(settings.BASE_DIR / "fonts"),
+        "brand_mark": str(settings.BASE_DIR / "assets" / "brand" / "revel-mark.svg"),
+    }
+
+    # Render and generate PDF
+    html_string = render_to_string("events/ticket.html", context=context_data)
+    html = HTML(string=html_string)
+    return t.cast(bytes, html.write_pdf())
+
+
+def create_series_pass_pdf(held_pass: "HeldSeriesPass") -> bytes:
+    """Generates a PDF version of a series pass using weasyprint.
+
+    Args:
+        held_pass: The HeldSeriesPass, expected to have ``series_pass`` (and its
+            ``event_series``/``organization``) and covered-event tier links
+            prefetched to avoid N+1 queries.
+
+    Returns:
+        The PDF content as bytes.
+    """
+    from weasyprint import HTML
+
+    series_pass = held_pass.series_pass
+    event_series = series_pass.event_series
+    organization = event_series.organization
+
+    # held_pass.qr_payload is the single source of truth for the check-in contract
+    # (see check_in_service.resolve_check_in_ticket_id).
+    qr_code_base64 = _qr_code_base64(held_pass.qr_payload)
+
+    links = list(series_pass.tier_links.select_related("event").order_by("event__start"))
+    covered_events = [
+        {"name": link.event.name, "start": format_event_datetime(link.event.start, link.event)} for link in links
+    ]
+
+    # Branding: a series pass has no single "event" of its own, so reuse the
+    # existing Event > EventSeries > Organization fallback keyed off the
+    # earliest covered event (all covered events share the same series).
+    if links:
+        logo_file, cover_art_file, _branding_source_name = _get_branding_assets(links[0].event)
+    else:
+        logo_file = event_series.logo_thumbnail or event_series.logo or organization.logo_thumbnail or organization.logo
+        cover_art_file = (
+            event_series.cover_art_social
+            or event_series.cover_art
+            or organization.cover_art_social
+            or organization.cover_art
+        )
+
+    logo_data_uri = _file_to_data_uri(logo_file)
+    cover_art_data_uri = _file_to_data_uri(cover_art_file)
+
+    context_data = {
+        "series_name": event_series.name,
+        "pass_name": series_pass.name,
+        "organization_name": organization.name,
+        "user_display_name": held_pass.user.get_display_name(),
+        "covered_events": covered_events,
+        "qr_code_base64": qr_code_base64,
+        "pass_id": str(held_pass.id),
+        "pass_id_short": str(held_pass.id)[:8].upper(),
+        "logo_url": logo_data_uri,
+        "cover_art_url": cover_art_data_uri,
+        "font_dir": str(settings.BASE_DIR / "fonts"),
+        "brand_mark": str(settings.BASE_DIR / "assets" / "brand" / "revel-mark.svg"),
+    }
+
+    html_string = render_to_string("events/series_pass.html", context=context_data)
+    html = HTML(string=html_string)
+    return t.cast(bytes, html.write_pdf())
+
+
+def create_membership_pdf(member: "OrganizationMember") -> bytes:
+    """Generates a PDF membership card using weasyprint.
+
+    Args:
+        member: The OrganizationMember, expected to have ``organization``,
+            ``user`` and ``tier`` select_related to avoid N+1 queries.
+
+    Returns:
+        The PDF content as bytes.
+    """
+    from weasyprint import HTML
+
+    organization = member.organization
+
+    # member.qr_payload is the single source of truth for the scan contract
+    # (see check_in_service.resolve_check_in_ticket_id / member_scan_service.scan_member_code).
+    qr_code_base64 = _qr_code_base64(member.qr_payload)
+
+    logo_file = organization.logo_thumbnail or organization.logo
+    cover_art_file = organization.cover_art_social or organization.cover_art
+
+    context_data = {
+        "organization_name": organization.name,
+        "member_name": member.user.get_display_name(),
+        "tier_name": member.tier.name if member.tier else None,
+        "member_since": format_organization_datetime(member.created_at, organization),
+        "qr_code_base64": qr_code_base64,
+        "member_id": str(member.id),
+        "member_id_short": str(member.id)[:8].upper(),
+        "logo_url": _file_to_data_uri(logo_file),
+        "cover_art_url": _file_to_data_uri(cover_art_file),
+        "font_dir": str(settings.BASE_DIR / "fonts"),
+        "brand_mark": str(settings.BASE_DIR / "assets" / "brand" / "revel-mark.svg"),
+    }
+
+    html_string = render_to_string("events/membership_card.html", context=context_data)
+    html = HTML(string=html_string)
+    return t.cast(bytes, html.write_pdf())

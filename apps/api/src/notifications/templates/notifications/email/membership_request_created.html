@@ -1,0 +1,22 @@
+{% extends "emails/base.html" %}
+{% load i18n %}
+{% block content %}
+<h2>{% trans "New Membership Request" %}</h2>
+
+<p>{% blocktranslate with name=context.requester_name org=context.organization_name %}<strong>{{ name }}</strong> has requested to join <strong>{{ org }}</strong>.{% endblocktranslate %}</p>
+
+<div class="card card--info">
+    <h3 style="margin-top: 0;">{% trans "Request Details:" %}</h3>
+    <div class="info-row"><strong>{% trans "Name:" %}</strong> {{ context.requester_name }}</div>
+    <div class="info-row"><strong>{% trans "Email:" %}</strong> {{ context.requester_email }}</div>
+    {% if context.request_message %}
+    <div class="info-row"><strong>{% trans "Message:" %}</strong><br>{{ context.request_message }}</div>
+    {% endif %}
+</div>
+
+<center>
+    <a href="{{ context.frontend_url }}" class="button">{% trans "View Request" %}</a>
+</center>
+
+<p style="color: #666; font-size: 12px;">{% trans "This is an automated notification from your organization management system." %}</p>
+{% endblock %}

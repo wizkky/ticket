@@ -1,0 +1,109 @@
+<script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
+	import type { OrganizationMemberSchema } from '$lib/api/generated/types.gen';
+	import {
+		Dialog,
+		DialogContent,
+		DialogDescription,
+		DialogFooter,
+		DialogHeader,
+		DialogTitle
+	} from '$lib/components/ui/dialog';
+	import { Button } from '$lib/components/ui/button';
+	import { UserCog, AlertCircle } from '@lucide/svelte';
+
+	interface Props {
+		member: OrganizationMemberSchema | null;
+		open: boolean;
+		onClose: () => void;
+		onConfirm: () => void;
+		isPromoting?: boolean;
+	}
+
+	const { member, open, onClose, onConfirm, isPromoting = false }: Props = $props();
+
+	// Display name
+	const displayName = $derived(
+		member
+			? member.user.preferred_name ||
+					(member.user.first_name && member.user.last_name
+						? `${member.user.first_name} ${member.user.last_name}`
+						: member.user.first_name || member.user.email || m['promoteToStaffDialog.thisMember']())
+			: m['promoteToStaffDialog.thisMember']()
+	);
+
+	function handleConfirm() {
+		onConfirm();
+	}
+
+	function handleCancel() {
+		if (!isPromoting) {
+			onClose();
+		}
+	}
+</script>
+
+<Dialog {open} onOpenChange={onClose}>
+	<DialogContent class="max-h-[90vh] max-w-md overflow-y-auto">
+		<DialogHeader>
+			<div class="flex items-center gap-3">
+				<div class="rounded-full bg-primary/10 p-3">
+					<UserCog class="h-6 w-6 text-primary" aria-hidden="true" />
+				</div>
+				<div class="flex-1">
+					<DialogTitle>{m['promoteToStaffDialog.makeStaffMember']()}</DialogTitle>
+					<DialogDescription class="mt-1">
+						{m['promoteToStaffDialog.promoteSubtitle']({ name: displayName })}
+					</DialogDescription>
+				</div>
+			</div>
+		</DialogHeader>
+
+		<div class="space-y-4 py-4">
+			<p class="text-sm text-muted-foreground">
+				{m['promoteToStaffDialog.confirmPrefix']()}
+				<strong class="font-semibold text-foreground">{displayName}</strong>
+				{m['promoteToStaffDialog.confirmSuffix']()}
+			</p>
+
+			<div class="rounded-lg border border-info bg-info/10 p-3">
+				<div class="flex gap-2">
+					<AlertCircle class="h-5 w-5 shrink-0 text-info" aria-hidden="true" />
+					<div class="text-sm">
+						<p class="font-medium text-foreground">
+							{m['promoteToStaffDialog.defaultPermissions']()}
+						</p>
+						<p class="mt-1 text-muted-foreground">
+							{m['promoteToStaffDialog.defaultPermissionsDescription']()}
+						</p>
+					</div>
+				</div>
+			</div>
+
+			<div class="space-y-2 text-sm text-muted-foreground">
+				<p class="font-medium text-foreground">{m['promoteToStaffDialog.staffMembersCan']()}</p>
+				<ul class="ml-4 list-disc space-y-1">
+					<li>{m['promoteToStaffDialog.editEvents']()}</li>
+					<li>{m['promoteToStaffDialog.checkInAttendees']()}</li>
+					<li>{m['promoteToStaffDialog.manageTickets']()}</li>
+					<li>{m['promoteToStaffDialog.invitePeople']()}</li>
+					<li>{m['promoteToStaffDialog.viewOrgDetails']()}</li>
+				</ul>
+				<p class="mt-2 text-xs">
+					{m['promoteToStaffDialog.additionalPermissionsNote']()}
+				</p>
+			</div>
+		</div>
+
+		<DialogFooter>
+			<Button variant="outline" onclick={handleCancel} disabled={isPromoting}
+				>{m['promoteToStaffDialog.cancel']()}</Button
+			>
+			<Button onclick={handleConfirm} disabled={isPromoting}>
+				{isPromoting
+					? m['promoteToStaffDialog.promoting']()
+					: m['promoteToStaffDialog.makeStaffMember']()}
+			</Button>
+		</DialogFooter>
+	</DialogContent>
+</Dialog>

@@ -1,0 +1,45 @@
+name: caudaltickets-demo
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.5-alpine@sha256:47e961a569fd52ff31f0fe205ed91eeab17d9f5fff6722e6d7ea6b588748b293
+    environment:
+      POSTGRES_DB: ${DB_NAME:?Run scripts/setup.sh first}
+      POSTGRES_USER: ${DB_USER:?Run scripts/setup.sh first}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Run scripts/setup.sh first}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-alpine-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -h 127.0.0.1 -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:v1.27@sha256:e22dce5b36f93c77082e204a3942fb6b283b7896e057458400a4c88344c3df68
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    volumes:
+      - mail-data:/data
+    environment:
+      MP_DATABASE: /data/mailpit.db
+
+volumes:
+  postgres-alpine-data:
+  redis-data:
+  mail-data:

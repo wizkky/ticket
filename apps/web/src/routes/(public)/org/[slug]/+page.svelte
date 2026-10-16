@@ -1,0 +1,750 @@
+<script lang="ts">
+	import { resolve } from '$app/paths';
+	import { page } from '$app/state';
+	import type { PageData } from './$types';
+	import {
+		MapPin,
+		Settings,
+		Calendar,
+		CalendarDays,
+		ArrowRight,
+		Repeat,
+		ArrowDownUp,
+		Send,
+		AtSign,
+		Ticket
+	} from '@lucide/svelte';
+	import Instagram from '$lib/components/icons/brand/Instagram.svelte';
+	import Facebook from '$lib/components/icons/brand/Facebook.svelte';
+	import ResourceCard from '$lib/components/resources/ResourceCard.svelte';
+	import OrgAnnouncements from '$lib/components/announcements/OrgAnnouncements.svelte';
+	import { EventCard, EventSeriesCard } from '$lib/components/events';
+	import { OrganizationDescription } from '$lib/components/organizations';
+	import { getImageUrl } from '$lib/utils/url';
+	import { createQuery } from '@tanstack/svelte-query';
+	import {
+		eventpublicdiscoveryListEvents,
+		eventseriesListEventSeries
+	} from '$lib/api/generated/sdk.gen';
+	import MembershipCta from '$lib/components/organization/membership/MembershipCta.svelte';
+	import OrgContactButton from '$lib/components/organization/OrgContactButton.svelte';
+	import ClaimMembershipButton from '$lib/components/organizations/ClaimMembershipButton.svelte';
+	import OrgMembershipInline from '$lib/components/account/OrgMembershipInline.svelte';
+	import FollowButton from '$lib/components/common/FollowButton.svelte';
+	import AnnouncementMuteButton from '$lib/components/organization/AnnouncementMuteButton.svelte';
+	import PageHeader from '$lib/components/common/PageHeader.svelte';
+	import SectionHeader from '$lib/components/common/SectionHeader.svelte';
+	import EmptyState from '$lib/components/common/EmptyState.svelte';
+	import { getPosterFallbackGradient } from '$lib/utils/fallback-gradient';
+	import { withUtmParams } from '$lib/utils/attribution';
+	import { SeoHead } from '$lib/seo';
+	import * as m from '$lib/paraglide/messages.js';
+
+	const { data }: { data: PageData } = $props();
+
+	// Create mutable copy for client-side updates
+	const organization = $state(data.organization);
+
+	// Filter state for events
+	let includePastEvents = $state(true);
+	let ticketType = $state<'ticketed' | 'free' | undefined>(undefined);
+	let eventsOrderBy = $state<'start' | '-start'>('-start'); // Newest first by default
+
+	// Pagination state
+	let eventsPage = $state(1);
+	let seriesPage = $state(1);
+	const pageSize = 6;
+
+	// Compute full image URLs
+	// Prefer thumbnail for logo display (64-80px size)
+	const logoUrl = $derived(getImageUrl(organization.logo_thumbnail_url || organization.logo));
+	const coverUrl = $derived(getImageUrl(organization.cover_art));
+
+	// Compute location display
+	const locationDisplay = $derived.by(() => {
+		if (!organization.city) return organization.address || null;
+		const cityCountry = organization.city.country
+			? `${organization.city.name}, ${organization.city.country}`
+			: organization.city.name;
+		return organization.address ? `${organization.address}, ${cityCountry}` : cityCountry;
+	});
+
+	// Check if organization has any social links
+	const hasSocialLinks = $derived(
+		organization.instagram_url ||
+			organization.facebook_url ||
+			organization.bluesky_url ||
+			organization.telegram_url
+	);
+
+	// Fallback cover, on the shared poster ramp (see utils/fallback-gradient.ts):
+	// an org, its series and its events all fall back to the same visual family.
+	const fallbackGradient = $derived(getPosterFallbackGradient(organization.id));
+
+	// Filter resources to show only those marked for display on org page
+	const displayedResources = $derived(
+		data.resources.filter((resource) => resource.display_on_organization_page)
+	);
+
+	// Fetch event series for this organization
+	const seriesQuery = createQuery(() => ({
+		queryKey: ['org-series', organization.id, seriesPage],
+		queryFn: async () => {
+			const response = await eventseriesListEventSeries({
+				query: {
+					organization: organization.id,
+					page: seriesPage,
+					page_size: pageSize
+				}
+			});
+
+			return {
+				results: response.data?.results || [],
+				count: response.data?.count || 0
+			};
+		}
+	}));
+
+	const eventSeries = $derived(seriesQuery.data?.results || []);
+	const seriesTotalCount = $derived(seriesQuery.data?.count || 0);
+	const seriesTotalPages = $derived(Math.ceil(seriesTotalCount / pageSize));
+
+	// Fetch events for this organization
+	const eventsQuery = createQuery(() => ({
+		queryKey: [
+			'org-events',
+			organization.id,
+			includePastEvents,
+			ticketType,
+			eventsOrderBy,
+			eventsPage
+		],
+		queryFn: async () => {
+			const response = await eventpublicdiscoveryListEvents({
+				query: {
+					organization: organization.id,
+					include_past: includePastEvents,
+					requires_ticket:
+						ticketType === 'ticketed' ? true : ticketType === 'free' ? false : undefined,
+					page: eventsPage,
+					page_size: pageSize,
+					order_by: eventsOrderBy
+				}
+			});
+
+			return {
+				results: response.data?.results || [],
+				count: response.data?.count || 0
+			};
+		}
+	}));
+
+	const events = $derived(eventsQuery.data?.results || []);
+	const eventsTotalCount = $derived(eventsQuery.data?.count || 0);
+	const eventsTotalPages = $derived(Math.ceil(eventsTotalCount / pageSize));
+
+	// Toggle event ordering
+	function toggleEventsOrder() {
+		eventsOrderBy = eventsOrderBy === '-start' ? 'start' : '-start';
+		eventsPage = 1; // Reset to first page
+	}
+
+	// Reset page when filter changes
+	$effect(() => {
+		// Watch includePastEvents, ticketType and eventsOrderBy
+		void includePastEvents;
+		void ticketType;
+		void eventsOrderBy;
+		eventsPage = 1;
+	});
+</script>
+
+<SeoHead config={data.seo} />
+
+<!-- `flex-col` so the tinted panel below can take `flex-1`: without it a sparse
+     org (no series, no resources, few events) leaves a bare `--background`
+     strip under the wash, which reads as an unfinished page. -->
+<div class="flex min-h-screen flex-col bg-background">
+	<!-- Hero Section with Cover Art -->
+	<section class="relative w-full overflow-hidden">
+		<!-- Cover Image or Gradient -->
+		<div class="relative h-48 w-full md:h-64 lg:h-80">
+			{#if coverUrl}
+				<!-- Blurred backdrop fills the ultra-wide strip; the real image is never cropped -->
+				<img
+					src={coverUrl}
+					alt=""
+					aria-hidden="true"
+					class="absolute inset-0 h-full w-full scale-110 object-cover blur-2xl brightness-75"
+					loading="eager"
+				/>
+				<img
+					src={coverUrl}
+					alt="{organization.name} cover"
+					class="relative h-full w-full object-contain"
+					loading="eager"
+				/>
+				<!-- Gradient overlay -->
+				<div
+					class="absolute inset-0 bg-gradient-to-b from-transparent via-poster-ink/20 to-poster-ink/60"
+				></div>
+			{:else}
+				<!-- Fallback gradient -->
+				<div class="h-full w-full bg-gradient-to-br {fallbackGradient}"></div>
+				<div class="absolute inset-0 bg-gradient-to-b from-poster-ink/10 to-poster-ink/60"></div>
+			{/if}
+		</div>
+	</section>
+
+	<!--
+		Poster ribbon (uplift, spec §9) — the event page's move, applied to the
+		other public identity page. A solid brand-purple colour block under the
+		cover, with the organization's own logo promoted OUT of the header row
+		and onto it as a tilted white sticker straddling the cut. The logo used
+		to be a 64px thumbnail beside the title; here it is the page's identity
+		mark, which is what an org profile is for.
+
+		Ribbon and sticker are mode-INERT by the imagery rule (a poster panel is
+		not a surface). No copy sits on the purple itself — the only text here is
+		the initial tile's letter, measured against the fixed values rather than
+		per-mode. The pair is registered in scripts/audit-brand-themes.py;
+		number pasted from its output:
+		  white on crimson-DEEP →  4.59:1
+		The initial tile's gradient ends on `crimson-deep`, not raw
+		`poster-crimson`: white on raw Light Crimson is 4.33:1, which fails AA
+		for the tile's bold letter — the trap app.css documents at the
+		`--poster-crimson-deep` declaration. That tile is the DEFAULT for any org
+		without a logo, not an edge case, which is also why the sticker is kept
+		here rather than delegated to `brand/LogoChip`: LogoChip renders NOTHING
+		without a logo (it is pure ornament), and this mark is not ornament.
+	-->
+	<div class="bg-poster-purple">
+		<div class="container mx-auto px-6 pb-6 md:px-8">
+			<div
+				class="-mt-8 inline-block -rotate-1 rounded-[1.25rem] bg-poster-white p-3 shadow-poster-lg"
+			>
+				{#if logoUrl}
+					<img
+						src={logoUrl}
+						alt="{organization.name} logo"
+						class="h-16 w-16 rounded-lg object-cover md:h-20 md:w-20"
+					/>
+				{:else}
+					<div
+						class="flex h-16 w-16 items-center justify-center rounded-lg bg-gradient-to-br from-poster-purple to-poster-crimson-deep text-xl font-black text-poster-white md:h-20 md:w-20 md:text-2xl"
+					>
+						{organization.name.charAt(0).toUpperCase()}
+					</div>
+				{/if}
+			</div>
+		</div>
+	</div>
+
+	<!--
+		Tinted content panel — the event detail page's wash, so an org profile and
+		the events it lists read as the same surface. Composite and therefore
+		ratios are identical to that page's. The recipe IS registered in
+		COMPOSITED_PAIRS ("public page secondary wash"), so these figures are
+		pasted from scripts/audit-brand-themes.py — never hand-computed:
+		  light — secondary@55 over background ⇒ hsl(231 88% 90%);
+		          foreground 12.36:1 · muted-foreground 6.43:1 · primary 4.97:1
+		  dark  — secondary@28 over background ⇒ hsl(246 33% 15%);
+		          foreground 15.68:1 · muted-foreground 7.44:1 · primary 6.30:1
+		Everything that lands directly on it here is covered: the h1 and section
+		headings (`foreground`), the metadata/social row and section blurbs
+		(`muted-foreground`), and the SectionHeader kickers plus the inline
+		"browse all"/"calendar" links (`primary`).
+	-->
+	<div class="flex-1 bg-secondary/55 dark:bg-secondary/[0.28]">
+		<!-- Main Content -->
+		<div class="container mx-auto px-6 py-8 md:px-8 lg:py-12">
+			<!-- Header with Name and Actions -->
+			<div class="mb-8 flex flex-col gap-6 sm:flex-row sm:items-start sm:justify-between">
+				<div class="flex flex-1 gap-4">
+					<!-- Organization Info -->
+					<div class="min-w-0 flex-1">
+						<PageHeader
+							volume="poster"
+							kicker={m['organizationProfile.kicker']()}
+							title={organization.name}
+							class="mb-2"
+						/>
+
+						<!-- Metadata Row -->
+						<div class="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+							<!-- Location -->
+							{#if locationDisplay}
+								<div class="flex items-center gap-1.5">
+									<MapPin class="h-4 w-4" aria-hidden="true" />
+									<span>{locationDisplay}</span>
+								</div>
+							{/if}
+
+							<!-- Social Links -->
+							{#if hasSocialLinks}
+								<div class="flex items-center gap-3">
+									{#if organization.instagram_url}
+										<!-- eslint-disable svelte/no-navigation-without-resolve -- external URL (off-site); not an internal route -->
+										<a
+											href={organization.instagram_url}
+											target="_blank"
+											rel="noopener noreferrer"
+											class="text-muted-foreground transition-colors hover:text-primary"
+											aria-label={m['organizationProfile.social_instagram']()}
+										>
+											<Instagram class="h-5 w-5" aria-hidden="true" />
+										</a>
+										<!-- eslint-enable svelte/no-navigation-without-resolve -->
+									{/if}
+									{#if organization.facebook_url}
+										<!-- eslint-disable svelte/no-navigation-without-resolve -- external URL (off-site); not an internal route -->
+										<a
+											href={organization.facebook_url}
+											target="_blank"
+											rel="noopener noreferrer"
+											class="text-muted-foreground transition-colors hover:text-primary"
+											aria-label={m['organizationProfile.social_facebook']()}
+										>
+											<Facebook class="h-5 w-5" aria-hidden="true" />
+										</a>
+										<!-- eslint-enable svelte/no-navigation-without-resolve -->
+									{/if}
+									{#if organization.bluesky_url}
+										<!-- eslint-disable svelte/no-navigation-without-resolve -- external URL (off-site); not an internal route -->
+										<a
+											href={organization.bluesky_url}
+											target="_blank"
+											rel="noopener noreferrer"
+											class="text-muted-foreground transition-colors hover:text-primary"
+											aria-label={m['organizationProfile.social_bluesky']()}
+										>
+											<AtSign class="h-5 w-5" aria-hidden="true" />
+										</a>
+										<!-- eslint-enable svelte/no-navigation-without-resolve -->
+									{/if}
+									{#if organization.telegram_url}
+										<!-- eslint-disable svelte/no-navigation-without-resolve -- external URL (off-site); not an internal route -->
+										<a
+											href={organization.telegram_url}
+											target="_blank"
+											rel="noopener noreferrer"
+											class="text-muted-foreground transition-colors hover:text-primary"
+											aria-label={m['organizationProfile.social_telegram']()}
+										>
+											<Send class="h-5 w-5" aria-hidden="true" />
+										</a>
+										<!-- eslint-enable svelte/no-navigation-without-resolve -->
+									{/if}
+								</div>
+							{/if}
+						</div>
+					</div>
+				</div>
+
+				<!-- Action Buttons -->
+				<div class="flex flex-shrink-0 flex-wrap gap-2">
+					<!-- Edit Button (if user has permission) -->
+					{#if data.canEdit}
+						<a
+							href={resolve('/(auth)/org/[slug]/admin/settings', { slug: organization.slug })}
+							class="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+						>
+							<Settings class="h-4 w-4" aria-hidden="true" />
+							{m['organizationProfile.editProfile']()}
+						</a>
+					{/if}
+
+					<!-- Claim Membership Button (if token present and grants membership) -->
+					{#if data.organizationTokenDetails && data.organizationTokenDetails.grants_membership && !data.isMember && !data.isOwner && !data.isStaff}
+						<ClaimMembershipButton
+							tokenId={data.organizationTokenDetails.id || ''}
+							tokenDetails={data.organizationTokenDetails}
+							class="inline-flex items-center gap-2"
+						/>
+						<!-- Membership CTA (if org accepts members and user is not a member) -->
+					{:else if organization.accept_membership_requests}
+						<MembershipCta
+							organizationSlug={organization.slug}
+							organizationName={organization.name}
+							isAuthenticated={data.isAuthenticated}
+							isMember={data.isMember}
+							membershipTier={data.membershipTier}
+							membershipStatus={data.membershipStatus}
+							isOwner={data.isOwner}
+							isStaff={data.isStaff}
+						/>
+					{/if}
+
+					<!-- Follow Button -->
+					<FollowButton
+						entityType="organization"
+						entityId={organization.slug}
+						entityName={organization.name}
+						isAuthenticated={data.isAuthenticated}
+						variant="outline"
+					/>
+
+					<AnnouncementMuteButton {organization} />
+
+					<!-- Contact Organizer Button -->
+					{#if organization.contact_method && organization.contact_method !== 'none'}
+						<OrgContactButton
+							organizationSlug={organization.slug}
+							organizationName={organization.name}
+							contactMethod={organization.contact_method}
+							contactEmail={organization.contact_email}
+							isAuthenticated={data.isAuthenticated}
+							variant="outline"
+						/>
+					{/if}
+				</div>
+			</div>
+
+			{#if data.isAuthenticated && organization.id}
+				<div class="mb-6">
+					<OrgMembershipInline
+						orgId={organization.id}
+						orgName={organization.name}
+						plans={data.membershipPlans}
+					/>
+				</div>
+			{/if}
+
+			<!-- Organization Description -->
+			<div class="mb-12">
+				<OrganizationDescription
+					description={organization.description}
+					organizationName={organization.name}
+				/>
+			</div>
+
+			<!-- Membership entry point.
+
+		     The plan grid used to live here, above the resources, series and
+		     events this page exists to show. It moved to /org/[slug]/membership
+		     (#720) — a tier can only be *chosen* there — and what is left is the
+		     pointer at it. The `id="membership"` stays so the deep links that
+		     predate the move still land on something that explains itself. -->
+			{#if organization.accept_membership_requests || data.membershipPlans.length > 0}
+				<section id="membership" aria-labelledby="membership-heading" class="mb-12">
+					<SectionHeader
+						volume="celebration"
+						id="membership-heading"
+						title={m['membershipPlans.heading']()}
+					/>
+					<p class="mt-1 text-sm text-muted-foreground">
+						{m['membershipTiers.landingBlurb']({ organizationName: organization.name })}
+					</p>
+					<a
+						href={resolve('/(public)/org/[slug]/membership', { slug: organization.slug })}
+						class="mt-3 inline-flex items-center gap-2 rounded-md border border-input bg-background px-4 py-2 text-sm font-bold transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+					>
+						{m['membershipPlans.viewMembership']()}
+						<ArrowRight class="h-4 w-4" aria-hidden="true" />
+					</a>
+				</section>
+			{/if}
+
+			<!-- Resources Section -->
+			{#if displayedResources.length > 0}
+				<section aria-labelledby="resources-heading" class="mb-12">
+					<div class="mb-6 flex items-center justify-between">
+						<div>
+							<SectionHeader
+								volume="celebration"
+								id="resources-heading"
+								title={m['organizationProfile.resources_heading']()}
+							/>
+							<p class="mt-1 text-sm text-muted-foreground">
+								{m['organizationProfile.resources_description']({
+									organizationName: organization.name
+								})}
+							</p>
+						</div>
+						<a
+							href={resolve('/(public)/org/[slug]/resources', { slug: organization.slug })}
+							class="text-sm font-bold text-primary hover:underline"
+						>
+							{m['organizationProfile.resources_viewAll']()}
+						</a>
+					</div>
+					<div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+						{#each displayedResources as resource (resource.id)}
+							<ResourceCard {resource} />
+						{/each}
+					</div>
+				</section>
+			{/if}
+
+			<!-- Event Series Section -->
+			{#if !seriesQuery.isError && (eventSeries.length > 0 || seriesQuery.isLoading)}
+				<section aria-labelledby="series-heading" class="mb-12">
+					<div class="mb-6 flex items-center justify-between">
+						<div>
+							<SectionHeader
+								volume="celebration"
+								id="series-heading"
+								title={m['organizationProfile.eventSeries_heading']()}
+							/>
+							<p class="mt-1 text-sm text-muted-foreground">
+								{m['organizationProfile.eventSeries_description']({
+									organizationName: organization.name
+								})}
+							</p>
+						</div>
+					</div>
+
+					{#if seriesQuery.isLoading}
+						<!-- Loading State -->
+						<div class="rounded-lg border-2 bg-card p-8 text-center shadow-poster">
+							<Repeat class="mx-auto mb-4 h-12 w-12 animate-pulse text-muted-foreground" />
+							<p class="text-muted-foreground">{m['organizationProfile.eventSeries_loading']()}</p>
+						</div>
+					{:else if eventSeries.length > 0}
+						<!-- Series Cards Grid -->
+						<div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+							{#each eventSeries as series (series.id)}
+								<EventSeriesCard {series} />
+							{/each}
+						</div>
+
+						<!-- Pagination -->
+						{#if seriesTotalPages > 1}
+							<div class="mt-6 flex items-center justify-center gap-2">
+								<button
+									type="button"
+									disabled={seriesPage === 1}
+									onclick={() => (seriesPage = seriesPage - 1)}
+									class="inline-flex h-10 items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50"
+								>
+									{m['common.pagination_previous']()}
+								</button>
+								<span class="text-sm text-muted-foreground">
+									{m['common.pagination_page']()}
+									{seriesPage}
+									{m['common.pagination_of']()}
+									{seriesTotalPages}
+								</span>
+								<button
+									type="button"
+									disabled={seriesPage >= seriesTotalPages}
+									onclick={() => (seriesPage = seriesPage + 1)}
+									class="inline-flex h-10 items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50"
+								>
+									{m['common.pagination_next']()}
+								</button>
+							</div>
+						{/if}
+					{/if}
+				</section>
+			{/if}
+
+			<!-- Events Section -->
+			<section aria-labelledby="events-heading" class="mb-12">
+				<div class="mb-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+					<div>
+						<SectionHeader
+							volume="celebration"
+							id="events-heading"
+							title={m['organizationProfile.events_heading']()}
+						/>
+						<p class="mt-1 text-sm text-muted-foreground">
+							{m['organizationProfile.events_description']({ organizationName: organization.name })}
+						</p>
+					</div>
+
+					<div class="flex flex-wrap items-center gap-4">
+						<!-- Filter Toggle -->
+						<div class="flex items-center gap-2">
+							<label for="include-past" class="text-sm font-bold"
+								>{m['organizationProfile.events_includePast']()}</label
+							>
+							<input
+								id="include-past"
+								type="checkbox"
+								bind:checked={includePastEvents}
+								class="h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-primary focus:ring-offset-2"
+							/>
+						</div>
+
+						<!-- Ticket Type Filter -->
+						<div class="flex items-center gap-2">
+							<Ticket class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
+							{#each [{ value: 'ticketed', label: m['filters.ticketType.ticketed']() }, { value: 'free', label: m['filters.ticketType.free']() }] as option (option.value)}
+								{@const isSelected = ticketType === option.value}
+								<button
+									type="button"
+									onclick={() =>
+										(ticketType = isSelected ? undefined : (option.value as 'ticketed' | 'free'))}
+									class="inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 {isSelected
+										? 'border-primary bg-primary text-primary-foreground hover:bg-primary/90'
+										: 'border-input bg-background hover:bg-accent hover:text-accent-foreground'}"
+									aria-pressed={isSelected}
+								>
+									{option.label}
+								</button>
+							{/each}
+						</div>
+
+						<!-- Sort Order Toggle -->
+						<button
+							type="button"
+							onclick={toggleEventsOrder}
+							class="inline-flex items-center gap-2 rounded-md border border-input bg-background px-3 py-1.5 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+							aria-label={eventsOrderBy === '-start'
+								? 'Showing newest first'
+								: 'Showing oldest first'}
+						>
+							<ArrowDownUp class="h-4 w-4" aria-hidden="true" />
+							{eventsOrderBy === '-start'
+								? m['organizationProfile.events_newestFirst']()
+								: m['organizationProfile.events_oldestFirst']()}
+						</button>
+
+						<!-- Calendar View Shortcut -->
+						<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+						<a
+							href={withUtmParams(
+								`/events?organization=${organization.id}&organization_name=${encodeURIComponent(
+									organization.name
+								)}&organization_slug=${organization.slug}&viewMode=calendar`,
+								page.url
+							)}
+							class="inline-flex items-center gap-2 text-sm font-medium text-primary hover:underline"
+						>
+							<CalendarDays class="h-4 w-4" aria-hidden="true" />
+							{m['organizationProfile.events_calendar']()}
+						</a>
+						<!-- eslint-enable svelte/no-navigation-without-resolve -->
+
+						<!-- Browse All Button -->
+						<!-- eslint-disable svelte/no-navigation-without-resolve -- resolve() validates the path; the appended query/fragment cannot be expressed through resolve() -->
+						<a
+							href={withUtmParams(
+								`/events?organization=${organization.id}&organization_name=${encodeURIComponent(
+									organization.name
+								)}&organization_slug=${organization.slug}`,
+								page.url
+							)}
+							class="inline-flex items-center gap-2 text-sm font-medium text-primary hover:underline"
+						>
+							{m['organizationProfile.events_browseAll']()}
+							<ArrowRight class="h-4 w-4" aria-hidden="true" />
+						</a>
+						<!-- eslint-enable svelte/no-navigation-without-resolve -->
+					</div>
+				</div>
+
+				{#if eventsQuery.isLoading}
+					<!-- Loading State -->
+					<div class="rounded-lg border-2 bg-card p-8 text-center shadow-poster">
+						<Calendar class="mx-auto mb-4 h-12 w-12 animate-pulse text-muted-foreground" />
+						<p class="text-muted-foreground">{m['organizationProfile.events_loading']()}</p>
+					</div>
+				{:else if eventsQuery.isError}
+					<!-- Error State. `bg-card` rather than a `bg-destructive/5` wash: the
+				     panel underneath is itself tinted now, so a second alpha would
+				     stack two composites under `text-destructive`. On card it is the
+				     audited token pair, and the doubled destructive edge carries the
+				     alarm. -->
+					<div class="rounded-lg border-2 border-destructive bg-card p-8 text-center shadow-poster">
+						<p class="font-semibold text-destructive">{m['organizationProfile.events_failed']()}</p>
+						<p class="mt-2 text-sm text-muted-foreground">
+							{m['common.errors_refreshPage']()}
+						</p>
+					</div>
+				{:else if events.length === 0}
+					<EmptyState
+						icon={Calendar}
+						title={includePastEvents
+							? m['organizationProfile.events_noEvents']()
+							: m['organizationProfile.events_noUpcoming']()}
+						body={includePastEvents
+							? m['organizationProfile.events_noEventsYet']({ organizationName: organization.name })
+							: m['organizationProfile.events_noUpcomingScheduled']({
+									organizationName: organization.name
+								})}
+					>
+						{#snippet action()}
+							{#if !includePastEvents}
+								<button
+									type="button"
+									onclick={() => (includePastEvents = true)}
+									class="text-sm font-bold text-primary hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+								>
+									{m['organizationProfile.events_viewPast']()}
+								</button>
+							{/if}
+						{/snippet}
+					</EmptyState>
+				{:else}
+					<!-- Event Cards Grid -->
+					<div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+						{#each events as event (event.id)}
+							<EventCard {event} />
+						{/each}
+					</div>
+
+					<!-- Pagination -->
+					{#if eventsTotalPages > 1}
+						<div class="mt-6 flex items-center justify-center gap-2">
+							<button
+								type="button"
+								disabled={eventsPage === 1}
+								onclick={() => (eventsPage = eventsPage - 1)}
+								class="inline-flex h-10 items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50"
+							>
+								{m['common.pagination_previous']()}
+							</button>
+							<span class="text-sm text-muted-foreground">
+								{m['common.pagination_page']()}
+								{eventsPage}
+								{m['common.pagination_of']()}
+								{eventsTotalPages}
+							</span>
+							<button
+								type="button"
+								disabled={eventsPage >= eventsTotalPages}
+								onclick={() => (eventsPage = eventsPage + 1)}
+								class="inline-flex h-10 items-center justify-center rounded-md border border-input bg-background px-4 py-2 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50"
+							>
+								{m['common.pagination_next']()}
+							</button>
+						</div>
+					{/if}
+				{/if}
+			</section>
+
+			<!-- Tags Section -->
+			{#if organization.tags && organization.tags.length > 0}
+				<section aria-labelledby="tags-heading" class="border-t pt-8">
+					<SectionHeader
+						volume="celebration"
+						id="tags-heading"
+						title={m['eventDetails.tags_heading']()}
+						class="mb-4"
+					/>
+					<!-- Tag chips: primary on the card surface with a 2px primary edge —
+				     poster stickers, not washes (mirrors the event detail page's tags
+				     section). This comment used to claim 5.3:1 for `bg-primary/10` on
+				     the `bg-secondary/55` wash; the honest composite is 4.29:1, under
+				     the 4.5:1 floor for 14px bold text. The card fill is opaque, so the
+				     audited primary-vs-card pair governs instead: 6.99:1 light /
+				     6.27:1 dark (the same pair the questionnaire option rows rest on). -->
+					<div class="flex flex-wrap gap-2">
+						{#each organization.tags as tag (tag)}
+							<span
+								class="rounded-full border-2 border-primary/40 bg-card px-3 py-1 text-sm font-bold text-primary shadow-poster"
+							>
+								{tag}
+							</span>
+						{/each}
+					</div>
+				</section>
+			{/if}
+
+			<!-- Announcements Section -->
+			<OrgAnnouncements organizationSlug={organization.slug} />
+		</div>
+	</div>
+</div>

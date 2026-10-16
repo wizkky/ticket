@@ -1,0 +1,596 @@
+"""Tests for Stripe webhook event handling."""
+
+import typing as t
+from decimal import Decimal
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+import stripe
+
+from accounts.models import RevelUser
+from events.models import Event, Organization, Payment, Refund, Ticket, TicketTier
+from events.service.stripe_webhooks import StripeEventHandler
+
+pytestmark = pytest.mark.django_db
+
+
+class TestStripeEventHandler:
+    """Test StripeEventHandler class."""
+
+    @pytest.fixture
+    def mock_stripe_event(self) -> MagicMock:
+        """
+        Creates a generic, robust mock of a Stripe webhook event
+        that can be correctly converted to a dict.
+        """
+        event_data: dict[str, t.Any] = {"id": "evt_generic", "type": "test.event", "data": {"object": {}}}
+        # Use MagicMock for more flexibility and to mock magic methods
+        mock_event = MagicMock(spec=stripe.Event)
+
+        # This is the key fix: make the mock iterable like a dict
+        mock_event.__iter__.return_value = iter(event_data.items())
+
+        # Also configure attributes for other tests to pass
+        mock_event.type = event_data["type"]
+        mock_event.data = MagicMock()
+        mock_event.data.object = event_data["data"]["object"]
+
+        return mock_event
+
+    @pytest.fixture
+    def handler(self, mock_stripe_event: MagicMock) -> StripeEventHandler:
+        """Create handler instance."""
+        return StripeEventHandler(mock_stripe_event)
+
+    @pytest.fixture
+    def paid_ticket_tier(self, event: Event) -> TicketTier:
+        """A paid ticket tier for testing."""
+        gat = event.ticket_tiers.first()
+        assert gat is not None
+        gat.price = Decimal("25.00")
+        gat.save()
+        return gat
+
+    @pytest.fixture
+    def completed_payment(
+        self,
+        event: Event,
+        paid_ticket_tier: TicketTier,
+        organization_owner_user: RevelUser,
+    ) -> Payment:
+        """Create a payment for testing webhooks."""
+        ticket = Ticket.objects.create(
+            guest_name="Test Guest",
+            event=event,
+            tier=paid_ticket_tier,
+            user=organization_owner_user,
+            status=Ticket.TicketStatus.PENDING,
+        )
+        return Payment.objects.create(
+            ticket=ticket,
+            user=organization_owner_user,
+            stripe_session_id="cs_test123",
+            amount=Decimal("25.00"),
+            platform_fee=Decimal("1.25"),
+            currency="EUR",
+            status=Payment.PaymentStatus.PENDING,
+            raw_response={},
+        )
+
+    def test_routes_known_event_to_handler(self, handler: StripeEventHandler) -> None:
+        """Test that known events are routed to appropriate handlers."""
+        # Arrange
+        handler.event.type = "checkout.session.completed"
+        with patch.object(handler, "handle_checkout_session_completed") as mock_handler:
+            # Act
+            handler.handle()
+
+            # Assert
+            mock_handler.assert_called_once_with(handler.event)
+
+    def test_routes_unknown_event_to_default_handler(
+        self,
+        handler: StripeEventHandler,
+    ) -> None:
+        """Test that unknown events are handled gracefully."""
+        # Arrange
+        handler.event.type = "unknown.event.type"  # type: ignore[assignment]
+
+        with patch.object(handler, "handle_unknown_event") as mock_handler:
+            # Act
+            handler.handle()
+
+            # Assert
+            mock_handler.assert_called_once_with(handler.event)
+
+    def test_handle_unknown_event_logs_only(
+        self,
+        handler: StripeEventHandler,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that unknown events are logged but don't raise exceptions."""
+        # Arrange
+        handler.event.type = "unknown.event.type"  # type: ignore[assignment]
+        handler.event.id = "evt_test123"
+
+        # Act
+        handler.handle_unknown_event(handler.event)
+
+        # Assert
+        assert "stripe_webhook_unhandled_event" in caplog.text
+        assert "unknown.event.type" in caplog.text
+
+    @patch("notifications.signals.notification_requested.send")
+    def test_handle_checkout_session_completed_success(
+        self,
+        mock_notification_signal: Mock,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+        django_capture_on_commit_callbacks: t.Any,
+    ) -> None:
+        """Test successful checkout session completion."""
+        # Arrange
+        mock_session_data = {
+            "id": "cs_test123",
+            "payment_status": "paid",
+            "payment_intent": "pi_test123",
+        }
+
+        # Create a dictionary representing the full event for the test
+        event_dict_data: dict[str, t.Any] = {
+            "type": "checkout.session.completed",
+            "data": {"object": mock_session_data},
+        }
+
+        # Configure the mock event to be iterable and have the correct attributes
+        handler.event.type = event_dict_data["type"]
+        handler.event.data.object = event_dict_data["data"]["object"]
+        handler.event.__iter__.return_value = iter(event_dict_data.items())  # type: ignore[attr-defined]
+
+        # Act
+        with django_capture_on_commit_callbacks(execute=True):
+            handler.handle_checkout_session_completed(handler.event)
+
+        # Assert
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.SUCCEEDED
+        assert completed_payment.stripe_payment_intent_id == "pi_test123"
+        # The assertion now works because handler.event is iterable
+        assert completed_payment.raw_response == dict(handler.event)
+
+        ticket = completed_payment.ticket
+        ticket.refresh_from_db()
+        assert ticket.status == Ticket.TicketStatus.ACTIVE
+
+        # Verify notification signals were sent
+        # We expect multiple notifications: PAYMENT_CONFIRMATION, and potentially TICKET_UPDATED/TICKET_CREATED
+        assert mock_notification_signal.called
+        from notifications.enums import NotificationType
+
+        # Check that PAYMENT_CONFIRMATION was sent
+        payment_confirmation_calls = [
+            call
+            for call in mock_notification_signal.call_args_list
+            if call.kwargs["notification_type"] == NotificationType.PAYMENT_CONFIRMATION
+        ]
+        assert len(payment_confirmation_calls) == 1
+        assert payment_confirmation_calls[0].kwargs["user"] == completed_payment.user
+
+    def test_handle_checkout_session_not_complete_is_noop(
+        self,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that a webhook for a session that is not 'complete' is ignored."""
+        # Arrange
+        mock_session_data = {"id": "cs_test123", "payment_status": "unpaid"}
+        handler.event.data.object = mock_session_data
+
+        # Act
+        handler.handle_checkout_session_completed(handler.event)
+
+        # Assert
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.PENDING  # Status remains unchanged
+
+    def test_handle_checkout_session_completed_idempotent(
+        self,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that duplicate webhooks are handled idempotently.
+
+        When a payment is already SUCCEEDED and we receive another webhook,
+        the status doesn't change and no duplicate notification is sent
+        (notifications are only sent when status changes via signal).
+        """
+        # Arrange
+        completed_payment.status = Payment.PaymentStatus.SUCCEEDED
+        completed_payment.save()
+
+        mock_session_data = {"id": "cs_test123", "payment_status": "paid"}
+        handler.event.data.object = mock_session_data
+
+        # Act
+        handler.handle_checkout_session_completed(handler.event)
+
+        # Assert - payment status remains unchanged
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.SUCCEEDED
+        assert "stripe_webhook_duplicate_payment_success" in caplog.text
+
+    def test_handle_checkout_session_completed_payment_not_found(
+        self,
+        handler: StripeEventHandler,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that missing payment is logged and handled gracefully."""
+        # Arrange
+        mock_session_data = {"id": "cs_nonexistent", "payment_status": "paid"}
+        handler.event.data.object = mock_session_data
+
+        # Act
+        handler.handle_checkout_session_completed(handler.event)
+
+        # Assert - should log warning and return without error
+        assert "stripe_session_no_payments" in caplog.text
+
+    @patch("notifications.signals.notification_requested.send")
+    def test_handle_charge_refunded_success(
+        self,
+        mock_notification_signal: Mock,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+        django_capture_on_commit_callbacks: t.Any,
+    ) -> None:
+        """Test successful refund processing."""
+        # Arrange
+        completed_payment.status = Payment.PaymentStatus.SUCCEEDED
+        completed_payment.stripe_payment_intent_id = "pi_test123"
+        completed_payment.save()
+
+        ticket = completed_payment.ticket
+        ticket.status = Ticket.TicketStatus.ACTIVE
+        ticket.save()
+
+        tier = ticket.tier
+        tier.quantity_sold = 5
+        tier.save()
+
+        # The new handler requires a `refunds` list to match payments.
+        # Branch 3 (exact-amount) will match this single payment.
+        refund_amount_cents = int(completed_payment.amount * 100)
+        mock_charge_data = {
+            "id": "ch_test123",
+            "payment_intent": "pi_test123",
+            "refunds": {"data": [{"id": "re_test", "amount": refund_amount_cents, "metadata": {}}]},
+        }
+
+        event_dict_data: dict[str, t.Any] = {"type": "charge.refunded", "data": {"object": mock_charge_data}}
+        handler.event.type = event_dict_data["type"]
+        handler.event.data.object = event_dict_data["data"]["object"]
+        handler.event.__iter__.return_value = iter(event_dict_data.items())  # type: ignore[attr-defined]
+
+        # Act - capture on_commit callbacks from signal handlers
+        with django_capture_on_commit_callbacks(execute=True):
+            handler.handle_charge_refunded(handler.event)
+
+        # Assert
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.REFUNDED
+        assert completed_payment.raw_response == dict(handler.event)
+
+        ticket.refresh_from_db()
+        assert ticket.status == Ticket.TicketStatus.ACTIVE, "refunds are record-only; the ticket stays active"
+        assert ticket.cancellation_source == ""
+
+        tier.refresh_from_db()
+        assert tier.quantity_sold == 5, "no seat may be reclaimed by a refund"
+
+        # Verify notification signal was sent to ticket holder (and potentially staff)
+        # The signal is called at least once for the ticket holder
+        # It may be called additional times for staff/owners with the preference enabled
+        assert mock_notification_signal.call_count >= 1
+
+        # Verify the first call is to the ticket holder
+        first_call_kwargs = mock_notification_signal.call_args_list[0].kwargs
+        assert first_call_kwargs["user"] == completed_payment.user
+        from notifications.enums import NotificationType
+
+        assert first_call_kwargs["notification_type"] == NotificationType.TICKET_REFUNDED
+        # Context should include refund amount
+        assert "refund_amount" in first_call_kwargs["context"]
+        assert first_call_kwargs["context"]["ticket_id"] == str(ticket.id)
+
+    def test_handle_charge_refunded_idempotent(
+        self,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that duplicate refund webhooks are handled idempotently.
+
+        The idempotency key is a SUCCEEDED ``Refund`` row carrying this exact
+        ``stripe_refund_id`` (not the legacy Payment mirror): a payment that
+        already has one is silently skipped for *this* refund id — no second
+        row, no re-application. ``stripe_refund_processed`` is still logged.
+        """
+        # Arrange — mark the payment as already fully refunded, backed by a
+        # matching SUCCEEDED Refund row (the actual idempotency anchor now).
+        completed_payment.status = Payment.PaymentStatus.REFUNDED
+        completed_payment.refund_status = Payment.RefundStatus.SUCCEEDED
+        completed_payment.stripe_refund_id = "re_dup"
+        completed_payment.stripe_payment_intent_id = "pi_test123"
+        completed_payment.save()
+        Refund.objects.create(
+            payment=completed_payment,
+            amount=completed_payment.amount,
+            currency=completed_payment.currency,
+            status=Refund.RefundStatus.SUCCEEDED,
+            stripe_refund_id="re_dup",
+            source=Refund.Source.STRIPE_DASHBOARD,
+        )
+
+        mock_charge_data = {
+            "id": "ch_test123",
+            "payment_intent": "pi_test123",
+            # Branch 1 matches via stripe_refund_id; idempotency skips mutation.
+            "refunds": {
+                "data": [
+                    {
+                        "id": "re_dup",
+                        "amount": int(completed_payment.amount * 100),
+                        "metadata": {},
+                    }
+                ]
+            },
+        }
+        handler.event.data.object = mock_charge_data
+
+        # Act
+        handler.handle_charge_refunded(handler.event)
+
+        # Assert — payment stays REFUNDED, no second mutation
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.REFUNDED
+        assert completed_payment.refund_status == Payment.RefundStatus.SUCCEEDED
+        assert Refund.objects.filter(payment=completed_payment).count() == 1, "the replay must not create a second row"
+        # The handler logs stripe_refund_processed with an empty newly_refunded list
+        assert "stripe_refund_processed" in caplog.text
+
+    def test_handle_charge_refunded_unknown_payment(
+        self,
+        handler: StripeEventHandler,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test refund webhook for unknown payment is logged."""
+        # Arrange
+        mock_charge_data = {
+            "id": "ch_test123",
+            "payment_intent": "pi_unknown",
+        }
+        handler.event.data.object = mock_charge_data
+
+        # Act
+        handler.handle_charge_refunded(handler.event)
+
+        # Assert
+        assert "stripe_refund_unknown_intent" in caplog.text
+
+    def test_handle_payment_intent_canceled_success(
+        self,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+    ) -> None:
+        """Test successful payment intent cancellation processing."""
+        # Arrange
+        completed_payment.status = Payment.PaymentStatus.PENDING
+        completed_payment.stripe_payment_intent_id = "pi_test123"
+        completed_payment.save()
+
+        ticket = completed_payment.ticket
+        ticket.status = Ticket.TicketStatus.PENDING
+        ticket.save()
+
+        tier = ticket.tier
+        tier.quantity_sold = 5
+        tier.save()
+
+        mock_payment_intent_data = {
+            "id": "pi_test123",
+            "status": "canceled",
+        }
+
+        event_dict_data: dict[str, t.Any] = {
+            "type": "payment_intent.canceled",
+            "data": {"object": mock_payment_intent_data},
+        }
+        handler.event.type = event_dict_data["type"]
+        handler.event.data.object = event_dict_data["data"]["object"]
+        handler.event.__iter__.return_value = iter(event_dict_data.items())  # type: ignore[attr-defined]
+
+        # Act
+        handler.handle_payment_intent_canceled(handler.event)
+
+        # Assert
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.FAILED
+        assert completed_payment.raw_response == dict(handler.event)
+
+        ticket.refresh_from_db()
+        assert ticket.status == Ticket.TicketStatus.CANCELLED
+
+        tier.refresh_from_db()
+        assert tier.quantity_sold == 4  # Restored from 5 to 4
+
+    def test_handle_payment_intent_canceled_non_pending_ignored(
+        self,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that payment_intent.canceled for non-pending payment is ignored."""
+        # Arrange
+        completed_payment.status = Payment.PaymentStatus.SUCCEEDED
+        completed_payment.stripe_payment_intent_id = "pi_test123"
+        completed_payment.save()
+
+        mock_payment_intent_data = {
+            "id": "pi_test123",
+            "status": "canceled",
+        }
+        handler.event.data.object = mock_payment_intent_data
+
+        # Act
+        handler.handle_payment_intent_canceled(handler.event)
+
+        # Assert
+        assert "stripe_payment_intent_canceled_no_pending" in caplog.text
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.SUCCEEDED  # Unchanged
+
+    def test_handle_payment_intent_canceled_locks_payment_rows(
+        self,
+        handler: StripeEventHandler,
+        completed_payment: Payment,
+    ) -> None:
+        """handle_payment_intent_canceled must lock its Payment selection with
+        select_for_update(of=("self",)) -- mirroring handle_charge_refunded -- so an
+        overlapping reclaim (cleanup_expired_payments, cancel_pending_checkout) on the
+        same rows serializes instead of both decrementing the tier from the same
+        unlocked snapshot. No outbound Stripe call happens in this handler, so holding
+        the lock for its duration is safe (#632)."""
+        completed_payment.status = Payment.PaymentStatus.PENDING
+        completed_payment.stripe_payment_intent_id = "pi_test123"
+        completed_payment.save()
+
+        ticket = completed_payment.ticket
+        ticket.status = Ticket.TicketStatus.PENDING
+        ticket.save()
+
+        mock_payment_intent_data = {"id": "pi_test123", "status": "canceled"}
+        handler.event.data.object = mock_payment_intent_data
+
+        original_select_for_update = Payment.objects.select_for_update
+        calls: list[tuple[t.Any, t.Any]] = []
+
+        def record_select_for_update(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            calls.append((args, kwargs))
+            return original_select_for_update(*args, **kwargs)
+
+        with patch.object(Payment.objects, "select_for_update", side_effect=record_select_for_update):
+            handler.handle_payment_intent_canceled(handler.event)
+
+        assert calls
+        assert calls[0][1] == {"of": ("self",)}
+        completed_payment.refresh_from_db()
+        assert completed_payment.status == Payment.PaymentStatus.FAILED
+
+    def test_handle_payment_intent_canceled_unknown_payment(
+        self,
+        handler: StripeEventHandler,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test payment_intent.canceled for unknown payment is logged as debug."""
+        # Arrange
+        mock_payment_intent_data = {
+            "id": "pi_unknown",
+            "status": "canceled",
+        }
+        handler.event.data.object = mock_payment_intent_data
+
+        # Act
+        handler.handle_payment_intent_canceled(handler.event)
+
+        # Assert - No error raised, just logged at debug level
+        # Note: caplog won't capture debug logs by default, but we're just checking it doesn't crash
+
+    # ---- account.updated webhook ------------------------------------------------
+
+    def test_handle_account_updated_syncs_organization(
+        self,
+        handler: StripeEventHandler,
+        organization: Organization,
+    ) -> None:
+        """Test that account.updated syncs status to the matching Organization."""
+        organization.stripe_account_id = "acct_org_test"
+        organization.save(update_fields=["stripe_account_id"])
+
+        handler.event.account = "acct_org_test"
+        handler.event.data.object = {
+            "id": "acct_org_test",
+            "charges_enabled": True,
+            "details_submitted": True,
+        }
+
+        handler.handle_account_updated(handler.event)
+
+        organization.refresh_from_db()
+        assert organization.stripe_charges_enabled is True
+        assert organization.stripe_details_submitted is True
+
+    def test_handle_account_updated_syncs_revel_user(
+        self,
+        handler: StripeEventHandler,
+        organization_owner_user: RevelUser,
+    ) -> None:
+        """Test that account.updated falls back to RevelUser when no Organization matches."""
+        organization_owner_user.stripe_account_id = "acct_user_test"
+        organization_owner_user.save(update_fields=["stripe_account_id"])
+
+        handler.event.account = "acct_user_test"
+        handler.event.data.object = {
+            "id": "acct_user_test",
+            "charges_enabled": True,
+            "details_submitted": True,
+        }
+
+        handler.handle_account_updated(handler.event)
+
+        organization_owner_user.refresh_from_db()
+        assert organization_owner_user.stripe_charges_enabled is True
+        assert organization_owner_user.stripe_details_submitted is True
+
+    def test_handle_account_updated_unknown_account_logs_warning(
+        self,
+        handler: StripeEventHandler,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Test that an unknown account ID is logged and does not raise."""
+        handler.event.account = "acct_unknown_999"
+        handler.event.data.object = {
+            "id": "acct_unknown_999",
+            "charges_enabled": True,
+            "details_submitted": True,
+        }
+
+        handler.handle_account_updated(handler.event)
+
+        assert "stripe_account_updated_unknown" in caplog.text
+
+    def test_handle_account_updated_platform_self_is_skipped(
+        self,
+        organization: Organization,
+    ) -> None:
+        """An account.updated with no event.account (platform self) must not touch the DB."""
+        organization.stripe_account_id = "acct_platform"
+        organization.save(update_fields=["stripe_account_id"])
+
+        event = stripe.Event.construct_from(
+            {
+                "id": "evt_self",
+                "object": "event",
+                "type": "account.updated",
+                "livemode": False,
+                # No "account" key: the event concerns the platform's own account.
+                "data": {"object": {"id": "acct_platform", "charges_enabled": True, "details_submitted": True}},
+            },
+            "sk_test_x",
+        )
+
+        StripeEventHandler(event).handle()
+
+        organization.refresh_from_db()
+        assert organization.stripe_charges_enabled is False, "platform-self event must not sync flags"

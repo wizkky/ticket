@@ -1,0 +1,577 @@
+# src/events/admin/organization.py
+"""Admin classes for Organization and related models."""
+
+import typing as t
+
+from django.conf import settings
+from django.contrib import admin, messages
+from django.db.models import Count, Exists, OuterRef, QuerySet, Subquery
+from django.db.models.functions import Coalesce
+from django.http import HttpRequest
+from django.urls import reverse
+from django.utils.html import format_html
+from django.utils.safestring import mark_safe
+from unfold.admin import ModelAdmin
+from unfold.contrib.filters.admin import AutocompleteSelectFilter, RangeDateFilter
+
+from common.models import STRIPE_CONNECTED_Q
+from events import models
+from events.admin.base import (
+    EventSeriesInline,
+    MembershipTierInline,
+    OrganizationLinkMixin,
+    OrganizationMemberInline,
+    OrganizationQuestionnaireInline,
+    OrganizationStaffInline,
+    UserLinkMixin,
+    VenueInline,
+)
+
+
+class StripeConnectedFilter(admin.SimpleListFilter):
+    """Filter organizations by whether Stripe Connect onboarding is complete."""
+
+    title = "Stripe connected"
+    parameter_name = "stripe_connected"
+
+    def lookups(self, request: HttpRequest, model_admin: admin.ModelAdmin) -> list[tuple[str, str]]:  # type: ignore[type-arg]
+        return [("yes", "Yes"), ("no", "No")]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> QuerySet[models.Organization]:
+        if self.value() == "yes":
+            return queryset.filter(STRIPE_CONNECTED_Q)
+        if self.value() == "no":
+            return queryset.exclude(STRIPE_CONNECTED_Q)
+        return queryset
+
+
+class HasEventsFilter(admin.SimpleListFilter):
+    """Filter organizations by whether they have at least one non-template event."""
+
+    title = "has events"
+    parameter_name = "has_events"
+
+    def lookups(self, request: HttpRequest, model_admin: admin.ModelAdmin) -> list[tuple[str, str]]:  # type: ignore[type-arg]
+        return [("yes", "Yes"), ("no", "No")]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> QuerySet[models.Organization]:
+        has_events = Exists(models.Event.objects.exclude_templates().filter(organization=OuterRef("pk")))
+        if self.value() == "yes":
+            return queryset.filter(has_events)
+        if self.value() == "no":
+            return queryset.filter(~has_events)
+        return queryset
+
+
+class VatStatusFilter(admin.SimpleListFilter):
+    """Filter organizations by VAT ID presence and VIES validation state."""
+
+    title = "VAT status"
+    parameter_name = "vat_status"
+
+    def lookups(self, request: HttpRequest, model_admin: admin.ModelAdmin) -> list[tuple[str, str]]:  # type: ignore[type-arg]
+        return [
+            ("none", "No VAT ID"),
+            ("unvalidated", "VAT ID, not validated"),
+            ("validated", "VAT ID validated"),
+        ]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> QuerySet[models.Organization]:
+        if self.value() == "none":
+            return queryset.filter(vat_id="")
+        if self.value() == "unvalidated":
+            return queryset.exclude(vat_id="").filter(vat_id_validated=False)
+        if self.value() == "validated":
+            return queryset.exclude(vat_id="").filter(vat_id_validated=True)
+        return queryset
+
+
+class AcquisitionSourceFilter(admin.SimpleListFilter):
+    """Filter organizations by the ``utm_source`` they were created through (#1075)."""
+
+    title = "acquisition source"
+    parameter_name = "utm_source"
+
+    def lookups(self, request: HttpRequest, model_admin: admin.ModelAdmin) -> list[tuple[str, str]]:  # type: ignore[type-arg]
+        sources = (
+            models.Organization.objects.filter(attribution__utm_source__isnull=False)
+            .values_list("attribution__utm_source", flat=True)
+            .distinct()
+            .order_by("attribution__utm_source")
+        )
+        return [("__direct__", "Direct (no source)"), *((s, s) for s in sources)]
+
+    def queryset(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> QuerySet[models.Organization]:
+        if self.value() == "__direct__":
+            return queryset.filter(attribution__utm_source__isnull=True)
+        if self.value():
+            return queryset.filter(attribution__utm_source=self.value())
+        return queryset
+
+
+@admin.register(models.Organization)
+class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
+    """Admin model for Organizations."""
+
+    SUPERUSER_ONLY_FIELDS: t.ClassVar[tuple[str, ...]] = (
+        "vat_id_validated",
+        "vat_id_validated_at",
+        "platform_fee_percent",
+        "platform_fee_fixed",
+        "contact_email_verified",
+    )
+
+    def get_readonly_fields(
+        self, request: HttpRequest, obj: models.Organization | None = None
+    ) -> tuple[str, ...] | list[str]:
+        readonly = tuple(super().get_readonly_fields(request, obj))
+        if not request.user.is_superuser:
+            readonly = readonly + self.SUPERUSER_ONLY_FIELDS
+            if obj is not None:
+                # Ownership transfer is superuser-only; owner stays settable on create.
+                readonly = readonly + ("owner",)
+        return readonly
+
+    list_display = [
+        "name",
+        "slug",
+        "owner_link",
+        "members_count",
+        "events_count",
+        "payments_count",
+        "stripe_connected",
+        "vat_status",
+        "visibility",
+        "acquisition_source",
+        "created_at",
+    ]
+    list_filter = [
+        StripeConnectedFilter,
+        HasEventsFilter,
+        VatStatusFilter,
+        AcquisitionSourceFilter,
+        "visibility",
+        ("created_at", RangeDateFilter),
+    ]
+    list_filter_submit = True
+    list_select_related = ["owner"]
+    search_fields = ["name", "slug", "owner__username"]
+    autocomplete_fields = ["owner", "city", "staff_members", "members"]
+    prepopulated_fields = {"slug": ("name",)}
+    readonly_fields = ["attribution"]
+    actions = ["bind_platform_stripe_account", "unbind_platform_stripe_account", "clear_stripe_connect_account"]
+
+    tabs = [
+        ("Settings", ["Settings", "Social"]),
+        ("Billing", ["Billing"]),
+        ("People", ["Staff", "Members", "Tiers"]),
+        ("Content", ["Series", "Questionnaires", "Venues"]),
+    ]
+
+    fieldsets = [
+        (
+            "Settings",
+            {
+                "fields": [
+                    "name",
+                    "slug",
+                    "owner",
+                    "description",
+                    "city",
+                    "visibility",
+                    "accept_membership_requests",
+                    "contact_email",
+                    "contact_email_verified",
+                    "attribution",
+                ],
+            },
+        ),
+        (
+            "Social",
+            {
+                "fields": [
+                    "instagram_url",
+                    "facebook_url",
+                    "bluesky_url",
+                    "telegram_url",
+                ],
+            },
+        ),
+        (
+            "Billing",
+            {
+                "fields": [
+                    "billing_name",
+                    "vat_id",
+                    "vat_country_code",
+                    "vat_rate",
+                    "vat_id_validated",
+                    "vat_id_validated_at",
+                    "billing_address",
+                    "billing_email",
+                    "platform_fee_percent",
+                    "platform_fee_fixed",
+                ],
+            },
+        ),
+    ]
+
+    inlines = [
+        OrganizationStaffInline,
+        OrganizationMemberInline,
+        MembershipTierInline,
+        EventSeriesInline,
+        OrganizationQuestionnaireInline,
+        VenueInline,
+    ]
+
+    @admin.action(description="Bind to platform Stripe account (superuser only)")
+    def bind_platform_stripe_account(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> None:
+        """Point ONE org at the platform's own Stripe account.
+
+        Connect onboarding always creates a NEW account, so the host operator
+        binds the platform account explicitly here. Webhook delivery for this
+        org rides the platform ("Your account") endpoint — see
+        docs/architecture/billing-and-vat.md.
+        """
+        if not request.user.is_superuser:
+            self.message_user(request, "Superuser required.", level=messages.ERROR)
+            return
+        # The settings default is a "test_..." placeholder; real Stripe account
+        # ids always start with acct_. Never bind a placeholder to an org.
+        if not settings.STRIPE_ACCOUNT.startswith("acct_"):
+            self.message_user(
+                request,
+                f"STRIPE_ACCOUNT is not configured ({settings.STRIPE_ACCOUNT!r} is a placeholder) — refusing to bind.",
+                level=messages.ERROR,
+            )
+            return
+        if queryset.count() != 1:
+            self.message_user(request, "Select exactly one organization.", level=messages.ERROR)
+            return
+        org = queryset.get()
+        if org.stripe_account_id:
+            self.message_user(
+                request, f"{org.slug} already has a Stripe account ({org.stripe_account_id}).", level=messages.ERROR
+            )
+            return
+        org.stripe_account_id = settings.STRIPE_ACCOUNT
+        org.stripe_charges_enabled = True
+        org.stripe_details_submitted = True
+        org.save(
+            update_fields=org._stripe_update_fields(
+                "stripe_account_id", "stripe_charges_enabled", "stripe_details_submitted"
+            )
+        )
+        self.message_user(request, f"{org.slug} bound to platform Stripe account.", level=messages.SUCCESS)
+
+    @admin.action(description="Unbind platform Stripe account (superuser only)")
+    def unbind_platform_stripe_account(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> None:
+        """Clear a platform-account binding. Refuses to touch real Connect accounts."""
+        if not request.user.is_superuser:
+            self.message_user(request, "Superuser required.", level=messages.ERROR)
+            return
+        for org in queryset:
+            if org.stripe_account_id != settings.STRIPE_ACCOUNT:
+                self.message_user(
+                    request, f"{org.slug} is not bound to the platform account — skipped.", level=messages.WARNING
+                )
+                continue
+            org.stripe_account_id = None
+            org.stripe_charges_enabled = False
+            org.stripe_details_submitted = False
+            org.save(
+                update_fields=org._stripe_update_fields(
+                    "stripe_account_id", "stripe_charges_enabled", "stripe_details_submitted"
+                )
+            )
+            self.message_user(request, f"{org.slug} unbound from platform Stripe account.", level=messages.SUCCESS)
+
+    @admin.action(description="Clear stale Stripe Connect account (superuser only)")
+    def clear_stripe_connect_account(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> None:
+        """Detach a stale Connect account so the org can re-onboard from scratch.
+
+        Nothing is deleted at Stripe — this only drops the local link. Account
+        status sync deliberately flags rather than clears the id (a misconfigured
+        platform key would otherwise wipe every live connection), so an account
+        that is genuinely gone at Stripe is unlinked here by a human.
+        """
+        if not request.user.is_superuser:
+            self.message_user(request, "Superuser required.", level=messages.ERROR)
+            return
+        cleared = 0
+        for org in queryset.exclude(stripe_account_id__isnull=True):
+            org.stripe_account_id = None
+            org.stripe_charges_enabled = False
+            org.stripe_details_submitted = False
+            org.save(
+                update_fields=org._stripe_update_fields(
+                    "stripe_account_id", "stripe_charges_enabled", "stripe_details_submitted"
+                )
+            )
+            cleared += 1
+        self.message_user(request, f"Cleared the Stripe Connect account of {cleared} organization(s).")
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[models.Organization]:
+        qs: QuerySet[models.Organization] = super().get_queryset(request)
+        # Use subqueries to avoid Cartesian product from joining both tables
+        members_subquery = (
+            models.OrganizationMember.objects.filter(organization=OuterRef("pk"))
+            .values("organization")
+            .annotate(cnt=Count("id"))
+            .values("cnt")
+        )
+        events_subquery = (
+            models.Event.objects.exclude_templates()
+            .filter(organization=OuterRef("pk"))
+            .values("organization")
+            .annotate(cnt=Count("id"))
+            .values("cnt")
+        )
+        # Successful ticket sales, reached through ticket -> event -> organization.
+        # Series-pass and membership payments live in separate tables and are not
+        # counted here; this column is "tickets sold online", not total revenue.
+        payments_subquery = (
+            models.Payment.objects.filter(
+                ticket__event__organization=OuterRef("pk"),
+                status=models.Payment.PaymentStatus.SUCCEEDED,
+            )
+            .values("ticket__event__organization")
+            .annotate(cnt=Count("id"))
+            .values("cnt")
+        )
+        return qs.annotate(
+            _members_count=Subquery(members_subquery),
+            _events_count=Subquery(events_subquery),
+            # Coalesced so orgs with no sales sort as 0 rather than clumping with NULLs.
+            _payments_count=Coalesce(Subquery(payments_subquery), 0),
+        )
+
+    def owner_link(self, obj: models.Organization) -> str:
+        return self.user_link(obj)
+
+    owner_link.short_description = "Owner"  # type: ignore[attr-defined]
+
+    @admin.display(description="Members", ordering="_members_count")
+    def members_count(self, obj: models.Organization) -> int:
+        return t.cast(int, getattr(obj, "_members_count", 0))
+
+    @admin.display(description="Events", ordering="_events_count")
+    def events_count(self, obj: models.Organization) -> int:
+        return t.cast(int, getattr(obj, "_events_count", 0))
+
+    @admin.display(description="Payments", ordering="_payments_count")
+    def payments_count(self, obj: models.Organization) -> int:
+        return t.cast(int, getattr(obj, "_payments_count", 0))
+
+    @admin.display(description="Source", ordering="attribution__utm_source")
+    def acquisition_source(self, obj: models.Organization) -> str:
+        attribution: models.TicketAttribution = obj.attribution or models.TicketAttribution()
+        return attribution.get("utm_source", "—")
+
+    @admin.display(description="Stripe", boolean=True)
+    def stripe_connected(self, obj: models.Organization) -> bool:
+        return obj.is_stripe_connected
+
+    @admin.display(description="VAT")
+    def vat_status(self, obj: models.Organization) -> str:
+        if not obj.vat_id:
+            return "—"
+        if obj.vat_id_validated:
+            icon = mark_safe('<span style="color: green;">&#10004;</span>')  # green checkmark
+        else:
+            icon = mark_safe('<span style="color: red;">&#10008;</span>')  # red cross
+        return format_html("{} {}", icon, obj.vat_id)
+
+
+@admin.register(models.OrganizationContactMessage)
+class OrganizationContactMessageAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for OrganizationContactMessage (public contact-form submissions).
+
+    Read-only: messages are user-submitted records kept for support/moderation,
+    never edited from the admin.
+    """
+
+    list_display = ["__str__", "organization_link", "sender_link", "sender_email_snapshot", "subject", "created_at"]
+    list_filter = ["created_at", ("organization", AutocompleteSelectFilter)]
+    list_filter_submit = True
+    list_select_related = ["organization", "sender"]
+    search_fields = ["organization__name", "sender_email_snapshot", "subject", "message", "sender__username"]
+    readonly_fields = [
+        "organization",
+        "sender",
+        "sender_email_snapshot",
+        "subject",
+        "message",
+        "created_at",
+        "updated_at",
+    ]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Sender")
+    def sender_link(self, obj: models.OrganizationContactMessage) -> str:
+        if not obj.sender:
+            return "—"
+        url = reverse("admin:accounts_reveluser_change", args=[obj.sender.id])
+        return format_html('<a href="{}">{}</a>', url, obj.sender.username)
+
+    def has_add_permission(self, request: HttpRequest) -> bool:
+        """Contact messages are created via the public API, never in the admin."""
+        return False
+
+
+@admin.register(models.OrganizationQuestionnaire)
+class OrganizationQuestionnaireAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
+    list_display = ["__str__", "organization_link", "questionnaire_link"]
+    list_select_related = ["organization", "questionnaire"]
+    autocomplete_fields = ["organization", "questionnaire"]
+    filter_horizontal = ["event_series", "events"]
+
+    def questionnaire_link(self, obj: models.OrganizationQuestionnaire) -> str:
+        url = reverse("admin:questionnaires_questionnaire_change", args=[obj.questionnaire.id])
+        return format_html('<a href="{}">{}</a>', url, obj.questionnaire.name)
+
+    questionnaire_link.short_description = "Questionnaire"  # type: ignore[attr-defined]
+
+
+@admin.register(models.MembershipTier)
+class MembershipTierAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for MembershipTier model."""
+
+    list_display = ["__str__", "name", "organization_link", "member_count", "created_at"]
+    list_select_related = ["organization"]
+    list_filter = [("organization", AutocompleteSelectFilter), "created_at"]
+    list_filter_submit = True
+    search_fields = ["name", "organization__name"]
+    autocomplete_fields = ["organization"]
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    def get_queryset(self, request: HttpRequest) -> QuerySet[models.MembershipTier]:
+        qs: QuerySet[models.MembershipTier] = super().get_queryset(request)
+        return qs.annotate(_member_count=Count("members"))
+
+    @admin.display(description="Members", ordering="_member_count")
+    def member_count(self, obj: models.MembershipTier) -> int:
+        return t.cast(int, getattr(obj, "_member_count", 0))
+
+
+@admin.register(models.OrganizationStaff)
+class OrganizationStaffAdmin(ModelAdmin, UserLinkMixin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for OrganizationStaff model."""
+
+    list_display = ["__str__", "user_link", "organization_link", "permissions_summary", "created_at"]
+    list_select_related = ["user", "organization"]
+    list_filter = [("organization", AutocompleteSelectFilter), "created_at"]
+    list_filter_submit = True
+    search_fields = ["user__username", "user__email", "organization__name"]
+    autocomplete_fields = ["user", "organization"]
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Permissions")
+    def permissions_summary(self, obj: models.OrganizationStaff) -> str:
+        if not obj.permissions:
+            return "None"
+        default_perms = obj.permissions.get("default", {})
+        active_perms = [k for k, v in default_perms.items() if v]
+        return ", ".join(active_perms) if active_perms else "None"
+
+
+@admin.register(models.OrganizationMember)
+class OrganizationMemberAdmin(ModelAdmin, UserLinkMixin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for OrganizationMember model."""
+
+    list_display = ["__str__", "user_link", "organization_link", "status", "tier_name", "created_at"]
+    list_select_related = ["user", "organization", "tier"]
+    list_filter = [
+        "status",
+        ("organization", AutocompleteSelectFilter),
+        ("tier", AutocompleteSelectFilter),
+        "created_at",
+    ]
+    list_filter_submit = True
+    search_fields = ["user__username", "user__email", "organization__name"]
+    autocomplete_fields = ["user", "organization", "tier"]
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Tier")
+    def tier_name(self, obj: models.OrganizationMember) -> str:
+        return obj.tier.name if obj.tier else "—"
+
+
+@admin.register(models.OrganizationMembershipRequest)
+class OrganizationMembershipRequestAdmin(ModelAdmin, UserLinkMixin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for OrganizationMembershipRequest model."""
+
+    list_display = ["__str__", "user_link", "organization_link", "status_display", "decided_by_link", "created_at"]
+    list_select_related = ["user", "organization", "decided_by"]
+    list_filter = ["status", ("organization", AutocompleteSelectFilter), "created_at"]
+    list_filter_submit = True
+    search_fields = ["user__username", "user__email", "organization__name", "message"]
+    autocomplete_fields = ["user", "organization", "decided_by"]
+    readonly_fields = ["created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Status")
+    def status_display(self, obj: models.OrganizationMembershipRequest) -> str:
+        colors: dict[t.Any, str] = {
+            models.OrganizationMembershipRequest.Status.PENDING: "orange",
+            models.OrganizationMembershipRequest.Status.APPROVED: "green",
+            models.OrganizationMembershipRequest.Status.REJECTED: "red",
+        }
+        color = colors.get(obj.status, "gray")
+        return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
+
+    @admin.display(description="Decided By")
+    def decided_by_link(self, obj: models.OrganizationMembershipRequest) -> str | None:
+        if not obj.decided_by:
+            return "—"
+        url = reverse("admin:accounts_reveluser_change", args=[obj.decided_by.id])
+        return format_html('<a href="{}">{}</a>', url, obj.decided_by.username)
+
+
+@admin.register(models.OrganizationToken)
+class OrganizationTokenAdmin(ModelAdmin, UserLinkMixin, OrganizationLinkMixin):  # type: ignore[misc]
+    """Admin for OrganizationToken model."""
+
+    list_display = [
+        "name",
+        "organization_link",
+        "issuer_link",
+        "grants_membership",
+        "grants_staff_status",
+        "tier_name",
+        "uses_display",
+        "expires_at",
+        "created_at",
+    ]
+    list_select_related = ["organization", "issuer", "membership_tier"]
+    list_filter = [
+        ("organization", AutocompleteSelectFilter),
+        "grants_membership",
+        "grants_staff_status",
+        "expires_at",
+        "created_at",
+    ]
+    list_filter_submit = True
+    search_fields = ["name", "organization__name", "issuer__username"]
+    autocomplete_fields = ["organization", "issuer", "membership_tier"]
+    readonly_fields = ["id", "created_at", "updated_at"]
+    date_hierarchy = "created_at"
+
+    @admin.display(description="Tier")
+    def tier_name(self, obj: models.OrganizationToken) -> str:
+        return obj.membership_tier.name if obj.membership_tier else "—"
+
+    @admin.display(description="Issuer")
+    def issuer_link(self, obj: models.OrganizationToken) -> str:
+        url = reverse("admin:accounts_reveluser_change", args=[obj.issuer.id])
+        return format_html('<a href="{}">{}</a>', url, obj.issuer.username)
+
+    @admin.display(description="Uses")
+    def uses_display(self, obj: models.OrganizationToken) -> str:
+        if obj.max_uses > 0:
+            return f"{obj.uses} / {obj.max_uses}"
+        return f"{obj.uses} / ∞"

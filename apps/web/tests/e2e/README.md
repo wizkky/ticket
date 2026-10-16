@@ -1,0 +1,112 @@
+# E2E Test Suite
+
+Journey-based Playwright suite derived from `revel-backend/USER_JOURNEYS.md`.
+Design: `docs/superpowers/specs/2026-07-10-e2e-test-suite-design.md` (local-only; full copy on issue #28).
+
+## Environment contract
+
+Journey specs run against a real local stack and **self-skip politely** (probe of
+`GET /api/version`) when it's absent. Regression specs (`regression/`) need only
+the built frontend.
+
+| Dependency | Where | Notes |
+| --- | --- | --- |
+| Backend | `http://localhost:8000` | `make e2e-setup` (this repo) starts it — or manually: `make run-e2e` in `revel-backend` (gunicorn + PgBouncer; plain `make run` exhausts Postgres connections at 4 workers) |
+| Reset | `uv run python src/manage.py reset_events --no-input && make seed && make bootstrap-tests` (backend repo) | Included in `make e2e-setup` — or manually: run before a full suite for determinism. Order matters: `reset_events` already re-runs `bootstrap_events` (a following `make bootstrap` fails on duplicates), and `seed` must run **before** `bootstrap-tests` — the seeder's payment/quantity sweeps are global, so seeding last would mutate the test fixtures (e.g. randomly refunding the sold-out event's tickets). The showcase seed (`make seed`) is required by the Teatro Grande specs (`getSeededBestAvailableEvent`).<br>**`reset_db → make bootstrap → make seed` is the WRONG order** and the way this has actually gone wrong: `make bootstrap` chains `bootstrap_test_events`, so a later `make seed` reaches those fixtures. `TicketSeeder._create_payments` selects `Ticket.objects.filter(tier__payment_method=ONLINE, payment__isnull=True)` with no scope at all and rolls some of them REFUNDED → ticket CANCELLED (`cancellation_source=stripe_dashboard`) + `tier.quantity_sold` decremented. Repairing a fixture after that takes BOTH halves — the `Ticket.status` rows *and* the denormalized counter |
+| Celery | inline/eager | Questionnaire auto-eval, exports, etc. complete synchronously |
+| Mailpit | `http://localhost:8025` | Captures all outbound email; override with `E2E_MAILPIT_URL` |
+| Keycloak | `http://localhost:8080` (realm `revel`, admin `admin`/`admin`) | OIDC login journeys; started by `make e2e-setup` via the backend compose overlay (backend PR #920). Specs self-skip when `/api/version` lists no `keycloak` provider. Override with `E2E_KEYCLOAK_URL` |
+| OAuth provider | backend `.env`: `OIDC_SIGNING_KEY_PATH` + `OAUTH_ISSUER=http://localhost:8000` | The `j28-oauth` journeys (14 tests across both projects) self-skip when `/api/version` reports `features.oauth_provider: false`. `OAUTH_ISSUER` must equal `API_URL` exactly (`localhost`, not `127.0.0.1`), or tokens are bound to another resource and a repeat request is not auto-approved as a prior grant |
+| Stripe | `stripe listen` forwarding to the backend | `make run-stripe` in `revel-backend` (`stripe listen --forward-to localhost:8000/api/stripe/webhook`) — **not** started by `make e2e-setup`, it stays a manual step. Backend `.env` also needs `CONNECTED_TEST_STRIPE_ID` **at bootstrap time**, or online checkout fails.<br>Without the forwarder the 12 Stripe specs **fail** (never skip — see below), and since #919 they fail *fast*: once two distinct webhook waits expire with nothing delivered, the rest of the run aborts in milliseconds instead of burning 90–150s each. Measured cost of the old behaviour: 36.5m without the forwarder vs 12.2m with it |
+| Email webhook | backend `EMAIL_WEBHOOK_SECRET=e2e-webhook-secret` | Set on the E2E daemon by `make e2e-setup` (backend `E2E_GUNICORN`, revel-backend#1045). `suppressed-address.spec.ts` posts fake provider events with it. With no secret (older backend), the webhook 404s and the spec self-skips (+4 skips over both projects). A *different* secret (401) fails loudly |
+| Frontend | `http://localhost:5173` | Started by Playwright (`pnpm build && pnpm preview`) with `PUBLIC_API_URL=http://localhost:8000` |
+
+## Running
+
+```bash
+make e2e                           # backend up + reseeded, then everything
+make e2e-setup && make e2e-run     # …as two halves; make e2e-teardown stops the backend
+pnpm test:e2e                      # everything
+pnpm test:e2e --grep @p0           # one tier (@p0–@p3)
+pnpm test:e2e --project=chromium   # desktop journeys only
+pnpm test:e2e tests/e2e/regression # CSP/FOUC guards (no backend needed)
+```
+
+## Layout
+
+- `journeys/jNN-*/` — one directory per USER_JOURNEYS.md journey; specs import
+  `{ test, expect }` from `../../support/fixtures` and tag describes `@p0`–`@p3`.
+- `regression/` — CSP + dark-mode-FOUC guards; full 5-browser matrix; plain
+  `@playwright/test`.
+- `support/` — personas, backend arrange client (`api.ts`, `factories.ts`),
+  Mailpit + Stripe helpers, backend probe.
+
+## Conventions
+
+- **Personas** (`support/personas.ts`) map to `make bootstrap` users (password
+  `password123`). Use the `asOwner`/`asMember`/… fixtures for an authenticated
+  page — each performs its own API login so every context holds a private
+  token pair. Destructive account flows register throwaway users instead.
+- **Never share a session between contexts** (e.g. via storageState files):
+  the client bootstrap ROTATES the refresh token and blacklists the old one,
+  so parallel contexts sharing a pair silently log each other out. Tests that
+  explicitly log out should own their session via a UI login (see
+  `j03-account/login-logout.spec.ts`).
+- **Arrange via API, assert via UI**: set up state with `support/api.ts` /
+  factories; only the journey under test goes through the UI.
+- **Unique names**: anything a test creates uses `uniqueName()`/`uniqueEmail()`
+  so parallel workers and repeated runs never collide. Tests don't clean up —
+  the reset command above restores determinism.
+- **Suppressing an address? Use `isolatedEmail()`**: email suppression
+  (provider bounce/complaint webhook, invitation opt-out) is keyed by the
+  normalized address, and normalization strips `+tags`. Suppressing any
+  `uniqueEmail()` address (`e2e+…@example.com`) suppresses `e2e@example.com`,
+  which is every E2E mailbox. Other suites' mail then silently stops, and the
+  row survives reseeds. `isolatedEmail()` has no `+tag`. If it happens anyway,
+  delete the `EmailSuppression` row for `e2e@example.com` in the backend shell.
+- **Suppression specs need the webhook secret**: the E2E daemon accepts
+  provider events on `/api/email-events/brevo` with the fixed secret
+  `e2e-webhook-secret` (`EMAIL_WEBHOOK_SECRET` in the backend's `E2E_GUNICORN`,
+  revel-backend#1045). If a backend lacks it (404), `suppressed-address.spec.ts`
+  skips. A different secret (401) fails.
+- **Invitation-cap spec assumes the default cap**: `invitation-cap.spec.ts`
+  sends 201 new addresses to trip `PENDING_INVITATION_DAILY_CAP` (default 200,
+  per organization per UTC day, counted in Redis, which survives reseeds).
+  The E2E backend must not override it. Each run uses a fresh organization, so
+  it has its own budget.
+- **Selectors**: `getByRole`/`getByLabel` first (the app is WCAG AA —
+  semantics identify elements); `data-testid` only as a last resort.
+- **Email**: assert through `support/mailpit.ts` with a unique recipient; never
+  "the latest message".
+- **Stripe webhooks fail, they never skip** (#919). Anything that can only
+  arrive through the `stripe listen` forwarder is awaited with
+  `expectWebhookEffect()` from `support/stripe.ts` (same `toPass` polling and
+  the same timeout as before), and tests whose arrange drives hosted checkout
+  open with `requireStripeWebhooks()`. `stripe listen` binds no local port, so
+  there is nothing to probe up front: the verdict is the forwarder's *effect*.
+  A webhook-only wait that burns its whole budget with no delivery anywhere in
+  the run files an expiry record keyed by its `description` and **rethrows its
+  own assertion error untouched**, with the forwarder attached as a report
+  annotation — one expiry cannot tell a missing forwarder apart from a UI
+  regression on that surface, so it never rules out the run on its own. Once
+  **two distinct** effects have expired that way, the run is ruled out and every
+  later Stripe test aborts immediately, listing both expiries and offering the
+  forwarder as the leading hypothesis. The first delivery writes a `delivered`
+  marker, after which the guard is inert for the rest of the run — later
+  failures surface their own assertion errors, untouched. Markers are created
+  with `wx` (never overwritten), so parallel workers cannot clobber the first
+  diagnostic, and they live in the OS temp dir keyed by `E2E_RUN_ID` (planted by
+  `support/global-setup.ts`) because Playwright spawns a **fresh worker process
+  after every failure**, so the per-worker caching `support/skip.ts` uses would
+  be discarded exactly when it matters. Corroboration is not proof: the backend
+  logs inbound events in `StripeWebhookEvent` but exposes it only through the
+  Django admin, so a staff/debug read route is what a directly *observed*
+  forwarder verdict would need. Deliberately not a skip — the payment paths are
+  the last coverage we can afford to lose silently, and the healthy skip
+  baseline stays **6**, all on mobile-chrome: 3 desktop-only `isMobile` skips,
+  the 2 chromium-only single-use referral-invite tests, and the chromium-only
+  Stripe Connect onboarding test (each run creates a real Stripe test account).
+  `j22 invoicing-mode` adds a 7th only when live VIES is down.
+  `j15 suppressed-address` adds 4 (2 tests × 2 projects) only on a backend
+  older than revel-backend#1045, which lacks the email webhook secret.
+- **Check-in**: use the QR scanner modal's manual-entry path (no camera in CI).

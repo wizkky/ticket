@@ -1,0 +1,946 @@
+import datetime
+import typing as t
+from decimal import Decimal
+
+import pytest
+from django.core.exceptions import ValidationError
+from django.utils import timezone, translation
+
+from accounts.models import RevelUser
+from events import exceptions
+from events.models import (
+    AdditionalResource,
+    DiscountCode,
+    Event,
+    EventInvitation,
+    EventRSVP,
+    EventSeries,
+    MembershipTier,
+    Organization,
+    OrganizationMember,
+    OrganizationStaff,
+    OrganizationToken,
+    ResourceVisibility,
+    Ticket,
+    TicketTier,
+)
+from events.models.organization import _validate_permissions
+
+
+@pytest.mark.django_db
+def test_organization_creation(organization_owner_user: RevelUser) -> None:
+    org = Organization.objects.create(name="Org1", slug="org1", owner=organization_owner_user)
+    assert org.name == "Org1"
+    assert org.owner == organization_owner_user
+
+
+@pytest.mark.django_db
+def test_unique_organizaion_staff_member(organization: Organization, organization_staff_user: RevelUser) -> None:
+    OrganizationStaff.objects.create(organization=organization, user=organization_staff_user)
+    with pytest.raises(ValidationError):
+        OrganizationStaff(organization=organization, user=organization_staff_user).full_clean()
+
+
+@pytest.mark.django_db
+def test_permissions_schema_validates(organization: Organization, organization_staff_user: RevelUser) -> None:
+    member = OrganizationStaff.objects.create(organization=organization, user=organization_staff_user)
+    assert member.permissions["default"]["create_event"] is False
+
+
+@pytest.mark.django_db
+def test_event_series_unique_constraint(organization: Organization) -> None:
+    EventSeries.objects.create(organization=organization, name="Series1", slug="series1")
+    with pytest.raises(ValidationError):
+        EventSeries(organization=organization, name="Series1", slug="series2").full_clean()
+
+
+@pytest.mark.django_db
+def test_event_creation(event: Event) -> None:
+    assert event.organization.name == "Org"
+    assert event.event_type == Event.EventType.PUBLIC
+
+
+@pytest.mark.django_db
+def test_event_with_organization_queryset(event: Event) -> None:
+    qs = Event.objects.with_organization()
+    p = qs.get(id=event.id)
+    assert hasattr(p.organization, "staff_members")
+
+
+@pytest.mark.django_db
+def test_event_resource_valid_file(event: Event, tmp_path: t.Any) -> None:
+    f = tmp_path / "file.txt"
+    f.write_text("content")
+    resource = AdditionalResource(
+        organization=event.organization,
+        resource_type=AdditionalResource.ResourceTypes.FILE,
+        file=f.open("rb"),
+    )
+    resource.full_clean()
+
+
+@pytest.mark.django_db
+def test_event_resource_invalid_multiple_fields(event: Event) -> None:
+    resource = AdditionalResource(
+        organization=event.organization,
+        resource_type=AdditionalResource.ResourceTypes.LINK,
+        link="https://example.com",
+        text="Should not be here",
+    )
+    with pytest.raises(exceptions.InvalidResourceStateError):
+        resource.clean()
+
+
+@pytest.mark.django_db
+def test_event_resource_missing_required_field(event: Event) -> None:
+    resource = AdditionalResource(
+        organization=event.organization,
+        resource_type=AdditionalResource.ResourceTypes.TEXT,
+        # Missing text field
+    )
+    with pytest.raises(exceptions.InvalidResourceStateError):
+        resource.clean()
+
+
+def test_validate_permissions() -> None:
+    with pytest.raises(ValidationError):
+        _validate_permissions({"foo": "bar"})
+
+
+@pytest.mark.django_db
+def test_organization_staff_has_permission(
+    organization: Organization, organization_staff_user: RevelUser, event: Event
+) -> None:
+    # Create a staff member with specific permissions
+    staff = OrganizationStaff.objects.create(
+        organization=organization,
+        user=organization_staff_user,
+        permissions={
+            "default": {
+                "edit_organization": True,
+                "create_event": False,
+            },
+            "event_overrides": {
+                str(event.id): {
+                    "edit_event": True,
+                    "delete_event": False,
+                }
+            },
+        },
+    )
+
+    # Test default permissions
+    assert staff.has_permission("edit_organization") is True
+    assert staff.has_permission("create_event") is False
+    assert staff.has_permission("non_existent_permission") is False
+
+    # Test event-specific permissions
+    assert staff.has_permission("edit_event", str(event.id)) is True
+    assert staff.has_permission("delete_event", str(event.id)) is False
+    assert staff.has_permission("non_existent_permission", str(event.id)) is False
+
+    # Test with non-existent event_id
+    assert staff.has_permission("edit_event", "non-existent-id") is False
+
+
+@pytest.mark.django_db
+def test_event_save_preserves_explicit_end_date(organization: Organization) -> None:
+    """Test that Event.save() preserves explicitly set end date."""
+
+    start_time = timezone.make_aware(datetime.datetime(2024, 3, 15, 14, 30))  # 2:30 PM
+    end_time = timezone.make_aware(datetime.datetime(2024, 3, 15, 18, 0))  # 6:00 PM same day
+
+    event = Event.objects.create(organization=organization, name="Test Event", start=start_time, end=end_time)
+
+    # Check that explicitly set end date is preserved
+    assert event.end == end_time
+
+
+@pytest.mark.django_db
+def test_event_open_ended_defaults_and_horizon(organization: Organization) -> None:
+    """is_open_ended defaults to False; an open-ended event still gets an internal end horizon."""
+    start_time = timezone.make_aware(datetime.datetime(2024, 3, 15, 14, 30))
+
+    default_event = Event.objects.create(organization=organization, name="Default", start=start_time, end=start_time)
+    assert default_event.is_open_ended is False
+
+    open_ended = Event.objects.create(
+        organization=organization, name="Open Ended", start=start_time, is_open_ended=True
+    )
+    assert open_ended.is_open_ended is True
+    # `end` is left as an operational horizon (start + 24h) even when open-ended.
+    assert open_ended.end == start_time + datetime.timedelta(days=1)
+
+
+@pytest.mark.django_db
+def test_event_ics_generation(event: Event) -> None:
+    """Test that Event.ics() generates valid iCalendar content."""
+    ics_content = event.ics()
+
+    # Should return bytes
+    assert isinstance(ics_content, bytes)
+
+    # Convert to string for content checks
+    ics_str = ics_content.decode("utf-8")
+
+    # Should contain iCalendar headers
+    assert "BEGIN:VCALENDAR" in ics_str
+    assert "END:VCALENDAR" in ics_str
+    assert "BEGIN:VEVENT" in ics_str
+    assert "END:VEVENT" in ics_str
+
+    # Should contain event details
+    assert event.name in ics_str
+    assert f"UID:{event.id}@letsrevel.io" in ics_str
+
+
+@pytest.mark.django_db
+def test_event_ics_with_address(organization: Organization) -> None:
+    """Test that Event.ics() includes address when available."""
+    event = Event.objects.create(
+        organization=organization, name="Test Event", start=timezone.now(), address="123 Test Street"
+    )
+
+    ics_content = event.ics()
+    ics_str = ics_content.decode("utf-8")
+
+    # Should include the address
+    assert "123 Test Street" in ics_str
+
+
+@pytest.mark.django_db
+def test_event_ics_with_city_no_address(organization: Organization) -> None:
+    """Test that Event.ics() uses city name when no address is provided."""
+    from geo.models import City
+
+    # Create a city for the test
+    city = City.objects.first()
+    assert city is not None
+
+    event = Event.objects.create(organization=organization, name="Test Event", start=timezone.now(), city=city)
+
+    ics_content = event.ics()
+    ics_str = ics_content.decode("utf-8")
+
+    # Should include the city name
+    assert city.name in ics_str
+
+
+@pytest.mark.django_db
+def test_event_ics_no_location(organization: Organization) -> None:
+    """Test that Event.ics() handles events with no location information."""
+    event = Event.objects.create(organization=organization, name="Test Event", start=timezone.now())
+
+    ics_content = event.ics()
+    ics_str = ics_content.decode("utf-8")
+
+    # Should include fallback text
+    assert "See event details" in ics_str
+
+
+@pytest.mark.django_db
+def test_organization_member_tier_validation_success(
+    organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that OrganizationMember.clean() passes when tier belongs to same organization."""
+    tier = MembershipTier.objects.create(organization=organization, name="Gold")
+    member = OrganizationMember(organization=organization, user=organization_owner_user, tier=tier)
+
+    # Should not raise any exception
+    member.full_clean()
+
+
+@pytest.mark.django_db
+def test_organization_member_tier_validation_fails_wrong_organization(
+    organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that OrganizationMember.clean() fails when tier belongs to different organization."""
+    other_org = Organization.objects.create(name="Other Org", slug="other-org", owner=organization_owner_user)
+    tier = MembershipTier.objects.create(organization=other_org, name="Gold")
+    member = OrganizationMember(organization=organization, user=organization_owner_user, tier=tier)
+
+    with pytest.raises(ValidationError) as exc_info:
+        member.full_clean()
+
+    assert "tier" in exc_info.value.message_dict
+    assert "must belong to the same organization" in str(exc_info.value.message_dict["tier"])
+
+
+@pytest.mark.django_db
+def test_organization_member_tier_can_be_null(organization: Organization, organization_owner_user: RevelUser) -> None:
+    """Test that OrganizationMember can have no tier assigned (tier=None)."""
+    member = OrganizationMember(organization=organization, user=organization_owner_user, tier=None)
+
+    # Should not raise any exception
+    member.full_clean()
+    member.save()
+    assert member.tier is None
+
+
+@pytest.mark.django_db
+def test_organization_token_requires_tier_when_granting_membership(
+    organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that OrganizationToken requires membership_tier when grants_membership is True."""
+    token = OrganizationToken(
+        organization=organization,
+        issuer=organization_owner_user,
+        grants_membership=True,
+        membership_tier=None,  # Missing tier
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        token.full_clean()
+
+    assert "membership_tier" in exc_info.value.message_dict
+    assert "required when granting membership" in str(exc_info.value.message_dict["membership_tier"])
+
+
+@pytest.mark.django_db
+def test_organization_token_tier_must_match_organization(
+    organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that membership_tier must belong to the same organization as the token."""
+    other_org = Organization.objects.create(name="Other Org", slug="other-org", owner=organization_owner_user)
+    other_tier = MembershipTier.objects.create(organization=other_org, name="Other Tier")
+
+    token = OrganizationToken(
+        organization=organization,
+        issuer=organization_owner_user,
+        grants_membership=True,
+        membership_tier=other_tier,  # Tier from different organization
+    )
+
+    with pytest.raises(ValidationError) as exc_info:
+        token.full_clean()
+
+    assert "membership_tier" in exc_info.value.message_dict
+    assert "must belong to the same organization" in str(exc_info.value.message_dict["membership_tier"])
+
+
+@pytest.mark.django_db
+def test_organization_token_valid_with_tier(organization: Organization, organization_owner_user: RevelUser) -> None:
+    """Test that OrganizationToken validates successfully with correct tier."""
+    tier = MembershipTier.objects.create(organization=organization, name="Gold")
+
+    token = OrganizationToken(
+        organization=organization,
+        issuer=organization_owner_user,
+        grants_membership=True,
+        membership_tier=tier,
+    )
+
+    # Should not raise any exception
+    token.full_clean()
+    token.save()
+    assert token.membership_tier == tier
+
+
+@pytest.mark.django_db
+def test_organization_token_tier_optional_when_not_granting_membership(
+    organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that membership_tier is optional when grants_membership is False."""
+    token = OrganizationToken(
+        organization=organization,
+        issuer=organization_owner_user,
+        grants_membership=False,
+        grants_staff_status=True,
+        membership_tier=None,
+    )
+
+    # Should not raise any exception
+    token.full_clean()
+    token.save()
+    assert token.membership_tier is None
+
+
+# --- Tests for SlugFromNameMixin slug collision handling ---
+
+
+@pytest.mark.django_db
+def test_event_slug_auto_generated(organization: Organization) -> None:
+    """Test that slug is auto-generated from name."""
+    event = Event.objects.create(
+        organization=organization,
+        name="My Test Event",
+        start=timezone.now(),
+    )
+    assert event.slug == "my-test-event"
+
+
+@pytest.mark.django_db
+def test_event_slug_collision_appends_date(organization: Organization) -> None:
+    """Test that slug collision appends the event start date."""
+    event1 = Event.objects.create(
+        organization=organization,
+        name="Weekly Reading Circle",
+        start=timezone.now(),
+    )
+    assert event1.slug == "weekly-reading-circle"
+
+    # Create second event with same name but different date - should get date suffix
+    next_week = timezone.now() + datetime.timedelta(days=7)
+    event2 = Event.objects.create(
+        organization=organization,
+        name="Weekly Reading Circle",
+        start=next_week,
+    )
+    expected_date = next_week.strftime("%Y-%m-%d")
+    assert event2.slug == f"weekly-reading-circle-{expected_date}"
+
+
+@pytest.mark.django_db
+def test_event_slug_collision_different_organizations(
+    organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Test that same slug can exist in different organizations."""
+    org2 = Organization.objects.create(
+        name="Another Org",
+        slug="another-org",
+        owner=organization_owner_user,
+    )
+
+    event1 = Event.objects.create(
+        organization=organization,
+        name="Weekly Reading Circle",
+        start=timezone.now(),
+    )
+    assert event1.slug == "weekly-reading-circle"
+
+    # Same name in different org should get same slug (no collision)
+    event2 = Event.objects.create(
+        organization=org2,
+        name="Weekly Reading Circle",
+        start=timezone.now(),
+    )
+    assert event2.slug == "weekly-reading-circle"
+
+
+@pytest.mark.django_db
+def test_event_slug_preserved_on_update(organization: Organization) -> None:
+    """Test that existing slug is preserved when updating an event."""
+    event = Event.objects.create(
+        organization=organization,
+        name="Original Name",
+        start=timezone.now(),
+    )
+    original_slug = event.slug
+
+    # Update the name
+    event.name = "New Name"
+    event.save()
+
+    # Slug should not change
+    event.refresh_from_db()
+    assert event.slug == original_slug
+
+
+@pytest.mark.django_db
+def test_event_explicit_slug_preserved(organization: Organization) -> None:
+    """Test that explicitly provided slug is not overwritten."""
+    event = Event.objects.create(
+        organization=organization,
+        name="My Event",
+        slug="custom-slug",
+        start=timezone.now(),
+    )
+    assert event.slug == "custom-slug"
+
+
+@pytest.mark.django_db
+def test_event_slug_collision_date_then_random(organization: Organization) -> None:
+    """Test that same name + same date falls back to date + random suffix."""
+    start = timezone.now()
+    date_str = start.strftime("%Y-%m-%d")
+
+    event1 = Event.objects.create(
+        organization=organization,
+        name="Weekly Reading Circle",
+        start=start,
+    )
+    assert event1.slug == "weekly-reading-circle"
+
+    # Same name, same date → date suffix
+    event2 = Event.objects.create(
+        organization=organization,
+        name="Weekly Reading Circle",
+        start=start,
+    )
+    assert event2.slug == f"weekly-reading-circle-{date_str}"
+
+    # Third event, same name, same date → date + random suffix
+    event3 = Event.objects.create(
+        organization=organization,
+        name="Weekly Reading Circle",
+        start=start,
+    )
+    assert event3.slug.startswith(f"weekly-reading-circle-{date_str}-")
+    assert len(event3.slug) == len(f"weekly-reading-circle-{date_str}-") + 5
+
+
+@pytest.mark.django_db
+def test_event_multiple_collisions(organization: Organization) -> None:
+    """Test that multiple events with same name all get unique slugs."""
+    start = timezone.now()
+    events = []
+    for i in range(5):
+        event = Event.objects.create(
+            organization=organization,
+            name="Recurring Event",
+            start=start,
+        )
+        events.append(event)
+
+    # All slugs should be unique
+    slugs = [e.slug for e in events]
+    assert len(slugs) == len(set(slugs))
+
+    # First one should be base slug
+    assert events[0].slug == "recurring-event"
+
+    # Rest should have suffixes
+    for event in events[1:]:
+        assert event.slug.startswith("recurring-event-")
+
+
+# --- Tests for Event.can_user_see_address ---
+
+
+class TestCanUserSeeAddress:
+    """Tests for the Event.can_user_see_address() method."""
+
+    @pytest.fixture
+    def event_with_address(self, organization: Organization) -> Event:
+        """An event with an address configured."""
+        return Event.objects.create(
+            organization=organization,
+            name="Event With Address",
+            start=timezone.now(),
+            address="123 Test Street",
+            visibility_settings={"address_visibility": ResourceVisibility.PUBLIC},
+        )
+
+    @pytest.fixture
+    def ticket_tier(self, event_with_address: Event) -> TicketTier:
+        """A ticket tier for the event."""
+        return TicketTier.objects.create(event=event_with_address, name="General")
+
+    # --- PUBLIC visibility tests ---
+
+    @pytest.mark.django_db
+    def test_public_visibility_anonymous_user_can_see(
+        self, event_with_address: Event, django_user_model: type[RevelUser]
+    ) -> None:
+        """Anonymous users can see address when visibility is PUBLIC."""
+        from django.contrib.auth.models import AnonymousUser
+
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PUBLIC}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(AnonymousUser()) is True
+
+    @pytest.mark.django_db
+    def test_public_visibility_authenticated_user_can_see(
+        self, event_with_address: Event, nonmember_user: RevelUser
+    ) -> None:
+        """Authenticated users can see address when visibility is PUBLIC."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PUBLIC}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(nonmember_user) is True
+
+    # --- PRIVATE visibility tests ---
+
+    @pytest.mark.django_db
+    def test_private_visibility_anonymous_user_cannot_see(self, event_with_address: Event) -> None:
+        """Anonymous users cannot see address when visibility is PRIVATE."""
+        from django.contrib.auth.models import AnonymousUser
+
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PRIVATE}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(AnonymousUser()) is False
+
+    @pytest.mark.django_db
+    def test_private_visibility_user_without_relationship_cannot_see(
+        self, event_with_address: Event, nonmember_user: RevelUser
+    ) -> None:
+        """Users without relationship to event cannot see address when visibility is PRIVATE."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PRIVATE}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_private_visibility_invited_user_can_see(
+        self, event_with_address: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        """Invited users can see address when visibility is PRIVATE."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PRIVATE}
+        event_with_address.save()
+
+        invitation = EventInvitation.objects.create(user=nonmember_user, event=event_with_address)
+        invitation.tiers.add(ticket_tier)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is True
+
+    @pytest.mark.django_db
+    def test_private_visibility_ticket_holder_can_see(
+        self, event_with_address: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        """Ticket holders can see address when visibility is PRIVATE."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PRIVATE}
+        event_with_address.save()
+
+        Ticket.objects.create(guest_name="Test Guest", user=nonmember_user, event=event_with_address, tier=ticket_tier)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is True
+
+    @pytest.mark.django_db
+    def test_private_visibility_rsvp_yes_can_see(self, event_with_address: Event, nonmember_user: RevelUser) -> None:
+        """Users with YES RSVP can see address when visibility is PRIVATE."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PRIVATE}
+        event_with_address.save()
+
+        EventRSVP.objects.create(user=nonmember_user, event=event_with_address, status=EventRSVP.RsvpStatus.YES)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is True
+
+    @pytest.mark.django_db
+    def test_private_visibility_rsvp_no_cannot_see(self, event_with_address: Event, nonmember_user: RevelUser) -> None:
+        """Users with NO RSVP cannot see address when visibility is PRIVATE."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PRIVATE}
+        event_with_address.save()
+
+        EventRSVP.objects.create(user=nonmember_user, event=event_with_address, status=EventRSVP.RsvpStatus.NO)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is False
+
+    # --- MEMBERS_ONLY visibility tests ---
+
+    @pytest.mark.django_db
+    def test_members_only_visibility_non_member_cannot_see(
+        self, event_with_address: Event, nonmember_user: RevelUser
+    ) -> None:
+        """Non-members cannot see address when visibility is MEMBERS_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.MEMBERS_ONLY}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_members_only_visibility_member_can_see(
+        self, event_with_address: Event, member_user: RevelUser, organization_membership: OrganizationMember
+    ) -> None:
+        """Organization members can see address when visibility is MEMBERS_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.MEMBERS_ONLY}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(member_user) is True
+
+    # --- STAFF_ONLY visibility tests ---
+
+    @pytest.mark.django_db
+    def test_staff_only_visibility_non_staff_cannot_see(
+        self, event_with_address: Event, nonmember_user: RevelUser
+    ) -> None:
+        """Non-staff users cannot see address when visibility is STAFF_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.STAFF_ONLY}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_staff_only_visibility_member_cannot_see(
+        self, event_with_address: Event, member_user: RevelUser, organization_membership: OrganizationMember
+    ) -> None:
+        """Regular members cannot see address when visibility is STAFF_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.STAFF_ONLY}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(member_user) is False
+
+    @pytest.mark.django_db
+    def test_staff_only_visibility_staff_can_see(
+        self, event_with_address: Event, organization_staff_user: RevelUser, staff_member: OrganizationStaff
+    ) -> None:
+        """Staff members can see address when visibility is STAFF_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.STAFF_ONLY}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(organization_staff_user) is True
+
+    @pytest.mark.django_db
+    def test_staff_only_visibility_owner_can_see(
+        self, event_with_address: Event, organization_owner_user: RevelUser
+    ) -> None:
+        """Organization owners can see address when visibility is STAFF_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.STAFF_ONLY}
+        event_with_address.save()
+
+        assert event_with_address.can_user_see_address(organization_owner_user) is True
+
+    # --- ATTENDEES_ONLY visibility tests ---
+
+    @pytest.mark.django_db
+    def test_attendees_only_visibility_invited_only_cannot_see(
+        self, event_with_address: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        """Users with only invitation (no ticket/RSVP) cannot see address when visibility is ATTENDEES_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.ATTENDEES_ONLY}
+        event_with_address.save()
+
+        invitation = EventInvitation.objects.create(user=nonmember_user, event=event_with_address)
+        invitation.tiers.add(ticket_tier)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_attendees_only_visibility_ticket_holder_can_see(
+        self, event_with_address: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        """Ticket holders can see address when visibility is ATTENDEES_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.ATTENDEES_ONLY}
+        event_with_address.save()
+
+        Ticket.objects.create(guest_name="Test Guest", user=nonmember_user, event=event_with_address, tier=ticket_tier)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is True
+
+    @pytest.mark.django_db
+    def test_attendees_only_visibility_rsvp_yes_can_see(
+        self, event_with_address: Event, nonmember_user: RevelUser
+    ) -> None:
+        """Users with YES RSVP can see address when visibility is ATTENDEES_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.ATTENDEES_ONLY}
+        event_with_address.save()
+
+        EventRSVP.objects.create(user=nonmember_user, event=event_with_address, status=EventRSVP.RsvpStatus.YES)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is True
+
+    @pytest.mark.django_db
+    def test_attendees_only_visibility_rsvp_maybe_cannot_see(
+        self, event_with_address: Event, nonmember_user: RevelUser
+    ) -> None:
+        """Users with MAYBE RSVP cannot see address when visibility is ATTENDEES_ONLY."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.ATTENDEES_ONLY}
+        event_with_address.save()
+
+        EventRSVP.objects.create(user=nonmember_user, event=event_with_address, status=EventRSVP.RsvpStatus.MAYBE)
+
+        assert event_with_address.can_user_see_address(nonmember_user) is False
+
+    # --- Cancelled ticket tests ---
+
+    @pytest.mark.django_db
+    def test_cancelled_ticket_does_not_grant_access(
+        self, event_with_address: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        """Cancelled tickets do not grant access to address."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.PRIVATE}
+        event_with_address.save()
+
+        Ticket.objects.create(
+            guest_name="Test Guest",
+            user=nonmember_user,
+            event=event_with_address,
+            tier=ticket_tier,
+            status=Ticket.TicketStatus.CANCELLED,
+        )
+
+        assert event_with_address.can_user_see_address(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_pending_ticket_grants_access(
+        self, event_with_address: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        """Pending tickets grant access to address."""
+        event_with_address.visibility_settings = {"address_visibility": ResourceVisibility.ATTENDEES_ONLY}
+        event_with_address.save()
+
+        Ticket.objects.create(
+            guest_name="Test Guest",
+            user=nonmember_user,
+            event=event_with_address,
+            tier=ticket_tier,
+            status=Ticket.TicketStatus.PENDING,
+        )
+
+        assert event_with_address.can_user_see_address(nonmember_user) is True
+
+    # --- Superuser/staff tests ---
+
+    @pytest.mark.django_db
+    def test_superuser_can_always_see_address(
+        self, event_with_address: Event, django_user_model: type[RevelUser]
+    ) -> None:
+        """Superusers can always see address regardless of visibility setting."""
+        superuser = django_user_model.objects.create_superuser(
+            username="superuser", email="super@example.com", password="pass"
+        )
+
+        for visibility in ResourceVisibility:
+            event_with_address.visibility_settings = {"address_visibility": visibility}
+            event_with_address.save()
+            assert event_with_address.can_user_see_address(superuser) is True, f"Failed for {visibility}"
+
+    @pytest.mark.django_db
+    def test_django_staff_can_always_see_address(
+        self, event_with_address: Event, django_user_model: type[RevelUser]
+    ) -> None:
+        """Django staff users can always see address regardless of visibility setting."""
+        staff_user = django_user_model.objects.create_user(
+            username="djangostaff", email="staff@example.com", password="pass", is_staff=True
+        )
+
+        for visibility in ResourceVisibility:
+            event_with_address.visibility_settings = {"address_visibility": visibility}
+            event_with_address.save()
+            assert event_with_address.can_user_see_address(staff_user) is True, f"Failed for {visibility}"
+
+    # --- Staff and owner hierarchy tests ---
+
+    @pytest.mark.django_db
+    def test_owner_can_see_all_visibility_levels(
+        self, event_with_address: Event, organization_owner_user: RevelUser
+    ) -> None:
+        """Organization owners can see address for all visibility levels."""
+        for visibility in ResourceVisibility:
+            event_with_address.visibility_settings = {"address_visibility": visibility}
+            event_with_address.save()
+            assert event_with_address.can_user_see_address(organization_owner_user) is True, f"Failed for {visibility}"
+
+    @pytest.mark.django_db
+    def test_staff_can_see_all_visibility_levels(
+        self, event_with_address: Event, organization_staff_user: RevelUser, staff_member: OrganizationStaff
+    ) -> None:
+        """Organization staff can see address for all visibility levels."""
+        for visibility in ResourceVisibility:
+            event_with_address.visibility_settings = {"address_visibility": visibility}
+            event_with_address.save()
+            assert event_with_address.can_user_see_address(organization_staff_user) is True, f"Failed for {visibility}"
+
+
+# --- Tests for Event.can_user_see_cancellation_reason ---
+
+
+class TestCanUserSeeCancellationReason:
+    """Tests for the Event.can_user_see_cancellation_reason() method."""
+
+    @pytest.fixture
+    def cancelled_event(self, organization: Organization) -> Event:
+        """A cancelled event carrying a reason."""
+        return Event.objects.create(
+            organization=organization,
+            name="Cancelled Event",
+            start=timezone.now(),
+            status=Event.EventStatus.CANCELLED,
+            cancellation_reason="Venue flooded",
+        )
+
+    @pytest.fixture
+    def ticket_tier(self, cancelled_event: Event) -> TicketTier:
+        return TicketTier.objects.create(event=cancelled_event, name="General")
+
+    @pytest.mark.django_db
+    def test_anonymous_cannot_see(self, cancelled_event: Event) -> None:
+        from django.contrib.auth.models import AnonymousUser
+
+        assert cancelled_event.can_user_see_cancellation_reason(AnonymousUser()) is False
+
+    @pytest.mark.django_db
+    def test_unrelated_user_cannot_see(self, cancelled_event: Event, nonmember_user: RevelUser) -> None:
+        assert cancelled_event.can_user_see_cancellation_reason(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_invited_only_user_cannot_see(
+        self, cancelled_event: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        """A merely-invited user (no ticket/RSVP) does NOT qualify — unlike PRIVATE address."""
+        invitation = EventInvitation.objects.create(user=nonmember_user, event=cancelled_event)
+        invitation.tiers.add(ticket_tier)
+
+        assert cancelled_event.can_user_see_cancellation_reason(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_ticket_holder_can_see(
+        self, cancelled_event: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        Ticket.objects.create(guest_name="Guest", user=nonmember_user, event=cancelled_event, tier=ticket_tier)
+
+        assert cancelled_event.can_user_see_cancellation_reason(nonmember_user) is True
+
+    @pytest.mark.django_db
+    def test_cancelled_ticket_holder_cannot_see(
+        self, cancelled_event: Event, nonmember_user: RevelUser, ticket_tier: TicketTier
+    ) -> None:
+        Ticket.objects.create(
+            guest_name="Guest",
+            user=nonmember_user,
+            event=cancelled_event,
+            tier=ticket_tier,
+            status=Ticket.TicketStatus.CANCELLED,
+        )
+
+        assert cancelled_event.can_user_see_cancellation_reason(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_rsvp_yes_can_see(self, cancelled_event: Event, nonmember_user: RevelUser) -> None:
+        EventRSVP.objects.create(user=nonmember_user, event=cancelled_event, status=EventRSVP.RsvpStatus.YES)
+
+        assert cancelled_event.can_user_see_cancellation_reason(nonmember_user) is True
+
+    @pytest.mark.django_db
+    def test_rsvp_no_cannot_see(self, cancelled_event: Event, nonmember_user: RevelUser) -> None:
+        EventRSVP.objects.create(user=nonmember_user, event=cancelled_event, status=EventRSVP.RsvpStatus.NO)
+
+        assert cancelled_event.can_user_see_cancellation_reason(nonmember_user) is False
+
+    @pytest.mark.django_db
+    def test_owner_can_see(self, cancelled_event: Event, organization_owner_user: RevelUser) -> None:
+        assert cancelled_event.can_user_see_cancellation_reason(organization_owner_user) is True
+
+    @pytest.mark.django_db
+    def test_staff_member_can_see(
+        self, cancelled_event: Event, organization_staff_user: RevelUser, staff_member: OrganizationStaff
+    ) -> None:
+        assert cancelled_event.can_user_see_cancellation_reason(organization_staff_user) is True
+
+    @pytest.mark.django_db
+    def test_superuser_can_see(self, cancelled_event: Event, nonmember_user: RevelUser) -> None:
+        nonmember_user.is_superuser = True
+        assert cancelled_event.can_user_see_cancellation_reason(nonmember_user) is True
+
+
+# --- i18n: model validation messages are organizer-facing, so they must actually translate ---
+
+
+@pytest.mark.django_db
+def test_member_tier_message_renders_in_the_active_language(
+    organization: Organization, organization_owner_user: RevelUser
+) -> None:
+    """Guards both the ``gettext`` wrapping and the catalog entry (see ADR-0011)."""
+    other_org = Organization.objects.create(name="Other Org", slug="other-org", owner=organization_owner_user)
+    tier = MembershipTier.objects.create(organization=other_org, name="Gold")
+    member = OrganizationMember(organization=organization, user=organization_owner_user, tier=tier)
+    with translation.override("it"):
+        with pytest.raises(ValidationError) as exc_info:
+            member.full_clean()
+        assert exc_info.value.message_dict["tier"] == [
+            "Il livello deve appartenere alla stessa organizzazione dell'iscrizione."
+        ]
+
+
+def test_discount_code_message_renders_in_the_active_language() -> None:
+    """DiscountCode.clean() is pure field validation — no database needed."""
+    code = DiscountCode(
+        code="SALE",
+        discount_type=DiscountCode.DiscountType.PERCENTAGE,
+        discount_value=Decimal("150"),
+    )
+    with translation.override("it"):
+        with pytest.raises(ValidationError) as exc_info:
+            code.clean()
+        assert exc_info.value.message_dict["discount_value"] == ["Lo sconto percentuale non può superare 100."]

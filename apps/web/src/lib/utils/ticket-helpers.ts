@@ -1,0 +1,195 @@
+import * as m from '$lib/paraglide/messages.js';
+import { formatMoney } from '$lib/utils/format';
+import { getUserDisplayName } from '$lib/utils/user-display';
+import type { AdminTicketSchema } from '$lib/api/generated/types.gen';
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
+/**
+ * Get guest name if different from user display name
+ */
+export function getGuestNameIfDifferent(ticket: any): string | null {
+	const guestName = typeof ticket.guest_name === 'string' ? ticket.guest_name.trim() : '';
+	if (!guestName) return null;
+	const userDisplayName = getUserDisplayName(ticket.user, m['eventTicketsAdmin.unknownUser']());
+	if (guestName.toLowerCase() === userDisplayName.toLowerCase().trim()) return null;
+	return guestName;
+}
+
+/**
+ * Get venue/sector/seat display info from tier and seat
+ */
+export function getSeatDisplay(ticket: any): string | null {
+	const tier = ticket.tier;
+	const seat = ticket.seat;
+	// Scan payloads (CheckInResponseSchema) expose sector_name at the top level;
+	// AdminTicketSchema nests it under tier.sector. Prefer the tier sector, then
+	// fall back to the explicit scan field.
+	const sectorName = tier?.sector?.name ?? ticket.sector_name ?? null;
+
+	if (!tier?.venue && !sectorName && !seat) return null;
+
+	const parts: string[] = [];
+
+	if (tier?.venue?.name) parts.push(tier.venue.name);
+	if (sectorName) parts.push(sectorName);
+
+	if (seat) {
+		// Prefer row_label; fall back to the transitional `row` alias while it still exists
+		const row = seat.row_label ?? seat.row;
+		if (row) parts.push(`Row ${row}`);
+		if (seat.number) parts.push(`Seat ${seat.number}`);
+		if (seat.label && !row && !seat.number) parts.push(seat.label);
+		if (seat.is_accessible) parts.push('\u267F');
+		if (seat.is_obstructed_view) parts.push('\u26A0\uFE0F Obstructed');
+	}
+
+	return parts.length > 0 ? parts.join(' \u2022 ') : null;
+}
+
+/**
+ * Get the effective price for a ticket.
+ * Priority: payment.amount > price_paid > tier.price
+ */
+export function getTicketPrice(ticket: any): number | string | undefined {
+	if (ticket.payment?.amount !== undefined && ticket.payment?.amount !== null) {
+		return ticket.payment.amount;
+	}
+	if (ticket.price_paid !== undefined && ticket.price_paid !== null) {
+		return ticket.price_paid;
+	}
+	return ticket.tier?.price;
+}
+
+/**
+ * Check if ticket can be checked in
+ */
+export function canCheckIn(ticket: any): boolean {
+	return ticket.status === 'active' || needsPaymentConfirmation(ticket);
+}
+
+/**
+ * Check if payment needs confirmation at check-in
+ */
+export function needsPaymentConfirmation(ticket: any): boolean {
+	const method = ticket.tier?.payment_method;
+	return ticket.status === 'pending' && (method === 'offline' || method === 'at_the_door');
+}
+
+/**
+ * Check if payment can be confirmed
+ */
+export function canConfirmPayment(ticket: any): boolean {
+	const method = ticket.tier?.payment_method;
+	return ticket.status === 'pending' && (method === 'offline' || method === 'at_the_door');
+}
+
+/**
+ * Check if ticket can be managed (non-Stripe)
+ */
+export function canManageTicket(ticket: any): boolean {
+	const method = ticket.tier?.payment_method;
+	return method === 'offline' || method === 'at_the_door' || method === 'free';
+}
+
+/**
+ * Check if an admin can cancel this ticket. Since organizer refunds (BE #865)
+ * cancellation applies to every payment method — online tickets take an
+ * optional refund alongside the cancellation.
+ */
+export function canAdminCancelTicket(ticket: AdminTicketSchema): boolean {
+	return ticket.status !== 'cancelled';
+}
+
+/**
+ * Check if the ticket's payment can be refunded in-app: online (Stripe)
+ * payments with a recorded payment row. Refunding never cancels the ticket.
+ */
+export function canRefundTicketPayment(ticket: AdminTicketSchema): boolean {
+	return ticket.tier?.payment_method === 'online' && !!ticket.payment;
+}
+
+/**
+ * Check if payment can be unconfirmed (active ticket with offline/at_the_door payment)
+ */
+export function canUnconfirmPayment(ticket: any): boolean {
+	const method = ticket.tier?.payment_method;
+	return ticket.status === 'active' && (method === 'offline' || method === 'at_the_door');
+}
+
+/**
+ * Check if a ticket's tier is PWYC with offline/at_the_door payment
+ */
+export function isPwycTicket(ticket: any): boolean {
+	return (
+		ticket.tier?.price_type === 'pwyc' &&
+		(ticket.tier?.payment_method === 'offline' || ticket.tier?.payment_method === 'at_the_door')
+	);
+}
+
+/**
+ * Get PWYC range warning message, if applicable
+ */
+export function getPwycWarning(ticket: any, value: string): string | null {
+	const num = parseFloat(value);
+	if (isNaN(num) || num <= 0) return null;
+
+	const min = ticket.tier?.pwyc_min ? parseFloat(ticket.tier.pwyc_min) : null;
+	const max = ticket.tier?.pwyc_max ? parseFloat(ticket.tier.pwyc_max) : null;
+
+	const currency = ticket.tier?.currency?.toUpperCase() || 'EUR';
+	const fmt = (v: number) => formatMoney(v, currency);
+
+	if (min !== null && max !== null && (num < min || num > max)) {
+		return `This amount is outside the suggested range (${fmt(min)} \u2013 ${fmt(max)})`;
+	}
+	if (min !== null && max === null && num < min) {
+		return `This amount is below the suggested minimum (${fmt(min)})`;
+	}
+	return null;
+}
+
+/**
+ * Get payment method label
+ */
+export function getPaymentMethodLabel(method: string): string {
+	switch (method) {
+		case 'online':
+			return m['eventTicketsAdmin.paymentOnline']();
+		case 'offline':
+			return m['eventTicketsAdmin.paymentOffline']();
+		case 'at_the_door':
+			return m['eventTicketsAdmin.paymentAtDoor']();
+		case 'free':
+			return m['eventTicketsAdmin.paymentFree']();
+		default:
+			return method;
+	}
+}
+
+/**
+ * Label for how a box-office ticket was sold (#959), or null when the sale
+ * source doesn't override the tier's payment method. A comp on an at-the-door
+ * tier must read "Comp", not "At the Door". Legacy rows carry a null
+ * `sale_source` ("not recorded") and keep the tier label — a 0.00 price alone
+ * can't tell a comp from a 100%-discounted checkout.
+ */
+export function saleSourceLabel(saleSource: string | null | undefined): string | null {
+	switch (saleSource) {
+		case 'box_office_comp':
+			return m['eventTicketsAdmin.saleSourceComp']();
+		case 'box_office_sale':
+			return m['eventTicketsAdmin.saleSourceDoorSale']();
+		default:
+			return null;
+	}
+}
+
+/** Payment label for a ticket row: the sale source when it says more, else the tier method. */
+export function getTicketPaymentLabel(
+	ticket: Pick<AdminTicketSchema, 'sale_source'> & { tier?: { payment_method?: string } | null }
+): string {
+	return (
+		saleSourceLabel(ticket.sale_source) ?? getPaymentMethodLabel(ticket.tier?.payment_method || '')
+	);
+}

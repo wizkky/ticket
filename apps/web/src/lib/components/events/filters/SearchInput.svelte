@@ -1,0 +1,82 @@
+<script lang="ts">
+	import { Search, X } from '@lucide/svelte';
+	import { cn } from '$lib/utils/cn';
+	import * as m from '$lib/paraglide/messages.js';
+
+	interface Props {
+		value: string;
+		onSearch: (value: string) => void;
+		placeholder?: string;
+		ariaLabel?: string;
+		/** id for the input, so an external visible <label for=...> can associate. */
+		id?: string;
+		debounceMs?: number;
+		class?: string;
+	}
+
+	const {
+		value = '',
+		onSearch,
+		placeholder = m['filters.search.eventsPlaceholder'](),
+		ariaLabel = m['filters.search.eventsLabel'](),
+		id,
+		debounceMs = 300,
+		class: className
+	}: Props = $props();
+
+	// Local input state for immediate UI feedback. Writable $derived: resynced
+	// with the external value, but locally reassignable on every keystroke.
+	let inputValue = $derived(value);
+	let debounceTimeout: ReturnType<typeof setTimeout> | null = null;
+
+	function handleInput(event: Event): void {
+		const target = event.target as HTMLInputElement;
+		inputValue = target.value;
+
+		// Clear existing timeout
+		if (debounceTimeout) {
+			clearTimeout(debounceTimeout);
+		}
+
+		// Debounce the search callback
+		debounceTimeout = setTimeout(() => {
+			onSearch(inputValue.trim());
+		}, debounceMs);
+	}
+
+	function handleClear(): void {
+		inputValue = '';
+		onSearch('');
+		if (debounceTimeout) {
+			clearTimeout(debounceTimeout);
+		}
+	}
+</script>
+
+<div class={cn('relative', className)}>
+	<div class="relative">
+		<Search
+			class="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+			aria-hidden="true"
+		/>
+		<input
+			type="search"
+			{id}
+			value={inputValue}
+			oninput={handleInput}
+			{placeholder}
+			class="h-10 w-full rounded-md border border-input bg-background pl-9 pr-9 text-sm ring-offset-background transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+			aria-label={ariaLabel}
+		/>
+		{#if inputValue}
+			<button
+				type="button"
+				onclick={handleClear}
+				class="absolute right-2 top-1/2 -translate-y-1/2 rounded-sm p-1 opacity-70 transition-opacity hover:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+				aria-label={m['common.search_clear']()}
+			>
+				<X class="h-4 w-4" aria-hidden="true" />
+			</button>
+		{/if}
+	</div>
+</div>

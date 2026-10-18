@@ -1,12 +1,9 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 	import { ArrowUpRight, Asterisk } from '@lucide/svelte';
-	import { authStore } from '$lib/stores/auth.svelte';
 	import { reveal } from './reveal';
 	import * as m from '$lib/paraglide/messages.js';
-	const producerHref = $derived(
-		authStore.isAuthenticated ? resolve('/(auth)/dashboard', {}) : resolve('/(public)/login', {})
-	);
+	const producerHref = resolve('/(auth)/producer', {});
 </script>
 
 <section id="productores" class="producer-section" aria-labelledby="producer-title">

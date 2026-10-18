@@ -51,6 +51,8 @@
 			(() => {
 				if (document.documentElement.dataset.themeLocked) return;
 				try {
+					document.documentElement.dataset.caudalMotion =
+						localStorage.getItem('caudal-motion') === 'paused' ? 'paused' : 'playing';
 					const savedMode = localStorage.getItem('mode-watcher-mode');
 					const validMode = ['light', 'dark', 'system'].includes(savedMode);
 					const embed = location.pathname.startsWith('/embed/');

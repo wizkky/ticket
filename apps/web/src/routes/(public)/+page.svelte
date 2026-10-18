@@ -12,6 +12,7 @@
 		QrCode,
 		Radio
 	} from '@lucide/svelte';
+	import OfferLabel from '$lib/components/caudal/OfferLabel.svelte';
 	import FlowField from '$lib/components/caudal/FlowField.svelte';
 	import FloatingTicket from '$lib/components/caudal/FloatingTicket.svelte';
 	import Family from '$lib/components/caudal/Family.svelte';
@@ -38,13 +39,22 @@
 		} catch {
 			/* optional preference */
 		}
-		return () => preference.removeEventListener('change', sync);
+		const syncPause = () => {
+			paused = document.documentElement.dataset.caudalMotion === 'paused';
+		};
+		window.addEventListener('caudal-motion-change', syncPause);
+		return () => {
+			preference.removeEventListener('change', sync);
+			window.removeEventListener('caudal-motion-change', syncPause);
+		};
 	});
 	function toggleMotion() {
 		paused = !paused;
+		document.documentElement.dataset.caudalMotion = paused ? 'paused' : 'playing';
 		if (paused) window.dispatchEvent(new Event('caudal-motion-paused'));
 		try {
 			localStorage.setItem('caudal-motion', paused ? 'paused' : 'playing');
+			window.dispatchEvent(new Event('caudal-motion-change'));
 		} catch {
 			/* optional preference */
 		}
@@ -53,7 +63,7 @@
 
 <svelte:head>
 	<title>{m['caudal.metaTitle']()}</title>
-	<meta name="description" content={m['caudal.heroCopy']()} />
+	<meta name="description" content={m['workspace.territoryIntro']()} />
 	<meta name="robots" content="noindex,nofollow" />
 </svelte:head>
 
@@ -71,7 +81,7 @@
 						>{m['caudal.heroTwo']()}</span
 					>
 				</h1>
-				<p>{m['caudal.heroCopy']()}</p>
+				<p>{m['workspace.territoryIntro']()}</p>
 				<div class="hero-actions">
 					<a class="pill" href={resolve('/(public)/events', {})}
 						>{m['caudal.explore']()}<ArrowUpRight size={19} strokeWidth={1.5} /></a
@@ -153,6 +163,8 @@
 						</p>
 						<h3>{event.name}</h3>
 						<p class="event-organizer">{event.organization.name}</p>
+						<p class="event-organizer">{event.venue?.city?.name ?? event.city?.name ?? ''}</p>
+						<OfferLabel offer={data.offers[event.id]} />
 						<span class="event-cta">{m['caudal.viewEvent']()}<ArrowUpRight size={17} /></span>
 					</div>
 				</a>
@@ -168,7 +180,7 @@
 				</div>
 			{/each}
 		</div>
-		<p class="demo-note">{m['caudal.paymentNote']()}</p>
+		<p class="demo-note">{m['workspace.paymentScope']()}</p>
 	</section>
 
 	<div class="marquee" aria-hidden="true">

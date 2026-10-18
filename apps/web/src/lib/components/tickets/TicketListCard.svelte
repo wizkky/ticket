@@ -14,6 +14,7 @@
 	import { detectWalletPlatform } from '$lib/utils/platform';
 	import { downloadRevelEventICalFile } from '$lib/utils/ical';
 	import { getImageUrl } from '$lib/utils/url';
+	import { formatPrice } from '$lib/utils/format';
 	import { formatEventDateRange, formatDate } from '$lib/utils/date';
 	import { getEventLogo, getEventLogoThumbnail } from '$lib/utils/event';
 	import { useQueryClient } from '@tanstack/svelte-query';
@@ -89,7 +90,7 @@
 	const createdDate = $derived(formatDate(ticket.created_at));
 </script>
 
-<Card class="group overflow-hidden transition-shadow hover:shadow-poster-lg">
+<Card class="group overflow-hidden transition-shadow hover:border-foreground/40">
 	<div class="flex flex-col gap-4 p-4 md:p-6">
 		<!-- Header with Event Info -->
 		<div class="flex items-start gap-4">
@@ -110,7 +111,7 @@
 			<div class="min-w-0 flex-1">
 				<div class="mb-2 flex items-start justify-between gap-2">
 					<div class="min-w-0 flex-1">
-						<h3 class="text-lg font-bold">
+						<h3 class="text-lg font-medium">
 							<a
 								href={resolve('/(public)/events/[id]', { id: ticket.event.id })}
 								class="hover:underline focus:underline focus:outline-none"
@@ -144,9 +145,18 @@
 							<span class="truncate">{eventLocation}</span>
 						</li>
 					{/if}
-					<!-- Purchased Date -->
+					<li class="flex flex-wrap gap-2">
+						{#if ticket.tier.payment_method === 'free'}<span>{m['workspace.freeTicket']()}</span>
+						{:else if ticket.tier.payment_method === 'at_the_door'}<span
+								>{m['workspace.payDoor']()}</span
+							>{/if}
+						{#if ticket.tier.payment_method !== 'free'}<span class="text-muted-foreground"
+								>{formatPrice(ticket.price_paid ?? ticket.tier.price, ticket.tier.currency)}</span
+							>{/if}
+					</li>
+					<!-- Reservation creation date -->
 					<li class="text-muted-foreground">
-						<span class="font-medium">{m['ticketListCard.purchased']()}</span>
+						<span class="font-medium">{m['workspace.createdAt']()}</span>
 						<time datetime={ticket.created_at}>{createdDate}</time>
 					</li>
 				</ul>

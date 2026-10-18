@@ -6,7 +6,7 @@
 		EventVisibilitySettings,
 		ResourceVisibility
 	} from '$lib/api/generated';
-	import CityAutocomplete from '$lib/components/forms/CityAutocomplete.svelte';
+	import TerritorySelect from '$lib/components/caudal/TerritorySelect.svelte';
 	import VenueSelector from './VenueSelector.svelte';
 	import {
 		MapPin,
@@ -230,12 +230,11 @@
 	{#if locationMode === 'address'}
 		<div class="space-y-4">
 			<!-- City -->
-			<CityAutocomplete
-				value={selectedCity}
+			<TerritorySelect
+				id="event-territory-city"
+				selectedId={selectedCity?.id}
 				onSelect={handleCitySelect}
-				error={validationErrors.city_id}
-				label={m['locationSection.cityLabel']()}
-				description=""
+				includeAll={false}
 			/>
 			{#if validationErrors.city_id}
 				<p class="text-sm text-destructive" role="alert">

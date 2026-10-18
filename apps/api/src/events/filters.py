@@ -53,6 +53,25 @@ class OrganizationFilterSchema(CityFilterMixin):
 
 
 class EventFilterSchema(CityFilterMixin):
+    region: t.Literal["los-rios"] | None = None
+
+    def filter_city_id(self, city_id: int | None) -> Q:
+        """Use the same effective event location as the region filter."""
+        if city_id is None:
+            return Q()
+        return Q(venue__city_id=city_id) | (Q(venue__city__isnull=True) & Q(city_id=city_id))
+
+    def filter_region(self, region: str | None) -> Q:
+        """The event location defines territory; buyer residence never participates."""
+        if region is None:
+            return Q()
+        local = Q(city__iso2="CL") & (Q(city__admin_name__icontains="Ríos") | Q(city__admin_name__icontains="Rios"))
+        venue_local = Q(venue__city__iso2="CL") & (
+            Q(venue__city__admin_name__icontains="Ríos") | Q(venue__city__admin_name__icontains="Rios")
+        )
+        # A venue's city takes precedence over the optional event city.
+        return venue_local | (Q(venue__city__isnull=True) & local)
+
     organization: t.Annotated[UUID | None, FilterLookup(q="organization_id")] = None
     organization_slug: t.Annotated[str | None, FilterLookup(q="organization__slug")] = None
     event_type: Event.EventType | None = None

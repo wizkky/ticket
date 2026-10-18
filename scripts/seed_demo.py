@@ -96,18 +96,18 @@ def seed_demo() -> dict[str, t.Any]:
             users[role] = user
 
         city, _ = City.objects.get_or_create(
-            city_id=3871336,
+            city_id=3868707,
             defaults={
-                "name": "Santiago",
-                "ascii_name": "Santiago",
+                "name": "Valdivia",
+                "ascii_name": "Valdivia",
                 "country": "Chile",
                 "iso2": "CL",
                 "iso3": "CHL",
-                "admin_name": "Región Metropolitana",
-                "capital": "primary",
-                "population": 6200000,
+                "admin_name": "Los Ríos",
+                "capital": "admin",
+                "population": 166080,
                 "timezone": "America/Santiago",
-                "location": Point(-70.6693, -33.4489, srid=4326),
+                "location": Point(-73.2459, -39.8142, srid=4326),
             },
         )
         manifest: dict[str, t.Any] = {"organizations": {}, "events": {}, "tiers": {}}
@@ -161,9 +161,17 @@ def seed_demo() -> dict[str, t.Any]:
                     "max_attendees": 0,
                     "max_tickets_per_user": None,
                     "city": city,
-                    "address": "Espacio de demostración · Santiago, Chile",
+                    "address": "Espacio de demostración · Valdivia, Chile",
                 },
             )
+            # Relocate only the two explicit local fixtures, preserving purchases and IDs.
+            if organization.city_id != city.id:
+                organization.city = city
+                organization.save(update_fields=["city"])
+            if event.city_id != city.id:
+                event.city = city
+                event.address = "Espacio de demostración · Valdivia, Chile"
+                event.save(update_fields=["city", "address"])
             # Configure Revel's auto-created default tier rather than leaving a stray 0-price offline tier.
             tier = event.ticket_tiers.filter(name="Entrada demo gratuita").first()
             if tier is None:

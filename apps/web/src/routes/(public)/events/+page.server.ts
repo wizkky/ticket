@@ -1,3 +1,4 @@
+import * as m from '$lib/paraglide/messages.js';
 import type { PageServerLoad } from './$types';
 import { eventpublicdiscoveryListEvents } from '$lib/api';
 import type { EventType, Visibility } from '$lib/api/generated/types.gen';
@@ -5,6 +6,8 @@ import { error as svelteKitError } from '@sveltejs/kit';
 import { buildSeo } from '$lib/seo';
 import { resolveLang } from '$lib/seo/server';
 import { log } from '$lib/server/logger';
+import type { EventOffer } from '$lib/caudal/offers';
+import { loadOffers } from '$lib/server/caudal/offers';
 
 const EVENT_TYPES: readonly EventType[] = ['public', 'private', 'members-only'];
 const VISIBILITIES: readonly Visibility[] = [
@@ -40,11 +43,12 @@ export const load: PageServerLoad = async ({ request, url, fetch, locals }) => {
 	const ticketType = url.searchParams.get('ticket_type') || undefined;
 	const requiresTicket =
 		ticketType === 'ticketed' ? true : ticketType === 'free' ? false : undefined;
-	const orderBy = pickAllowed(url.searchParams.get('order_by'), ORDER_BY_VALUES) ?? 'distance';
+	const orderBy = pickAllowed(url.searchParams.get('order_by'), ORDER_BY_VALUES) ?? 'start';
 
 	try {
 		// Prepare query parameters
 		const queryParams = {
+			region: 'los-rios' as const,
 			search,
 			city_id: cityId ? parseInt(cityId) : undefined,
 			organization,
@@ -87,6 +91,7 @@ export const load: PageServerLoad = async ({ request, url, fetch, locals }) => {
 		return {
 			seo,
 			events: response.data.results,
+			offers: await loadOffers(response.data.results, fetch, locals.user?.accessToken),
 			totalCount: response.data.count,
 			page,
 			pageSize,
@@ -110,13 +115,14 @@ export const load: PageServerLoad = async ({ request, url, fetch, locals }) => {
 		return {
 			seo,
 			events: [],
+			offers: {} as Record<string, EventOffer>,
 			totalCount: 0,
 			page: 1,
 			pageSize: 20,
 			nextUrl: null,
 			previousUrl: null,
 			filters: {},
-			error: 'Failed to load events. Please try again later.'
+			error: m['workspace.dataUnavailable']()
 		};
 	}
 };

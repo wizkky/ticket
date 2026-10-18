@@ -39,7 +39,10 @@
 	const error = $derived(data.error);
 
 	// Parse current filters from URL
-	const currentFilters = $derived(parseFilters($page.url.searchParams));
+	const currentFilters = $derived({
+		...parseFilters($page.url.searchParams),
+		orderBy: data.filters.orderBy ?? 'start'
+	});
 
 	// View mode (list or calendar)
 	const viewMode = $derived<'list' | 'calendar'>(
@@ -66,6 +69,7 @@
 					week: calendarParams.view === 'week' ? calendarParams.week : undefined,
 					month: calendarParams.view === 'month' ? calendarParams.month : undefined,
 					year: calendarParams.year,
+					region: 'los-rios',
 					// Apply filters
 					city_id: currentFilters.cityId,
 					organization: currentFilters.organizationId,
@@ -142,7 +146,7 @@
 	}
 
 	function handleClearFilters(): void {
-		const params = filtersToParams(clearFilters());
+		const params = filtersToParams({ ...clearFilters(), orderBy: 'start' });
 		const target = `${resolve('/(public)/events', {})}${params.toString() ? `?${params}` : ''}`;
 		// eslint-disable-next-line svelte/no-navigation-without-resolve -- resolve() validates the route id; the appended query string cannot be expressed through resolve()
 		goto(withUtmParams(target, $page.url), { replaceState: false });
@@ -220,8 +224,8 @@
 			<PageHeader
 				volume="poster"
 				onBand
-				kicker={m['browse.events_kicker']()}
-				title={m['browse.events_title']()}
+				kicker={m['workspace.territoryKicker']()}
+				title={m['workspace.territoryTitle']()}
 				subtitle={countLabel}
 				subtitleAttrs={{ 'aria-live': 'polite' }}
 			>
@@ -246,6 +250,11 @@
 					</Button>
 				{/snippet}
 			</PageHeader>
+			<p class="mt-5 max-w-2xl text-sm leading-relaxed text-muted-foreground">
+				{m['workspace.territoryIntro']()}<br /><span class="text-xs"
+					>{m['workspace.paymentScope']()}</span
+				>
+			</p>
 		</div>
 	</section>
 
@@ -322,7 +331,7 @@
 							>
 								{#each events as event, index (`${event.id}-${index}`)}
 									<div role="listitem">
-										<EventCard {event} variant="standard" />
+										<EventCard {event} offer={data.offers[event.id]} variant="standard" />
 									</div>
 								{/each}
 							</div>

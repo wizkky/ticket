@@ -5,6 +5,7 @@ import { getImpersonationInfo } from '$lib/utils/impersonation';
 import { getFeatures } from '$lib/server/features';
 import { DEFAULT_FEATURES } from '$lib/utils/features';
 import { isEmbedPath } from '$lib/embed/constants';
+import { caudalWorkspace, type CaudalWorkspace } from '$lib/api';
 
 /**
  * Root layout server load function
@@ -43,6 +44,7 @@ export const load: LayoutServerLoad = async ({ cookies, locals, fetch, url }) =>
 	if (isEmbedPath(url.pathname)) {
 		return {
 			embed: true,
+			workspace: null as CaudalWorkspace | null,
 			auth: {
 				hasAccessToken: false,
 				hasRefreshToken: false,
@@ -75,8 +77,19 @@ export const load: LayoutServerLoad = async ({ cookies, locals, fetch, url }) =>
 			.slice(0, 16);
 	}
 
+	let workspace: CaudalWorkspace | null = null;
+	if (locals.user?.accessToken) {
+		const response = await caudalWorkspace({
+			fetch,
+			headers: { Authorization: `Bearer ${locals.user.accessToken}` },
+			signal: AbortSignal.timeout(5000)
+		}).catch(() => null);
+		workspace = response?.data ?? null;
+	}
+
 	return {
 		embed: false,
+		workspace,
 		auth: {
 			hasAccessToken,
 			hasRefreshToken,

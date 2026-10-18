@@ -1,4 +1,5 @@
 <script lang="ts">
+	import * as m from '$lib/paraglide/messages.js';
 	import type { PageData } from './$types';
 	import { useQueryClient } from '@tanstack/svelte-query';
 	import type { TierSchemaWithId } from '$lib/types/tickets';
@@ -437,6 +438,9 @@
 
 	<!-- Event Header (cover → poster ribbon) -->
 	<EventHeader {event} />
+	<p class="container mx-auto px-6 py-5 text-xs leading-relaxed text-muted-foreground md:px-8">
+		{m['workspace.paymentScope']()}
+	</p>
 
 	<!--
 		Tinted content panel (uplift prototype). The page body is no longer bare

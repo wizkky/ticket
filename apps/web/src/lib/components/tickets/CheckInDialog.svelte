@@ -3,7 +3,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import { X, AlertCircle, CheckCircle, Clock, XCircle } from '@lucide/svelte';
-	import { fade, scale } from 'svelte/transition';
+	import * as Dialog from '$lib/components/ui/dialog';
 	import { getUserDisplayName } from '$lib/utils/user-display';
 	import { formatMoney, formatPrice } from '$lib/utils/format';
 	import {
@@ -209,53 +209,33 @@
 			case 'pending':
 				return {
 					label: m['checkInDialog.statusPendingPayment'](),
-					color: 'text-yellow-700 dark:text-yellow-300',
-					bgColor: 'bg-yellow-100 dark:bg-yellow-900/50'
+					color: 'text-foreground',
+					bgColor: 'bg-highlight/10'
 				};
 			case 'active':
 				return {
 					label: m['checkInDialog.statusActive'](),
-					color: 'text-green-700 dark:text-green-300',
-					bgColor: 'bg-green-100 dark:bg-green-900/50'
+					color: 'text-foreground',
+					bgColor: 'bg-success/10'
 				};
 			case 'checked_in':
 				return {
 					label: m['checkInDialog.statusAlreadyCheckedIn'](),
-					color: 'text-blue-700 dark:text-blue-300',
-					bgColor: 'bg-blue-100 dark:bg-blue-900/50'
+					color: 'text-foreground',
+					bgColor: 'bg-info/10'
 				};
 			case 'cancelled':
 				return {
 					label: m['checkInDialog.statusCancelled'](),
-					color: 'text-red-700 dark:text-red-300',
-					bgColor: 'bg-red-100 dark:bg-red-900/50'
+					color: 'text-foreground',
+					bgColor: 'bg-destructive/10'
 				};
 			default:
 				return {
 					label: status,
-					color: 'text-gray-700 dark:text-gray-300',
-					bgColor: 'bg-gray-100 dark:bg-gray-900/50'
+					color: 'text-foreground',
+					bgColor: 'bg-muted/10'
 				};
-		}
-	}
-
-	/**
-	 * Handle backdrop click
-	 */
-	function handleBackdropClick(event: MouseEvent) {
-		if (event.target === event.currentTarget && !isLoading) {
-			pwycPricePaid = '';
-			onCancel();
-		}
-	}
-
-	/**
-	 * Handle escape key
-	 */
-	function handleKeyDown(event: KeyboardEvent) {
-		if (event.key === 'Escape' && !isLoading) {
-			pwycPricePaid = '';
-			onCancel();
 		}
 	}
 
@@ -275,27 +255,25 @@
 	{@const statusInfo = getStatusInfo(ticket.status)}
 	{@const guestName = getGuestNameIfDifferent(ticket)}
 	{@const seatInfo = getSeatDisplay(ticket)}
-	<div
-		class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-		onclick={handleBackdropClick}
-		onkeydown={handleKeyDown}
-		transition:fade={{ duration: 150 }}
-		role="dialog"
-		aria-modal="true"
-		aria-labelledby="checkin-dialog-title"
-		tabindex="-1"
+	<Dialog.Root
+		open={isOpen}
+		onOpenChange={(open) => {
+			if (!open && !isLoading) onCancel();
+		}}
 	>
-		<div
-			class="relative w-full max-w-md rounded-lg border bg-background shadow-lg"
-			transition:scale={{ duration: 150, start: 0.95 }}
+		<Dialog.Content
+			class="max-h-[90dvh] max-w-md overflow-y-auto p-0"
+			showCloseButton={false}
+			escapeKeydownBehavior={isLoading ? 'ignore' : 'close'}
+			interactOutsideBehavior={isLoading ? 'ignore' : 'close'}
 		>
 			<!-- Header -->
 			<div class="flex items-center justify-between border-b px-6 py-4">
-				<h2 id="checkin-dialog-title" class="text-xl font-bold">
+				<Dialog.Title class="text-xl font-medium">
 					{needsPaymentConfirmation || needsPwycInput
 						? m['checkInDialog.confirmPaymentCheckInTitle']()
 						: m['checkInDialog.checkInAttendeeTitle']()}
-				</h2>
+				</Dialog.Title>
 				<button
 					type="button"
 					onclick={onCancel}
@@ -307,6 +285,7 @@
 				</button>
 			</div>
 
+			<Dialog.Description class="sr-only">{m['checkInDialog.verifyIdentity']()}</Dialog.Description>
 			<!-- Content -->
 			<div class="space-y-4 px-6 py-4">
 				<!-- Status Alert -->
@@ -477,6 +456,6 @@
 					{/if}
 				</Button>
 			</div>
-		</div>
-	</div>
+		</Dialog.Content>
+	</Dialog.Root>
 {/if}

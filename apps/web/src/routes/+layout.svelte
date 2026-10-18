@@ -4,6 +4,7 @@
 	import { browser } from '$app/environment';
 	import { afterNavigate } from '$app/navigation';
 	import { ModeWatcher } from 'mode-watcher';
+	import MotionPreferences from '$lib/components/caudal/MotionPreferences.svelte';
 	import { QueryClient, QueryClientProvider } from '@tanstack/svelte-query';
 	import { shouldRetry } from '$lib/api/query-retry';
 	import { authStore } from '$lib/stores/auth.svelte';
@@ -301,6 +302,7 @@
 		turning the injection off changes nothing but the console noise. Keep the two
 		in sync — app.html is now the ONLY anti-FOUC script.
 	-->
+	<MotionPreferences />
 	<ModeWatcher defaultMode="dark" disableHeadScriptInjection />
 	<QueryClientProvider client={queryClient}>
 		<Toaster richColors position="top-right" />

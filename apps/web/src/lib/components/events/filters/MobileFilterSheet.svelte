@@ -281,7 +281,7 @@
 				<div class="border-t" role="separator"></div>
 
 				<!-- City Filter -->
-				<CityFilter {selectedCity} onChangeCity={handleChangeCity} />
+				<CityFilter {selectedCity} cityId={filters.cityId} onChangeCity={handleChangeCity} />
 
 				<!-- Divider -->
 				<div class="border-t" role="separator"></div>

@@ -6,7 +6,6 @@
 	import MobileNav from './MobileNav.svelte';
 	import UserMenu from './UserMenu.svelte';
 	import ThemeToggle from './ThemeToggle.svelte';
-	import AdminButton from './AdminButton.svelte';
 	import LanguageSwitcher from './LanguageSwitcher.svelte';
 	import { NotificationDropdown } from '$lib/components/notifications';
 	import * as m from '$lib/paraglide/messages.js';
@@ -29,11 +28,11 @@
 	// Navigation items for authenticated users - using translated strings
 	const authNavItems = $derived([
 		{ href: resolve('/(public)/events', {}), label: m['nav.browseEvents']() },
-		{ href: resolve('/(public)/organizations', {}), label: m['nav.organizations']() },
 		{ href: resolve('/(auth)/dashboard/tickets', {}), label: m['nav.myTickets']() },
-		{ href: resolve('/(auth)/dashboard/passes', {}), label: m['nav.myPasses']() },
-		{ href: resolve('/(auth)/dashboard/rsvps', {}), label: m['nav.rsvps']() },
-		{ href: resolve('/(auth)/dashboard/invitations', {}), label: m['nav.invitations']() }
+		{ href: resolve('/(auth)/producer', {}), label: m['workspace.producerSpace']() },
+		...($page.data.workspace?.platform_admin
+			? [{ href: resolve('/(auth)/administration', {}), label: m['workspace.administration']() }]
+			: [])
 	]);
 
 	// Determine which nav items to show
@@ -74,7 +73,7 @@
 
 			<!-- Desktop Navigation -->
 			<nav
-				class="hidden xl:flex xl:items-center xl:gap-6"
+				class="hidden xl:flex xl:items-center xl:gap-4"
 				aria-label={m['header.mainNavigation']()}
 			>
 				{#each navItems as item (item.href)}
@@ -95,13 +94,6 @@
 
 		<!-- Right side actions -->
 		<div class="flex items-center gap-2 sm:gap-4">
-			<!-- Admin Button (Desktop, Authenticated) -->
-			{#if isAuthenticated}
-				<div class="hidden xl:block">
-					<AdminButton />
-				</div>
-			{/if}
-
 			<!-- Theme Toggle -->
 			<ThemeToggle />
 

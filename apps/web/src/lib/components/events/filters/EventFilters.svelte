@@ -96,14 +96,14 @@
 </script>
 
 <aside
-	class={cn('flex w-full flex-col gap-6 rounded-lg border-2 bg-card p-6 shadow-poster', className)}
+	class={cn('flex w-full flex-col gap-6 rounded-lg border bg-card p-6', className)}
 	aria-label={m['eventFilters.eventFilters']()}
 >
 	<!-- Header -->
 	<div class="flex items-center justify-between">
 		<div class="flex items-center gap-2">
 			<Filter class="h-5 w-5 text-muted-foreground" aria-hidden="true" />
-			<h2 class="text-xl font-extrabold">{m['common.filters_filters']()}</h2>
+			<h2 class="text-lg font-medium">{m['common.filters_filters']()}</h2>
 			{#if activeFilterCount > 0}
 				<span
 					class="rounded-full bg-primary px-2 py-0.5 text-xs font-bold text-primary-foreground"
@@ -130,13 +130,13 @@
 	<div class="border-t" role="separator"></div>
 
 	<!-- City Filter (Location - Top Priority) -->
-	<CityFilter {selectedCity} onChangeCity={handleChangeCity} />
+	<CityFilter cityId={filters.cityId} {selectedCity} onChangeCity={handleChangeCity} />
 
 	<!-- Divider -->
 	<div class="border-t" role="separator"></div>
 
 	<!-- Order By Filter -->
-	<OrderByFilter orderBy={filters.orderBy ?? 'distance'} onChangeOrderBy={handleChangeOrderBy} />
+	<OrderByFilter orderBy={filters.orderBy ?? 'start'} onChangeOrderBy={handleChangeOrderBy} />
 
 	<!-- Divider -->
 	<div class="border-t" role="separator"></div>

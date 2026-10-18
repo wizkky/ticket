@@ -47,9 +47,11 @@
 	// part of why those screens read flat. Studio is deliberately untouched.
 	// Poster rides with celebration at section level (see the Props doc).
 	const studio = $derived(volume === 'studio');
-	const headingClass = $derived(studio ? 'text-lg font-bold' : 'text-2xl font-extrabold');
+	const headingClass = $derived(
+		studio ? 'text-lg font-semibold tracking-tight' : 'text-2xl font-medium tracking-tight'
+	);
 	const kickerClass = $derived(
-		cn('font-extrabold uppercase tracking-[0.12em] text-primary', studio ? 'text-xs' : 'text-sm')
+		cn('font-medium uppercase tracking-[0.16em] text-primary', studio ? 'text-xs' : 'text-sm')
 	);
 </script>
 

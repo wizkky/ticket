@@ -93,7 +93,9 @@
 			</svg>
 			<div>
 				<p class="font-medium">{m['guest_attendance.ticket_confirmed_title']()}</p>
-				<p class="text-sm">{m['guest_attendance.ticket_confirmed_body']()}</p>
+				<p class="text-sm">
+					{m['guest_attendance.ticket_confirmed_body']()}<br />{m['workspace.paymentScope']()}
+				</p>
 			</div>
 		</div>
 	</div>

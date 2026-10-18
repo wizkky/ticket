@@ -1,4 +1,6 @@
 <script lang="ts">
+	import OfferLabel from '$lib/components/caudal/OfferLabel.svelte';
+	import type { EventOffer } from '$lib/caudal/offers';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import type { EventInListSchema } from '$lib/api/generated/types.gen';
@@ -16,6 +18,7 @@
 
 	interface Props {
 		event: EventInListSchema;
+		offer?: EventOffer;
 		variant?: 'compact' | 'standard';
 		userStatus?: UserEventStatus | null;
 		class?: string;
@@ -45,7 +48,8 @@
 		lean = false,
 		href,
 		target = null,
-		priceFrom = null
+		priceFrom = null,
+		offer
 	}: Props = $props();
 
 	// Computed values
@@ -119,18 +123,7 @@
 	// Container classes based on variant
 	const containerClasses = $derived(
 		cn(
-			'group relative overflow-hidden rounded-lg border-2 bg-card shadow-poster transition-transform',
-			// Same silhouette and lift on all three discovery cards (event / series /
-			// organization): the thick edge + poster float that `ui/card` took
-			// globally in the uplift, applied by hand because these are bare
-			// `<article>`s rather than the Card primitive. The float is the point —
-			// discovery pages now sit on a tinted panel, so a card has to read as a
-			// white sticker ON it, not a rectangle cut out of it.
-			// `transition-transform`, not `transition-all`: the ring below is a
-			// box-shadow, and transitioning box-shadow would fade it in on focus.
-			// Scoping to transform keeps the hover lift and makes the ring instant
-			// (the shadow swap snaps, which is imperceptible next to the lift).
-			'hover:-translate-y-1 hover:shadow-poster-lg focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2',
+			'group relative overflow-hidden rounded-lg border bg-card transition-transform hover:-translate-y-0.5 hover:border-foreground/40 motion-reduce:transform-none focus-within:ring-2 focus-within:ring-ring focus-within:ring-offset-2',
 			variant === 'compact' && 'flex flex-row md:flex-col',
 			variant === 'standard' && 'flex flex-col',
 			isPast && 'opacity-75',
@@ -211,7 +204,7 @@
 		<div class="space-y-1">
 			<h3
 				class={cn(
-					'line-clamp-2 font-bold leading-tight',
+					'line-clamp-2 font-medium leading-tight tracking-tight',
 					variant === 'compact' ? 'text-base md:text-lg' : 'text-lg'
 				)}
 			>
@@ -248,6 +241,7 @@
 				<span class="truncate">{locationDisplay}</span>
 			</div>
 
+			{#if offer || !priceLabel}<OfferLabel {offer} />{/if}
 			<!-- Entry price ("from €X"), when the caller supplied one -->
 			{#if priceLabel}
 				<div class="flex items-center gap-2 text-sm">
@@ -258,7 +252,7 @@
 
 			{#if variant === 'standard'}
 				<!-- Access Type (only in standard variant; superseded by the price row) -->
-				{#if !priceLabel}
+				{#if !priceLabel && !offer}
 					<div class="flex items-center gap-2 text-sm">
 						<Ticket class="h-4 w-4 shrink-0 text-muted-foreground" aria-hidden="true" />
 						<span class="truncate">{accessDisplay}</span>

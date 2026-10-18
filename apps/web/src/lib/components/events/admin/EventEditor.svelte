@@ -66,7 +66,6 @@
 	const {
 		organization,
 		existingEvent,
-		userCity,
 		orgCity,
 		eventSeries = [],
 		initialTab,
@@ -112,7 +111,7 @@
 		start: toDateTimeLocal(existingEvent?.start) || '',
 		end: toDateTimeLocal(existingEvent?.end) || '',
 		is_open_ended: existingEvent?.is_open_ended ?? false,
-		city_id: existingEvent?.city?.id || orgCity?.id || userCity?.id || null,
+		city_id: existingEvent?.city?.id || orgCity?.id || null,
 		visibility: existingEvent?.visibility || 'public',
 		event_type: existingEvent?.event_type || 'public',
 		requires_ticket: existingEvent?.requires_ticket || false,
@@ -234,7 +233,7 @@
 	});
 
 	// Location selection state
-	let selectedCity = $state<CitySchema | null>(existingEvent?.city || orgCity || userCity || null);
+	let selectedCity = $state<CitySchema | null>(existingEvent?.city || orgCity || null);
 	let selectedVenue = $state<VenueDetailSchema | null>(
 		existingEvent?.venue ? (existingEvent.venue as VenueDetailSchema) : null
 	);

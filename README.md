@@ -1,6 +1,6 @@
-# CaudalTickets · Primera prueba funcional
+# CaudalTickets · Plataforma en desarrollo
 
-Base de desarrollo de una ticketera y comunidad para productores, compradores y creativos. Esta primera versión integra snapshots MIT de Revel v2.22.1, con una portada CaudalTickets y datos de demostración propios.
+Base de desarrollo de una ticketera y comunidad para productores, compradores y creativos. Esta primera versión integra snapshots MIT de Revel v2.22.1, con identidad Caudal, recorridos de comprador, productor y administración, y datos de demostración propios.
 
 ## Inicio
 
@@ -47,7 +47,7 @@ Todos los puertos de esta configuración se enlazan a loopback. No es una config
 
 El setup crea dos productores con organizaciones y eventos separados, un comprador y un administrador. Las contraseñas aleatorias se guardan únicamente en `.local/demo-credentials.json` con permisos privados; los identificadores y rutas de eventos quedan en `.local/demo.json`. Estos archivos no se suben a GitHub.
 
-Hay una entrada gratuita y una reserva de 10 EUR con pago en puerta por evento. El comprador puede reservar y recibir un ticket PDF; el productor puede escanear su QR. El correo se entrega a Mailpit local, sin enviarlo a destinatarios reales. Se utilizan EUR y la zona horaria de Santiago para los eventos: CLP todavía no está admitido por los esquemas de tarifas de Revel y requiere adaptación.
+Hay una entrada gratuita y una reserva de 10 EUR con pago en puerta por evento. El comprador puede reservar y recibir un ticket PDF; el productor puede escanear su QR. El correo se entrega a Mailpit local, sin enviarlo a destinatarios reales. Los eventos de demostración están en Valdivia, Los Ríos, con zona `America/Santiago`. Se utiliza EUR: CLP todavía no está admitido por los esquemas de tarifas de Revel y requiere adaptación.
 
 El modo demo propio se habilita con `CAUDAL_DEMO=True`. El bypass de autenticación original de Revel permanece desactivado (`DEMO_MODE=False`): las cuentas acceden con contraseña real.
 
@@ -66,7 +66,7 @@ Cada ejecución crea nuevas entradas de prueba; no borra órdenes anteriores. Lo
 ## Alcance actual
 
 - Venta/reserva de demostración gratuita o con pago en puerta.
-- Paneles existentes de Revel y portada CaudalTickets; la personalización completa de interfaz y marca es trabajo posterior.
+- Sistema visual Caudal compartido, catálogo de Los Ríos, espacio productor y administración general con acceso protegido. Consulta [los recorridos y límites de esta etapa](docs/experiencia-caudal-v3.md).
 - Sin cuenta Stripe conectada: no se ha validado un cobro online ni liquidaciones a productores. No se debe presentar una reserva offline como un pago procesado.
 - Apple/Google Wallet, Telegram, evaluación con IA y escaneo antivirus no forman parte de esta prueba. Las integraciones que requieren credenciales están desactivadas o sin configurar.
 - Los perfiles y el mercado de servicios creativos todavía requieren diseño y desarrollo.
@@ -94,3 +94,9 @@ La segunda etapa adapta CaudalTickets al lenguaje de Caudal Creativo y sus
 marcas hermanas. Consulta [la dirección visual y procedencia de activos](docs/identidad-visual-caudal.md).
 
 [Portada de escritorio](docs/screenshots/caudal-v2-desktop.png) · [Vista móvil](docs/screenshots/caudal-v2-mobile.png)
+
+## Recorridos y revisión de producto
+
+La tercera etapa une catálogo territorial, cuenta y entradas, gestión del productor y
+administración general. [Recorridos](docs/experiencia-caudal-v3.md) ·
+[Validación y capturas de escritorio/móvil](docs/validacion-experiencia-v3.md).

@@ -58,57 +58,64 @@
 	}
 
 	function formatDate(dateString: string | null | undefined): string {
-		if (!dateString) return 'Not set';
+		if (!dateString) return '';
 		return formatDateTime(dateString);
 	}
 
 	const priceDisplay = $derived.by(() => {
 		const currency = tier.currency || 'EUR';
-		if (tier.payment_method === 'free') return 'Free';
+		if (tier.payment_method === 'free') return m['tierForm.free']();
 		if (tier.price_type === 'pwyc') {
 			const min = formatMoney(tier.pwyc_min || 1, currency);
-			const max = tier.pwyc_max ? formatMoney(tier.pwyc_max, currency) : 'any amount';
+			const max = tier.pwyc_max ? formatMoney(tier.pwyc_max, currency) : m['pwycModal.anyAmount']();
 			return `${min}${MONEY_RANGE_SEPARATOR}${max}`;
 		}
 		return formatMoney(tier.price || 0, currency);
 	});
 
 	const priceTypeDisplay = $derived.by(() => {
-		if (tier.payment_method === 'free') return 'Free';
-		return tier.price_type === 'pwyc' ? 'Pay What You Can' : 'Fixed Price';
+		if (tier.payment_method === 'free') return m['tierForm.free']();
+		return tier.price_type === 'pwyc' ? m['tierForm.payWhatYouCan']() : m['tierForm.fixedPrice']();
 	});
 
 	const quantityDisplay = $derived.by(() => {
-		if (tier.total_quantity === null) return 'Unlimited';
+		if (tier.total_quantity === null) return m['tierCard.unlimited']();
 		// `?? 0` is safe here and only here: this is a staff-only admin surface, and
 		// organization owners/staff bypass `visibility_settings` entirely (#825), so
 		// `total_available` is never withheld from this reader. On any guest-facing
 		// surface the same expression would render a hidden count as zero.
 		const available = tier.total_available ?? 0;
-		return `${available} of ${tier.total_quantity} remaining`;
+		return `${m['tierCard.remaining']({ count: available })} / ${tier.total_quantity}`;
 	});
 
 	const paymentMethodDisplay = $derived.by(() => {
 		const methods: Record<string, string> = {
-			free: 'Free',
-			online: 'Online (Stripe)',
-			offline: 'Offline',
-			at_the_door: 'At the Door'
+			free: m['tierForm.free'](),
+			online: m['tierForm.onlineStripe'](),
+			offline: m['tierForm.offline'](),
+			at_the_door: m['tierForm.atTheDoor']()
 		};
 		const pm = tier.payment_method ?? 'online';
 		return methods[pm] || pm.replace(/_/g, ' ');
 	});
 
 	const visibilityDisplay = $derived.by(() => {
-		return (tier.visibility ?? 'public').replace(/-/g, ' ');
+		switch (tier.visibility) {
+			case 'members-only':
+				return m['tierForm.membersOnly']();
+			case 'staff-only':
+				return m['tierForm.staffOnly']();
+			default:
+				return m['tierForm.public']();
+		}
 	});
 
 	const purchasableByDisplay = $derived.by(() => {
 		const options: Record<string, string> = {
-			public: 'Anyone',
-			members: 'Members Only',
-			invited: 'Invited Only',
-			invited_and_members: 'Invited + Members'
+			public: m['tierForm.anyone'](),
+			members: m['tierForm.membersOnly'](),
+			invited: m['tierForm.invitedOnly'](),
+			invited_and_members: m['tierForm.invitedAndMembers']()
 		};
 		const pb = tier.purchasable_by ?? 'public';
 		return options[pb] || pb.replace(/_/g, ' ');
@@ -117,9 +124,9 @@
 	const salesWindowDisplay = $derived.by(() => {
 		const start = formatDate(tier.sales_start_at);
 		const end = formatDate(tier.sales_end_at);
-		if (start === 'Not set' && end === 'Not set') return 'Always available';
-		if (start === 'Not set') return `Until ${end}`;
-		if (end === 'Not set') return `From ${start}`;
+		if (!start && !end) return m['workspace.salesAlways']();
+		if (!start) return m['workspace.salesUntil']({ date: end });
+		if (!end) return m['workspace.salesFrom']({ date: start });
 		return `${start} - ${end}`;
 	});
 

@@ -236,7 +236,7 @@
 						{m['eventDetails.eventType_label']()}
 					</div>
 					<div class="mt-1 font-bold capitalize">
-						{event.event_type.replace('-', ' ')}
+						{formatVisibilityLabel(event.event_type)}
 					</div>
 					{#if visibilityMismatch}
 						<div class="mt-1 flex items-center gap-1 text-sm text-muted-foreground">

@@ -139,7 +139,9 @@ export function createTicketScanCheckIn(opts: Options) {
 			});
 
 			if (response.error || !response.data) {
-				throw new Error('Ticket not found');
+				throw new Error(
+					extractApiErrorDetail(response.error) ?? m['eventTicketsAdmin.checkInError']()
+				);
 			}
 
 			ticketToCheckIn = toCheckInTicket(response.data);
@@ -148,7 +150,8 @@ export function createTicketScanCheckIn(opts: Options) {
 			showQRScanner = false;
 		} catch (err) {
 			console.error('Failed to fetch ticket:', err);
-			// Error will be shown in the scanner component
+			// Let the camera/manual input clear its success state and show a failure.
+			throw err;
 		}
 	}
 

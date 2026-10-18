@@ -1,4 +1,5 @@
 <script lang="ts">
+	import MotionToggle from '$lib/components/caudal/MotionToggle.svelte';
 	import { resolve } from '$app/paths';
 	import { ArrowUpRight } from '@lucide/svelte';
 	import RevelWordmark from '$lib/components/brand/RevelWordmark.svelte';
@@ -18,6 +19,7 @@
 			href={resolve('/(public)/organizations', {})}>{m['nav.organizations']()}</a
 		><a href={resolve('/(auth)/dashboard/tickets', {})}>{m['nav.myTickets']()}</a>
 	</div>
+	<div class="mx-auto flex max-w-[1524px] justify-end pb-4"><MotionToggle /></div>
 	<div class="footer-bottom">
 		<p>{m['caudal.footerOrigin']()}</p>
 		<p>

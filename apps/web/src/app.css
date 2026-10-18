@@ -294,3 +294,43 @@
 		padding-bottom: 0.5rem;
 	}
 }
+
+/* Shared quiet interactions for the operational and purchasing surfaces. */
+[data-caudal-motion='paused'] .caudal-motion {
+	animation: none !important;
+	transition: none !important;
+	transform: none !important;
+}
+.caudal-workspace {
+	max-width: 1440px;
+}
+.caudal-workspace table {
+	width: 100%;
+	border-collapse: collapse;
+}
+.caudal-workspace th {
+	font-weight: 500;
+	font-size: 0.75rem;
+	color: hsl(var(--muted-foreground));
+}
+.caudal-workspace td,
+.caudal-workspace th {
+	padding: 1rem;
+	text-align: left;
+	border-bottom: 1px solid hsl(var(--border));
+}
+.caudal-workspace :is(input, select, textarea) {
+	scroll-margin-top: 110px;
+}
+@media (max-width: 640px) {
+	.caudal-workspace :is(input, select, button) {
+		min-height: 44px;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.caudal-motion {
+		animation: none !important;
+		transition: none !important;
+		transform: none !important;
+	}
+}

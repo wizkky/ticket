@@ -5,7 +5,11 @@ export function reveal(node: HTMLElement) {
 	const observer = new IntersectionObserver(
 		([entry]) => {
 			if (entry.isIntersecting) {
-				if (!motion.matches && !node.closest('.motion-paused'))
+				if (
+					!motion.matches &&
+					document.documentElement.dataset.caudalMotion !== 'paused' &&
+					!node.closest('.motion-paused')
+				)
 					animation = node.animate(
 						[
 							{ opacity: 0.3, transform: 'translateY(28px)' },

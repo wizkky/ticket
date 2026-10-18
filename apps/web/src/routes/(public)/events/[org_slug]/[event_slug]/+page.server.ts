@@ -1,3 +1,4 @@
+import { isLosRios } from '$lib/caudal/territory';
 import { error, isHttpError } from '@sveltejs/kit';
 import { buildSeo } from '$lib/seo';
 import { resolveLang } from '$lib/seo/server';
@@ -72,6 +73,8 @@ export const load: PageServerLoad = async ({
 		}
 
 		const event = eventResponse.data;
+		if (!isLosRios(event.venue?.city ?? event.city))
+			error(404, 'Event outside the current Caudal agenda');
 
 		// Compute SEO and soft-404 for past/cancelled events
 		const lang = resolveLang(request);

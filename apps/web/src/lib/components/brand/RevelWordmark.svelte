@@ -10,7 +10,7 @@
 	const { class: className = '', mono = false, mark = true }: Props = $props();
 </script>
 
-<span class={cn('caudal-wordmark', mono && 'mono', className)}>
+<span class={cn('caudal-wordmark text-2xl', mono && 'mono', className)}>
 	{#if mark}
 		<span class="symbol" aria-hidden="true"
 			><img src={asset('/brand/caudal/symbol.png')} alt="" width="2048" height="2048" /></span
@@ -27,7 +27,6 @@
 		align-items: center;
 		gap: 0.45em;
 		white-space: nowrap;
-		font-size: 1.6rem;
 		line-height: 1;
 	}
 	.name {

@@ -200,14 +200,14 @@
 	});
 </script>
 
-<div class="relative mb-4">
+<div class="relative mb-4" class:hidden={!active}>
 	<div
 		id={readerId}
 		class="overflow-hidden rounded-lg border-2 border-primary"
 		style="width: 100%; max-width: 500px; margin: 0 auto;"
 	></div>
 
-	{#if !isScanning && !error}
+	{#if active && !isScanning && !error}
 		<div class="absolute inset-0 flex items-center justify-center">
 			<div class="text-center">
 				<Camera class="mx-auto mb-2 h-12 w-12 text-muted-foreground" aria-hidden="true" />
@@ -251,7 +251,7 @@
 		<KeyRound class="h-4 w-4 text-muted-foreground" aria-hidden="true" />
 		{manualLabel}
 	</label>
-	<div class="flex gap-2">
+	<div class="flex flex-col gap-2 sm:flex-row">
 		<input
 			id="{readerId}-manual"
 			type="text"
@@ -260,7 +260,7 @@
 			autocomplete="off"
 			autocapitalize="off"
 			spellcheck="false"
-			class="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+			class="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
 		/>
 		<Button type="submit" disabled={!manualCode.trim() || isSubmittingManual}>
 			{manualSubmitLabel}

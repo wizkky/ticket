@@ -161,6 +161,7 @@
 	subtitle={m['dashboard.tickets.description']()}
 	kicker={m['userMenu.dashboard']()}
 >
+	<p class="mb-6 text-xs leading-relaxed text-muted-foreground">{m['workspace.paymentScope']()}</p>
 	<div class="mb-8 space-y-4 rounded-lg border-2 border-border bg-card p-4 shadow-poster sm:p-6">
 		<!-- Ticket Count -->
 		{#if !ticketsQuery.isPending && totalCount > 0}

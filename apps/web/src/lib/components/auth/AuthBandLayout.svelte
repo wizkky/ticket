@@ -72,28 +72,96 @@
 	);
 </script>
 
-<div class={cn('min-h-[calc(100vh-4rem)] bg-background', className)}>
-	<section class="bg-secondary text-secondary-foreground">
-		<div class={cn('container mx-auto px-4 pb-20 pt-10 text-center sm:pt-14', widthClass)}>
-			{#if chip}
-				<div class="mb-5 flex justify-center">{@render chip()}</div>
-			{/if}
+<div class={cn('auth-shell', className)}>
+	<section class="auth-intro">
+		<div class="auth-heading">
+			{#if chip}<div class="mb-6">{@render chip()}</div>{/if}
 			<PageHeader
 				volume="poster"
-				onBand
 				{kicker}
 				{title}
 				{subtitle}
 				role={status ? 'status' : undefined}
-				class="text-center sm:flex-col sm:items-center"
 			/>
+			<div class="auth-current" aria-hidden="true"></div>
 		</div>
 	</section>
-
-	<!-- Pulled up over the band's bottom edge: the float is the whole point. -->
-	{#if children}
-		<div class={cn('container mx-auto -mt-12 space-y-6 px-4 pb-16', widthClass)}>
+	{#if children}<div class={cn('auth-content caudal-motion', widthClass)}>
 			{@render children()}
-		</div>
-	{/if}
+		</div>{/if}
 </div>
+
+<style>
+	.auth-shell {
+		max-width: 1440px;
+		margin: auto;
+		min-height: 70svh;
+		display: grid;
+		gap: 50px;
+		padding: 65px clamp(22px, 4.7vw, 88px);
+	}
+	.auth-heading {
+		position: relative;
+		max-width: 560px;
+	}
+	.auth-current {
+		position: relative;
+		height: 140px;
+		margin-top: 40px;
+		overflow: hidden;
+		background: repeating-radial-gradient(
+			ellipse at 80% -15%,
+			transparent 0 14px,
+			hsl(var(--foreground) / 0.15) 15px,
+			transparent 16px
+		);
+		mask-image: linear-gradient(90deg, transparent, black);
+	}
+	.auth-content {
+		width: 100%;
+		justify-self: center;
+		display: flex;
+		flex-direction: column;
+		gap: 24px;
+	}
+	@media (min-width: 1024px) {
+		.auth-shell {
+			grid-template-columns: 1.1fr 1fr;
+			align-items: start;
+			padding-block: 95px;
+			gap: 90px;
+		}
+		.auth-content {
+			justify-self: end;
+		}
+	}
+	@media (max-width: 1023px) {
+		.auth-current {
+			display: none;
+		}
+		.auth-intro {
+			max-width: 672px;
+			width: 100%;
+			margin: auto;
+		}
+		.auth-content {
+			justify-self: start;
+			margin: auto;
+		}
+	}
+	@media (prefers-reduced-motion: no-preference) {
+		.auth-content {
+			animation: appear 0.4s ease-out both;
+		}
+		@keyframes appear {
+			from {
+				opacity: 0.6;
+				transform: translateY(8px);
+			}
+			to {
+				opacity: 1;
+				transform: none;
+			}
+		}
+	}
+</style>

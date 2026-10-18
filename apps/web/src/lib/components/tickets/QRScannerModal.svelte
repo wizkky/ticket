@@ -2,7 +2,7 @@
 	import * as m from '$lib/paraglide/messages.js';
 	import { Button } from '$lib/components/ui/button';
 	import QrCameraScanner from './QrCameraScanner.svelte';
-	import { X } from '@lucide/svelte';
+	import * as Dialog from '$lib/components/ui/dialog';
 
 	/**
 	 * Dialog wrapper around `QrCameraScanner`. Everything camera-shaped — the
@@ -22,40 +22,21 @@
 	const { isOpen, onClose, onScan }: Props = $props();
 </script>
 
-{#if isOpen}
-	<!-- Modal Overlay -->
-	<div
-		class="fixed inset-0 z-50 flex items-center justify-center bg-black/80"
-		role="dialog"
-		aria-modal="true"
-		aria-labelledby="qr-scanner-title"
-	>
-		<!-- Modal Content -->
-		<div class="relative w-full max-w-lg rounded-lg bg-background p-6 shadow-lg">
-			<div class="mb-4 flex items-center justify-between">
-				<h2 id="qr-scanner-title" class="text-xl font-bold">{m['qrScannerModal.scanQr']()}</h2>
-				<button
-					type="button"
-					onclick={onClose}
-					class="rounded-full p-1 hover:bg-accent"
-					aria-label={m['qrScannerModal.closeLabel']()}
-				>
-					<X class="h-5 w-5" />
-				</button>
-			</div>
-
-			<p class="mb-4 text-sm text-muted-foreground">
-				{m['qrScannerModal.instructions']()}
-			</p>
-
-			<!-- Mounted only while open, so every reopen starts from a clean camera and
-			     an empty manual-entry field; `onDestroy` in the child stops and clears
-			     the html5-qrcode instance on the way out. -->
-			<QrCameraScanner active={isOpen} {onScan} />
-
-			<div class="flex justify-end gap-2">
-				<Button variant="outline" onclick={onClose}>{m['qrScannerModal.cancel']()}</Button>
-			</div>
-		</div>
-	</div>
-{/if}
+<Dialog.Root
+	open={isOpen}
+	onOpenChange={(open) => {
+		if (!open) onClose();
+	}}
+>
+	<Dialog.Content class="max-h-[90dvh] overflow-y-auto border shadow-none">
+		<Dialog.Header>
+			<Dialog.Title>{m['qrScannerModal.scanQr']()}</Dialog.Title>
+			<Dialog.Description>{m['qrScannerModal.instructions']()}</Dialog.Description>
+		</Dialog.Header>
+		{#if isOpen}<QrCameraScanner active={isOpen} {onScan} />{/if}
+		<Dialog.Footer
+			><Button variant="outline" onclick={onClose}>{m['qrScannerModal.cancel']()}</Button
+			></Dialog.Footer
+		>
+	</Dialog.Content>
+</Dialog.Root>

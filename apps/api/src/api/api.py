@@ -21,6 +21,7 @@ from common.exception_handlers import ExceptionHandler, make_static_handler, reg
 from common.models import Legal, SiteSettings
 from common.schema import BannerSchema, FeaturesSchema, LegalSchema, ResponseOk, SSOProviderSchema, VersionResponse
 from common.throttling import AnonDefaultThrottle, UserDefaultThrottle
+from events.controllers.caudal import CaudalController
 from events.controllers.dashboard import DashboardController
 from events.controllers.event_admin import EVENT_ADMIN_CONTROLLERS
 from events.controllers.event_public import EVENT_PUBLIC_CONTROLLERS
@@ -221,6 +222,7 @@ api.register_controllers(
     *INTEGRATION_CONTROLLERS,
     # OAuth provider controllers
     *OAUTH_CONTROLLERS,
+    CaudalController,
 )
 
 # Only truly global handlers live here. App-specific exceptions self-register

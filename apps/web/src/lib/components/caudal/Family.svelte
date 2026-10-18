@@ -3,6 +3,13 @@
 	import { ArrowUpRight } from '@lucide/svelte';
 	import { reveal } from './reveal';
 	import * as m from '$lib/paraglide/messages.js';
+	// User supplied brand names retain their spelling in every locale.
+	const brands = {
+		creative: 'Caudal Creativo',
+		factoria: 'La Factoría',
+		subte: 'El Subte',
+		emergia: 'Emergia'
+	};
 </script>
 
 <section class="family" aria-labelledby="family-title">
@@ -17,7 +24,7 @@
 		<div class="parent">
 			<img
 				src={asset('/brand/caudal/creative.png')}
-				alt="Caudal Creativo"
+				alt={brands.creative}
 				width="2048"
 				height="682"
 				loading="lazy"
@@ -26,7 +33,7 @@
 		<div class="sister">
 			<img
 				src={asset('/brand/caudal/factoria.png')}
-				alt="La Factoría"
+				alt={brands.factoria}
 				width="968"
 				height="946"
 				loading="lazy"
@@ -36,7 +43,7 @@
 		<div class="sister subte">
 			<img
 				src={asset('/brand/caudal/subte.png')}
-				alt="El Subte"
+				alt={brands.subte}
 				width="1254"
 				height="1254"
 				loading="lazy"
@@ -46,7 +53,7 @@
 		<div class="sister emergia">
 			<img
 				src={asset('/brand/caudal/emergia.png')}
-				alt="Emergia"
+				alt={brands.emergia}
 				width="1254"
 				height="1254"
 				loading="lazy"

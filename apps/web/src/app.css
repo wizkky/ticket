@@ -1,180 +1,116 @@
-@import '@fontsource-variable/nata-sans';
 /* Google Sans Medium (500) ONLY, and only for the "Continue with Google"
    button: Google's sign-in branding guidelines mandate it there. Never use it
-   for anything else — the app face is Nata Sans. */
+   for anything else — the app face is DM Sans. */
 @import '@fontsource/google-sans/500.css';
 
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
 
-/*
- * THE BRAND THEME — "Bubble" (2026 ACIDHAIRS rebrand, decided 2026-07-08).
- * The logo's warmth as UI language: sticker-round corners, lavender paper by
- * day, aubergine club-light by night with the palette Lavender as the glow
- * primary. Crimson appears only as the "heart" accent; amber for highlights.
- *
- * Derived from the official palette (see "Brand Palette" in CLAUDE.md).
- * Token NAMES are the stable contract — a future rebrand is an edit to the
- * values below, nothing else. Retired candidates (gradient/midnight/mono and
- * the pre-2026 purple/cyan brand) live in git history at commit 3e6d2bb9.
- *
- * ACCESSIBILITY CONTRACT — validate any change with
- * `python3 scripts/audit-brand-themes.py` (keep it at 0 failures):
- *   - every *-foreground on its surface ≥ 4.5:1 (WCAG AA text);
- *   - --primary vs --background ≥ 3:1 (links, focus rings);
- *   - semantic colors separated by LIGHTNESS, not hue alone (color-blind
- *     safety); never encode meaning by color alone in components.
- */
+/* Caudal: warm paper, near-black ink and quiet borders. Semantic status colors
+   remain distinct. Run scripts/audit-brand-themes.py after editing these pairs. */
+@font-face {
+	font-family: 'DM Sans';
+	src: url('/fonts/dmsans.ttf') format('truetype');
+	font-weight: 100 1000;
+	font-style: normal;
+	font-display: swap;
+}
+@font-face {
+	font-family: 'Manrope';
+	src: url('/fonts/manrope.ttf') format('truetype');
+	font-weight: 200 800;
+	font-style: normal;
+	font-display: swap;
+}
 @layer base {
 	:root {
-		--background: 268 60% 96%; /* whisper lavender paper */
-		--foreground: 173 40% 8%; /* ink */
-		--card: 0 0% 100%;
-		--card-foreground: 173 40% 8%;
-		--popover: 0 0% 100%;
-		--popover-foreground: 173 40% 8%;
-		--primary: 270 70% 48%; /* Hearty Purple */
-		--primary-foreground: 0 0% 100%;
-		--secondary: 226 95% 85%; /* periwinkle chip */
-		--secondary-foreground: 226 65% 20%;
-		--muted: 268 40% 92%;
-		--muted-foreground: 268 18% 32%;
-		--accent: 3 76% 44%; /* the heart: crimson pop */
+		--background: 45 20% 96%;
+		--foreground: 0 0% 5%;
+		--card: 45 15% 98%;
+		--card-foreground: 0 0% 5%;
+		--popover: 45 15% 98%;
+		--popover-foreground: 0 0% 5%;
+		--primary: 0 0% 8%;
+		--primary-foreground: 45 20% 96%;
+		--secondary: 40 8% 90%;
+		--secondary-foreground: 0 0% 8%;
+		--muted: 40 8% 92%;
+		--muted-foreground: 0 0% 33%;
+		--accent: 0 0% 42%;
 		--accent-foreground: 0 0% 100%;
-		--highlight: 38 94% 56%; /* amber badge/pop */
+		--highlight: 38 94% 56%;
 		--highlight-foreground: 30 55% 12%;
-		--destructive: 350 78% 30%; /* maroon, never brand crimson */
+		--destructive: 350 78% 30%;
 		--destructive-foreground: 0 0% 100%;
-		/* Destructive as TEXT/ICON on a surface, as opposed to --destructive the
-		   FILL (buttons, badges, which pair with --destructive-foreground).
-		   A fill only owes WCAG 1.4.11's 3:1; text owes 4.5:1, and the dark fill
-		   value cannot serve both — see the .dark definition. Light mode has no
-		   such tension, so this is deliberately IDENTICAL to --destructive here
-		   and light-mode rendering is unchanged to the byte.
-		   Wired to `text-destructive` in tailwind.config.ts (textColor override),
-		   so every existing `text-destructive` call site resolves here while
-		   `bg-/border-/ring-destructive` keep the fill value. */
-		--destructive-text: 350 78% 30%; /* == --destructive; 8.63:1 on --background, 9.75:1 on --card */
-		/* Rebrand additions (2026-08 platform rebrand): success/info join the
-		   semantic set — values tuned so audit-brand-themes.py passes both the
-		   AA pairs and the color-blind (lightness) separation. */
-		--success: 145 65% 28%; /* confirmations; deep green, white label */
+		--destructive-text: 350 78% 30%;
+		--success: 145 65% 28%;
 		--success-foreground: 0 0% 100%;
-		--info: 226 70% 32%; /* informational; periwinkle family, deepened for AA */
+		--info: 226 70% 32%;
 		--info-foreground: 0 0% 100%;
-		/* Third-party brand identity (Telegram, reference #0088cc) — centralized so
-		   the literal appears once; deliberately NOT part of the semantic audit. */
-		--brand-telegram: 200 100% 33%; /* fill: white labels measure ~5.4:1 (hand-verified; audit-exempt) — deliberately darker than Telegram's #0088cc so text-sm white labels pass AA in both modes (fill is NOT redefined in .dark) */
-		--brand-telegram-text: 200 100% 33%; /* text-on-surface: 4.8:1 on --background, 5.4:1 on card (hand-verified) */
-		/* More third-party brand identity: social-icon marks on the org settings
-		   page (decorative, aria-hidden — never text — so the WCAG 1.4.11 non-text
-		   3:1 floor applies, not the 4.5:1 text floor). Same rationale as
-		   --brand-telegram; audit-exempt. Converted precisely from the official
-		   brand hexes, not redefined in .dark (icons don't need a dark variant —
-		   hand-verified below at both surfaces in both modes). */
-		--brand-instagram: 349 75% 57%; /* #E4405F — 3.60:1 on background, 4.06:1 on card (light); 4.50:1/4.12:1 (dark) */
-		--brand-facebook: 214 89% 52%; /* #1877F2 — 3.78:1 on background, 4.27:1 on card (light); 4.28:1/3.92:1 (dark) */
-		--brand-bluesky: 211 99% 53%; /* #1185FE — 3.26:1 on background, 3.68:1 on card (light); 4.97:1/4.55:1 (dark) */
-		/* Google's four-color "G" mark (SSO sign-in buttons, SsoProviderButtons).
-		   Stored as the EXACT official hexes: this is logo artwork, not UI color,
-		   so it stays outside the HSL token grammar and audit-brand-themes.py
-		   deliberately doesn't parse it (hex values don't match its triplet
-		   regex). Mode-inert like the other brand marks; never redefined in
-		   .dark. Google's own dark sign-in button keeps these colors too. */
+		--border: 40 5% 80%;
+		--input: 40 5% 72%;
+		--ring: 0 0% 8%;
+		--radius: 0.5rem;
+		--logo-from: hsl(0 0% 75%);
+		--logo-to: hsl(0 0% 32%);
+		/* Legacy poster token names now follow Caudal. Status amber/red are retained. */
+		--poster-purple: 0 0% 18%;
+		--poster-crimson: 3 79% 53%;
+		--poster-crimson-deep: 3 79% 50%;
+		--poster-lavender: 40 5% 68%;
+		--poster-periwinkle: 40 5% 80%;
+		--poster-amber: 38 94% 59%;
+		--poster-ink: 0 0% 5%;
+		--poster-paper: 45 20% 96%;
+		--poster-white: 0 0% 100%;
+		--poster-shadow: 0 10px 30px hsl(var(--poster-ink) / 0.15);
+		--poster-shadow-lg: 0 18px 44px hsl(var(--poster-ink) / 0.22);
+		/* Third-party marks keep their original identity, independent of our palette. */
+		--brand-telegram: 200 100% 33%;
+		--brand-telegram-text: 200 100% 33%;
+		--brand-instagram: 349 75% 57%;
+		--brand-facebook: 214 89% 52%;
+		--brand-bluesky: 211 99% 53%;
 		--brand-google-blue: #4285f4;
 		--brand-google-green: #34a853;
 		--brand-google-yellow: #fbbc04;
 		--brand-google-red: #e94235;
-		/* Google sign-in button chrome, straight from the branding-guidelines
-		   sample assets (light theme here, dark theme overridden in .dark).
-		   Like the mark above these are brand-mandated hexes, not UI tokens —
-		   the audit script doesn't parse them and MUST not: Google fixes the
-		   pairs. Light: #FFF fill / #747775 stroke / #1F1F1F text. */
 		--brand-google-fill: #ffffff;
 		--brand-google-stroke: #747775;
 		--brand-google-text: #1f1f1f;
-		--border: 268 35% 84%;
-		--input: 268 35% 84%;
-		--ring: 270 70% 48%;
-		--radius: 1.25rem; /* the signature: sticker corners everywhere */
-		/* Logo gradient (RevelMark): Hearty Purple → Light Crimson. */
-		--logo-from: hsl(270 70% 55%);
-		--logo-to: hsl(3 79% 53%);
-		/* Poster panels (landing page). Fixed brand colors, identical in dark
-		   mode on purpose: the panels behave like imagery, not like surfaces.
-		   crimson-deep exists because white body text on raw Light Crimson is
-		   ~4.3:1 (fails AA normal text); 3 79% 50% measures >= 4.5:1. */
-		--poster-purple: 270 70% 55%; /* Hearty Purple #8C3CDD */
-		--poster-crimson: 3 79% 53%; /* Light Crimson #E6332A */
-		--poster-crimson-deep: 3 79% 50%; /* panel bg variant, AA vs white */
-		--poster-lavender: 268 55% 68%; /* Lavender #AB82DB */
-		--poster-periwinkle: 226 100% 80%; /* Periwinkle #9AB2FF */
-		--poster-amber: 38 94% 59%; /* Amber #F9B233 */
-		--poster-ink: 173 40% 8%; /* Ink #0D1E1C */
-		--poster-paper: 268 44% 95%; /* lavender paper panel */
-		--poster-white: 0 0% 100%;
-		/* Poster FLOAT — the landing mocks' depth, promoted to a token so every
-		   surface reads the same shadow and it can flip per mode. This is the
-		   one poster value that is NOT mode-inert: the landing's ink shadow is
-		   cast on a light panel; on the dark aubergine background an ink shadow
-		   is invisible (ink IS darker than nothing, but at 8% L it has almost no
-		   contrast against a 10% L surface), so dark mode casts near-black at a
-		   higher alpha and wider spread instead. Exposed as `shadow-poster` /
-		   `shadow-poster-lg` (tailwind.config.ts). */
-		--poster-shadow: 0 10px 30px hsl(var(--poster-ink) / 0.15);
-		--poster-shadow-lg: 0 18px 44px hsl(var(--poster-ink) / 0.22);
 	}
-
 	.dark {
-		--background: 270 35% 10%; /* aubergine, not black — backstage light */
-		--foreground: 0 0% 97%;
-		--card: 270 30% 14%;
-		--card-foreground: 0 0% 97%;
-		--popover: 270 30% 14%;
-		--popover-foreground: 0 0% 97%;
-		--primary: 268 60% 72%; /* palette Lavender as the glow, ink label */
-		--primary-foreground: 173 40% 8%;
-		--secondary: 226 45% 26%;
-		--secondary-foreground: 226 90% 88%;
-		--muted: 270 25% 18%;
-		--muted-foreground: 270 12% 70%;
-		--accent: 3 85% 62%; /* neon heart, ink label */
-		--accent-foreground: 173 40% 8%;
+		--background: 0 0% 3%;
+		--foreground: 45 20% 96%;
+		--card: 0 0% 6%;
+		--card-foreground: 45 20% 96%;
+		--popover: 0 0% 8%;
+		--popover-foreground: 45 20% 96%;
+		--primary: 45 20% 96%;
+		--primary-foreground: 0 0% 5%;
+		--secondary: 0 0% 14%;
+		--secondary-foreground: 45 20% 96%;
+		--muted: 0 0% 11%;
+		--muted-foreground: 40 3% 67%;
+		--accent: 0 0% 48%;
+		--accent-foreground: 0 0% 5%;
 		--highlight: 38 94% 60%;
 		--highlight-foreground: 30 60% 10%;
-		--destructive: 0 70% 45%; /* FILL only: white label = 5.88:1; as TEXT it is 3.11:1 on --background / 2.85:1 on --card (issue #781) */
+		--destructive: 0 70% 45%;
 		--destructive-foreground: 0 0% 100%;
-		/* The text-safe half of the destructive pair (issue #781). The fill above
-		   must stay dark enough for a white label, which leaves it far under
-		   4.5:1 when borrowed as text — so dark mode splits the token. Rose
-		   rather than the fill's pure red: it keeps the light-mode maroon's hue
-		   family and stays clear of --accent (3 85% 62%, the crimson "heart"),
-		   which a plain lightened red would collide with under protanopia.
-		   All figures below are PRINTED BY scripts/audit-brand-themes.py, not
-		   hand-computed — paste from the script, never the reverse (#783):
-		     7.02:1 on --background · 6.42:1 on --card/--popover · 5.74:1 on
-		     --muted · 4.74:1 on --secondary · 6.05:1 on bg-destructive/10 over
-		     card · 5.37:1 on bg-destructive/25 over card.
-		   Color-blind separation vs the other semantics (worst simulated
-		   redmean dE): accent 107.9, success 67.5, highlight 108.4,
-		   primary 148.9, info 185.6. */
 		--destructive-text: 352 85% 72%;
-		--success: 145 55% 65%; /* glow green, ink label — mirrors the dark primary pattern */
-		--success-foreground: 173 40% 8%;
-		--info: 226 100% 82%; /* periwinkle glow, ink label */
-		--info-foreground: 173 40% 8%;
-		--border: 270 25% 20%;
-		--input: 270 25% 20%;
-		--ring: 268 60% 72%;
-		--brand-telegram-text: 200 85% 60%; /* 8.0:1 on dark background, 7.3:1 on dark popover (hand-verified) */
-		/* Google sign-in button, official dark theme (branding-guidelines
-		   sample: #131314 fill / #8E918F stroke / #E3E3E3 text; the four-color
-		   G stays as-is — Google's own dark button keeps it on the dark fill). */
+		--success: 145 55% 65%;
+		--success-foreground: 0 0% 5%;
+		--info: 226 100% 82%;
+		--info-foreground: 0 0% 5%;
+		--border: 0 0% 23%;
+		--input: 0 0% 38%;
+		--ring: 45 20% 96%;
+		--brand-telegram-text: 200 85% 60%;
 		--brand-google-fill: #131314;
 		--brand-google-stroke: #8e918f;
 		--brand-google-text: #e3e3e3;
-		/* See the light-mode definition: ink casts no shadow on aubergine. */
 		--poster-shadow: 0 10px 30px hsl(0 0% 0% / 0.5);
 		--poster-shadow-lg: 0 20px 50px hsl(0 0% 0% / 0.62);
 	}
@@ -207,11 +143,17 @@
 }
 
 @layer base {
+	h1,
+	h2,
+	h3 {
+		font-family: 'Manrope', sans-serif;
+	}
 	* {
 		@apply border-border;
 	}
 	body {
 		@apply bg-background text-foreground;
+		-webkit-font-smoothing: antialiased;
 	}
 
 	/*

@@ -59,3 +59,15 @@ HOST=127.0.0.1 PORT=5173 ORIGIN=http://localhost:5173 node --env-file=.env build
 ```
 
 La portada en español responde HTTP 200 y explica que el cobro en línea sigue pendiente. Las cookies de autenticación conservan el atributo `Secure` de producción: usar `http://localhost:5173` para la prueba local o HTTPS para una publicación. Se verificó en Chromium real el inicio de sesión del comprador contra el backend, la redirección a `/dashboard`, la persistencia de ambas cookies `Secure` + `HttpOnly` y la navegación autenticada a `/dashboard/tickets`. El listado y una ficha de evento también responden HTTP 200, sin errores JavaScript de página. Las capturas de datos demo están en `docs/screenshots/`.
+
+## Desarrollo con la portada Caudal
+
+La identidad compartida y sus referencias están en
+[identidad-visual-caudal.md](identidad-visual-caudal.md). La portada usa datos
+reales de la API pública y conserva los estados sin eventos y de error de carga.
+
+En el entorno en la nube, `bash scripts/dev.sh` sirve la compilación de
+producción. Antes de recompilar, ejecuta `bash scripts/stop.sh`; después compila
+en `apps/web` y vuelve a iniciar desde la raíz. Esto evita que el proceso
+anterior lea archivos que Vite reemplaza durante la compilación. Para edición
+continua también está disponible el servidor Vite documentado más arriba.

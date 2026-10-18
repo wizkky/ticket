@@ -87,3 +87,10 @@ docs/           Investigación, arquitectura y resultados
 Las nuevas contribuciones de esta base se publican bajo MIT. Conservar [LICENSE](LICENSE), las licencias de cada snapshot y [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). [UPSTREAM.md](UPSTREAM.md) registra los repositorios, versiones y revisiones exactas; no se declara autoría propia sobre el código original.
 
 Cada tarea cloud ya tiene un entorno aislado: trabajar sobre este checkout, sin crear un worktree adicional salvo petición explícita. La configuración reusable del entorno y los scripts deben reactivar servicios; no asumir que los procesos sobreviven al cierre de una tarea.
+
+## Identidad visual
+
+La segunda etapa adapta CaudalTickets al lenguaje de Caudal Creativo y sus
+marcas hermanas. Consulta [la dirección visual y procedencia de activos](docs/identidad-visual-caudal.md).
+
+[Portada de escritorio](docs/screenshots/caudal-v2-desktop.png) · [Vista móvil](docs/screenshots/caudal-v2-mobile.png)

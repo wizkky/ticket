@@ -94,17 +94,11 @@
 				class="absolute inset-0 bg-gradient-to-t from-poster-ink/85 via-poster-ink/45 to-transparent"
 			></div>
 		{:else}
-			<!-- Fallback cover. The direction utility was missing here, so the colour
-			     stops painted nothing and the hero rendered on bare background;
-			     restored alongside the poster ramp. The scrim now matches the
-			     cover-image branch, and the type block sits in the bottom third
-			     where `from-poster-ink/85` applies. Hand-computed against the
-			     LIGHTEST stop in the ramp (lavender, 68% L), because a composited
-			     alpha is invisible to scripts/audit-brand-themes.py:
-			       ink@85% over lavender → 14.1:1 vs white, 11.7:1 vs white/90
-			       ink@45% over lavender (mid-gradient) → 6.7:1 / 5.8:1
-			     so every text layer here clears AA on every cover. -->
-			<div class="h-full w-full bg-gradient-to-br {fallbackGradient}"></div>
+			<!-- Neutral Caudal cover when no artwork was supplied. The same ink
+                 scrim keeps overlay text readable on both fallback and real covers. -->
+			<div
+				class="caudal-cover relative h-full w-full overflow-hidden bg-gradient-to-br {fallbackGradient}"
+			></div>
 			<div
 				class="absolute inset-0 bg-gradient-to-t from-poster-ink/85 via-poster-ink/45 to-poster-ink/20"
 			></div>
@@ -116,13 +110,13 @@
 				<!-- Kicker: who is putting this on. The organization badge below the
 				     cover repeats it as a link; up here it is the eyebrow that gives
 				     the display title something to sit on. -->
-				<p class="mb-1 text-sm font-extrabold uppercase tracking-[0.12em] text-poster-white/90">
+				<p class="mb-3 text-xs font-medium uppercase tracking-[0.16em] text-poster-white/90">
 					{event.organization.name}
 				</p>
 
 				<!-- Event Name -->
 				<h1
-					class="mb-3 text-3xl font-black leading-[1.12] text-poster-white sm:text-4xl lg:text-5xl"
+					class="mb-4 text-3xl font-normal leading-[1.12] tracking-[-0.05em] text-poster-white sm:text-4xl lg:text-6xl"
 				>
 					{event.name}
 				</h1>
@@ -180,24 +174,8 @@
 		</div>
 	</div>
 
-	<!--
-		Poster ribbon (uplift prototype). A solid brand-purple color block under
-		the cover, carrying the organization chip as a tilted white sticker — the
-		landing's move, applied to the app's most public page. The ribbon and the
-		chip are mode-INERT by the imagery rule (they are a poster panel, not a
-		surface); every pair on them is hand-verified against the fixed values,
-		since a poster-palette pair is invisible to scripts/audit-brand-themes.py
-		(numbers are the audit script's own, for the HSL tokens):
-		  ink on white                   → 17.40:1
-		  Hearty Purple #8C3CDD on white →  5.52:1 (the text-xs kicker clears AA)
-		  white on crimson-DEEP          →  4.59:1 (the logo-less initial tile)
-		The initial tile's gradient ends on `crimson-deep`, not raw
-		`poster-crimson`: white on raw Light Crimson is 4.33:1, which fails AA
-		for the tile's 18px bold letter — the exact trap app.css documents at
-		the `--poster-crimson-deep` declaration. This is the DEFAULT rendering
-		for any org without a logo, not an edge case.
-		Note: always the ORGANIZATION logo/initial, never the event's.
-	-->
+	<!-- A paper organization label connects the event to its producer.
+         These fixed artwork tokens keep their contrast in both UI themes. -->
 	<div class="bg-poster-purple">
 		<div class="relative mx-auto max-w-[1920px] px-6 pb-6 md:px-8">
 			<a
@@ -213,7 +191,7 @@
 					/>
 				{:else}
 					<div
-						class="flex h-12 w-12 items-center justify-center rounded-md bg-gradient-to-br from-poster-purple to-poster-crimson-deep text-lg font-black text-poster-white"
+						class="flex h-12 w-12 items-center justify-center rounded-md bg-poster-ink text-lg font-medium text-poster-white"
 					>
 						{event.organization.name.charAt(0).toUpperCase()}
 					</div>
@@ -231,3 +209,18 @@
 		</div>
 	</div>
 </header>
+
+<style>
+	.caudal-cover::after {
+		content: '';
+		position: absolute;
+		inset: 0;
+		background: repeating-radial-gradient(
+			ellipse at 85% -25%,
+			transparent 0 15px,
+			hsl(var(--poster-paper) / 0.15) 16px,
+			transparent 17px
+		);
+		pointer-events: none;
+	}
+</style>

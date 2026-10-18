@@ -87,7 +87,7 @@
 		{#if kicker}
 			<p
 				class={cn(
-					'text-sm font-extrabold uppercase tracking-[0.12em]',
+					'text-xs font-medium uppercase tracking-[0.16em]',
 					onBand ? 'text-current' : 'text-primary'
 				)}
 			>
@@ -99,9 +99,11 @@
 				{...titleAttrs}
 				class={cn(
 					'mt-1',
-					volume === 'poster' && 'text-4xl font-black leading-[1.08] sm:text-5xl',
-					volume === 'celebration' && 'text-3xl font-black leading-[1.12] sm:text-4xl',
-					volume === 'studio' && 'text-2xl font-extrabold tracking-tight sm:text-3xl'
+					volume === 'poster' &&
+						'text-4xl font-normal leading-[1.08] tracking-[-0.05em] sm:text-6xl',
+					volume === 'celebration' &&
+						'text-3xl font-medium leading-[1.12] tracking-[-0.04em] sm:text-4xl',
+					volume === 'studio' && 'text-2xl font-semibold tracking-tight sm:text-3xl'
 				)}
 			>
 				{title}

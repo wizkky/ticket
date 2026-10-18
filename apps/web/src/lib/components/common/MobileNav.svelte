@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { resolve } from '$app/paths';
 	import { page } from '$app/stores';
+	import { tick } from 'svelte';
 	import { X } from '@lucide/svelte';
 	import UserMenu from './UserMenu.svelte';
 	import * as m from '$lib/paraglide/messages.js';
@@ -14,6 +15,7 @@
 
 	let { open = $bindable(false), navItems, isAuthenticated, onClose }: Props = $props();
 
+	let drawer: HTMLDivElement;
 	const currentPath = $derived($page.url.pathname);
 
 	// Check if link is active
@@ -28,8 +30,20 @@
 
 	// Close on Escape key
 	function handleKeydown(event: KeyboardEvent) {
-		if (event.key === 'Escape') {
-			onClose();
+		if (event.key === 'Escape') onClose();
+		if (event.key === 'Tab') {
+			const targets = drawer.querySelectorAll<HTMLElement>(
+				'a[href],button:not([disabled]),[tabindex="0"]'
+			);
+			const first = targets[0],
+				last = targets[targets.length - 1];
+			if (event.shiftKey && document.activeElement === first) {
+				event.preventDefault();
+				last?.focus();
+			} else if (!event.shiftKey && document.activeElement === last) {
+				event.preventDefault();
+				first?.focus();
+			}
 		}
 	}
 
@@ -43,7 +57,17 @@
 	// Focus trap management
 	$effect(() => {
 		if (open) {
-			// Add event listener for Escape key
+			const previous =
+				document.activeElement instanceof HTMLElement ? document.activeElement : null;
+			void tick().then(() => {
+				if (open) drawer.querySelector('button')?.focus();
+			});
+			const desktop = matchMedia('(min-width: 1280px)');
+			const closeOnDesktop = () => {
+				if (desktop.matches) onClose();
+			};
+			desktop.addEventListener('change', closeOnDesktop);
+			// Keyboard focus remains inside the open navigation drawer.
 			document.addEventListener('keydown', handleKeydown);
 			// Prevent body scroll
 			document.body.style.overflow = 'hidden';
@@ -51,6 +75,8 @@
 			return () => {
 				document.removeEventListener('keydown', handleKeydown);
 				document.body.style.overflow = '';
+				desktop.removeEventListener('change', closeOnDesktop);
+				previous?.focus();
 			};
 		}
 		return undefined;
@@ -68,7 +94,10 @@
 
 <!-- Mobile Menu Drawer -->
 <div
-	class="fixed right-0 top-0 z-50 h-full w-full max-w-sm transform border-l bg-background shadow-lg transition-transform duration-300 ease-in-out md:hidden {open
+	bind:this={drawer}
+	inert={!open}
+	aria-hidden={!open}
+	class="fixed right-0 top-0 z-50 h-full w-full max-w-sm transform border-l bg-background shadow-lg transition-transform duration-300 ease-in-out xl:hidden {open
 		? 'translate-x-0'
 		: 'translate-x-full'}"
 	role="dialog"

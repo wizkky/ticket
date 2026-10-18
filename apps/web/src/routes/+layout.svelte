@@ -301,7 +301,7 @@
 		turning the injection off changes nothing but the console noise. Keep the two
 		in sync — app.html is now the ONLY anti-FOUC script.
 	-->
-	<ModeWatcher disableHeadScriptInjection />
+	<ModeWatcher defaultMode="dark" disableHeadScriptInjection />
 	<QueryClientProvider client={queryClient}>
 		<Toaster richColors position="top-right" />
 		<ImpersonationBanner />

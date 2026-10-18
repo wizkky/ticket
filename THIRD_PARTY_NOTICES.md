@@ -1,7 +1,8 @@
 # Avisos de terceros
 
 CaudalTickets incorpora software de Revel. La licencia MIT de la raíz se aplica a
-las nuevas contribuciones; los siguientes avisos y las licencias propias de las
+las nuevas contribuciones de código; las marcas y gráficas del usuario quedan
+excluidas de esta concesión. Los siguientes avisos y las licencias propias de las
 dependencias conservan su vigencia. Las versiones exactas de las aplicaciones
 importadas están en [UPSTREAM.md](UPSTREAM.md).
 
@@ -109,3 +110,15 @@ presentar CaudalTickets como un servicio oficial de Revel. Para publicar la
 identidad comercial de CaudalTickets, preparar marca, imágenes y textos propios,
 y revisar el origen de los recursos que se decida conservar. No se ha hecho una
 auditoría individual de todas las imágenes del proyecto original.
+
+## Identidad de Caudal y fuentes
+
+Los archivos de `apps/web/static/brand/caudal/` fueron entregados por el usuario
+en `sitios.zip`. Son activos de identidad de Caudal Creativo, La Factoría, El
+Subte y Emergia, y sus derechos siguen con sus titulares. Su incorporación no
+concede licencia MIT sobre marcas o gráficas.
+
+DM Sans y Manrope se distribuyen bajo SIL Open Font License 1.1; las licencias y
+los avisos originales están en `apps/web/static/fonts/dmsans-OFL.txt` y
+`apps/web/static/fonts/manrope-OFL.txt`. Procedencia y aplicación visual en
+[docs/identidad-visual-caudal.md](docs/identidad-visual-caudal.md).

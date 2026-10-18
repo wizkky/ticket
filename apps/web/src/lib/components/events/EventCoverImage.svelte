@@ -9,7 +9,7 @@
 		getEventLogoThumbnail
 	} from '$lib/utils/event';
 	import { getImageUrl } from '$lib/utils/url';
-	import { Calendar } from '@lucide/svelte';
+	import { Waves } from '@lucide/svelte';
 	import EventBadges from './EventBadges.svelte';
 	import type { UserEventStatus } from './types';
 
@@ -67,9 +67,9 @@
 					</div>
 				</div>
 			{:else}
-				<!-- Ultimate fallback: Calendar icon -->
+				<!-- Decorative current when the producer has not supplied artwork. -->
 				<div class="flex h-full w-full items-center justify-center">
-					<Calendar class="h-16 w-16 text-poster-white/60" aria-hidden="true" />
+					<Waves class="h-16 w-16 text-poster-white/60" strokeWidth={1} aria-hidden="true" />
 				</div>
 			{/if}
 		</div>

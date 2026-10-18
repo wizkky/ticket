@@ -4,7 +4,7 @@
 		<meta charset="utf-8" />
 		<link rel="icon" type="image/svg+xml" href="%sveltekit.assets%/caudal-mark.svg" />
 		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-		<meta name="theme-color" content="#8C3CDD" />
+		<meta name="theme-color" content="#080808" />
 		<link rel="manifest" href="/manifest.json" />
 		<!-- RSS Feed for events -->
 		<link
@@ -45,14 +45,18 @@
 			<html> server-side (src/lib/server/embed.ts), and localStorage inside a
 			third-party iframe is partitioned per host page — empty and meaningless
 			— so letting it win here would override the organizer's choice.
-			?theme=auto locks nothing, because this script's own 'system' default
-			IS prefers-color-scheme, which is what auto means.
+			?theme=auto retains the system default inside embeds; regular pages default to Caudal dark.
 		-->
 		<script nonce="%sveltekit.nonce%">
 			(() => {
 				if (document.documentElement.dataset.themeLocked) return;
 				try {
-					const mode = localStorage.getItem('mode-watcher-mode') || 'system';
+					const savedMode = localStorage.getItem('mode-watcher-mode');
+					const validMode = ['light', 'dark', 'system'].includes(savedMode);
+					const embed = location.pathname.startsWith('/embed/');
+					const mode = validMode ? savedMode : embed ? 'system' : 'dark';
+					// Initialize before mode-watcher's persisted store is imported.
+					if (!validMode && !embed) localStorage.setItem('mode-watcher-mode', mode);
 					const dark =
 						mode === 'dark' ||
 						(mode === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
@@ -60,7 +64,13 @@
 					root.classList.toggle('dark', dark);
 					root.style.colorScheme = dark ? 'dark' : 'light';
 				} catch {
-					/* localStorage unavailable (e.g. private mode) — fall back to light */
+					document.documentElement.classList.toggle(
+						'dark',
+						!location.pathname.startsWith('/embed/')
+					);
+					document.documentElement.style.colorScheme = location.pathname.startsWith('/embed/')
+						? 'light'
+						: 'dark';
 				}
 			})();
 		</script>

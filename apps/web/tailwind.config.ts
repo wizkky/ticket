@@ -30,11 +30,11 @@ export default {
 			screens: {
 				tall: { raw: '(min-height: 640px)' }
 			},
-			// Nata Sans is the brand font (imported in app.css); preflight picks
+			// DM Sans is self-hosted in app.css; preflight picks
 			// this up, so it applies app-wide without per-component classes.
 			fontFamily: {
 				sans: [
-					'Nata Sans Variable',
+					'DM Sans',
 					'ui-sans-serif',
 					'system-ui',
 					'-apple-system',

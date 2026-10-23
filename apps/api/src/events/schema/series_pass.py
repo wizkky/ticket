@@ -212,7 +212,7 @@ class SeriesPassCreateSchema(Schema):
     description: StrippedString | None = None
     price: Decimal = Field(..., ge=0)
     pro_rata_discount: Decimal = Field(..., ge=0)
-    currency: Currencies = Field(default="EUR", max_length=3)
+    currency: Currencies = Field(default="CLP", max_length=3)
     payment_method: TicketTier.PaymentMethod = TicketTier.PaymentMethod.ONLINE
     purchasable_by: TicketTier.PurchasableBy = TicketTier.PurchasableBy.PUBLIC
     visibility: SeriesPass.Visibility = SeriesPass.Visibility.PUBLIC

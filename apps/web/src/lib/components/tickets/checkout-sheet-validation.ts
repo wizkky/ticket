@@ -33,7 +33,12 @@ export function sheetValidationError(
 		}
 		if (group.tier.price_type === 'pwyc') {
 			const { minAmount, maxAmount } = pwycBounds(group.tier);
-			const validation = validatePwycAmount(group.pwycAmount ?? '', minAmount, maxAmount);
+			const validation = validatePwycAmount(
+				group.pwycAmount ?? '',
+				minAmount,
+				maxAmount,
+				group.tier.currency
+			);
 			if (!validation.valid) return 'pwyc';
 		}
 		if (isMappedBestAvailable(group.tier) && group.priceCategoryId == null) return 'zone';

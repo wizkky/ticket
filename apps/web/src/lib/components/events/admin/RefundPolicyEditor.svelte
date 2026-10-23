@@ -7,7 +7,9 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Trash2, Plus, Undo2, Receipt } from '@lucide/svelte';
 
+	import { normalizeMoneyInput, moneyInputPattern, moneyInputValue } from '$lib/utils/money-input';
 	interface Props {
+		currency?: string;
 		/** Optional initial policy (when editing). null = no brackets yet. */
 		value: RefundPolicy | null | undefined;
 		disabled?: boolean;
@@ -24,6 +26,7 @@
 		value,
 		disabled = false,
 		currencySymbol = '',
+		currency = 'CLP',
 		onChange,
 		onValidityChange
 	}: Props = $props();
@@ -52,7 +55,9 @@
 	}
 
 	let brackets = $state<BracketDraft[]>(bracketsFrom(value));
-	let flatFee = $state<string>(value?.flat_fee !== undefined ? String(value.flat_fee) : '');
+	let flatFee = $state<string>(
+		moneyInputValue(value?.flat_fee !== undefined ? String(value.flat_fee) : '', currency)
+	);
 
 	function normalizeDecimalInput(v: string): string {
 		let normalized = v.replace(/,/g, '.');
@@ -307,13 +312,14 @@
 				<Input
 					id="refund-flat-fee"
 					type="text"
-					inputmode="decimal"
+					inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+					pattern={moneyInputPattern(currency)}
 					value={flatFee}
 					oninput={(e) => {
-						flatFee = normalizeDecimalInput((e.currentTarget as HTMLInputElement).value);
+						flatFee = normalizeMoneyInput((e.currentTarget as HTMLInputElement).value, currency);
 						emit();
 					}}
-					placeholder={m['refundPolicy.flatFeePlaceholder']()}
+					placeholder={currency === 'CLP' ? '0' : m['refundPolicy.flatFeePlaceholder']()}
 					{disabled}
 					class={currencySymbol ? 'pl-9' : ''}
 				/>

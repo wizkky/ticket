@@ -26,8 +26,9 @@ from .venue import TierPricingGapSchema, TierUnsellableZoneSchema, VenueSchema, 
 RefundPolicyTierSchema = RefundPolicyTier
 RefundPolicySchema = RefundPolicy
 
-# Supported currencies — must match frankfurter.dev for exchange rate availability
+# Sale currencies; availability of exchange rates is a separate capability.
 Currencies = t.Literal[
+    "CLP",  # Chilean Peso (whole pesos)
     "EUR",  # Euro
     "USD",  # US Dollar
     "GBP",  # British Pound Sterling
@@ -304,7 +305,7 @@ class TicketTierCreateSchema(TicketTierPriceValidationMixin):
     pwyc_max: Decimal | None = Field(None, ge=1)
     vat_rate: Decimal | None = Field(None, ge=0, le=100, description="VAT rate override. Null = use org default.")
 
-    currency: Currencies = Field(default="EUR", max_length=3)
+    currency: Currencies = Field(default="CLP", max_length=3)
     sales_start_at: AwareDatetime | None = None
     sales_end_at: AwareDatetime | None = None
     sales_paused: bool = False

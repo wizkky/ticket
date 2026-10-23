@@ -9,6 +9,7 @@ from django.utils.translation import gettext_lazy as _
 
 from common.fields import MarkdownField, ProtectedFileField
 from common.models import TimeStampedModel
+from common.money import valid_currency_precision
 
 from .event_series import EventSeries
 from .mixins import VisibilityMixin
@@ -33,7 +34,7 @@ class SeriesPass(TimeStampedModel, VisibilityMixin):
     description = MarkdownField(null=True, blank=True)
     price = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
     pro_rata_discount = models.DecimalField(max_digits=10, decimal_places=2, validators=[MinValueValidator(0)])
-    currency = models.CharField(max_length=3, default=settings.DEFAULT_CURRENCY)
+    currency = models.CharField(max_length=3, default=settings.DEFAULT_TICKET_CURRENCY)
     payment_method = models.CharField(
         choices=TicketTier.PaymentMethod.choices,
         default=TicketTier.PaymentMethod.ONLINE,
@@ -73,6 +74,13 @@ class SeriesPass(TimeStampedModel, VisibilityMixin):
             TicketTier.PurchasableBy.INVITED_AND_MEMBERS,
         ):
             raise DjangoValidationError({"purchasable_by": _("Series passes cannot be invitation-restricted.")})
+        precision_errors = {
+            field: _("Enter a whole number.")
+            for field in ("price", "pro_rata_discount")
+            if not valid_currency_precision(getattr(self, field), self.currency)
+        }
+        if precision_errors:
+            raise DjangoValidationError(precision_errors)
         if self.pk:
             old = SeriesPass.objects.filter(pk=self.pk).values("currency", "payment_method").first()
             if old is None:

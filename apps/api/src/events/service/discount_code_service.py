@@ -13,6 +13,7 @@ from django.utils.translation import gettext_lazy as _
 from ninja.errors import HttpError
 
 from accounts.models import RevelUser
+from common.money import round_currency_amount
 from events.exceptions import DuplicateDiscountCodeError
 from events.models import Event, EventSeries, Organization, Ticket, TicketTier
 from events.models.discount_code import DiscountCode
@@ -284,6 +285,7 @@ def assert_min_purchase_amount(discount_code: DiscountCode, total_amount: Decima
 
     Args:
         discount_code: The validated discount code.
+        currency: The ticket currency, used to round CLP to whole pesos.
         total_amount: The cart's pre-discount total (sum of the resolved seat prices).
 
     Raises:
@@ -526,7 +528,7 @@ def preview_discount_code(
     )
 
 
-def calculate_discounted_unit_price(base_price: Decimal, discount_code: DiscountCode) -> Decimal:
+def calculate_discounted_unit_price(base_price: Decimal, discount_code: DiscountCode, currency: str = "EUR") -> Decimal:
     """Apply a discount code to one unit price.
 
     The per-unit primitive. ``calculate_discounted_price`` is the flat-tier
@@ -536,31 +538,33 @@ def calculate_discounted_unit_price(base_price: Decimal, discount_code: Discount
     Args:
         base_price: The pre-discount unit price.
         discount_code: The validated discount code.
+        currency: The ticket currency, used to round CLP to whole pesos.
 
     Returns:
-        The discounted unit price (2 decimal places, non-negative).
+        The discounted unit price (whole pesos for CLP, non-negative).
     """
     if discount_code.discount_type == DiscountCode.DiscountType.PERCENTAGE:
-        discounted = (base_price * (Decimal("100") - discount_code.discount_value) / Decimal("100")).quantize(
-            Decimal("0.01")
+        discounted = round_currency_amount(
+            base_price * (Decimal("100") - discount_code.discount_value) / Decimal("100"), currency
         )
         return max(discounted, Decimal("0.00"))
 
     # FIXED_AMOUNT
-    return max((base_price - discount_code.discount_value).quantize(Decimal("0.01")), Decimal("0.00"))
+    return max(round_currency_amount(base_price - discount_code.discount_value, currency), Decimal("0.00"))
 
 
-def calculate_unit_discount_amount(base_price: Decimal, discount_code: DiscountCode) -> Decimal:
+def calculate_unit_discount_amount(base_price: Decimal, discount_code: DiscountCode, currency: str = "EUR") -> Decimal:
     """Calculate how much a discount code subtracts from one unit price.
 
     Args:
         base_price: The pre-discount unit price.
         discount_code: The validated discount code.
+        currency: The ticket currency, used to round CLP to whole pesos.
 
     Returns:
         The discount amount for that unit (never negative, never above ``base_price``).
     """
-    return base_price - calculate_discounted_unit_price(base_price, discount_code)
+    return base_price - calculate_discounted_unit_price(base_price, discount_code, currency)
 
 
 def calculate_discounted_price(tier: TicketTier, discount_code: DiscountCode) -> Decimal:
@@ -569,11 +573,12 @@ def calculate_discounted_price(tier: TicketTier, discount_code: DiscountCode) ->
     Args:
         tier: The ticket tier.
         discount_code: The validated discount code.
+        currency: The ticket currency, used to round CLP to whole pesos.
 
     Returns:
-        The discounted unit price (2 decimal places, non-negative).
+        The discounted unit price (whole pesos for CLP, non-negative).
     """
-    return calculate_discounted_unit_price(tier.price, discount_code)
+    return calculate_discounted_unit_price(tier.price, discount_code, tier.currency)
 
 
 def calculate_discount_amount(tier: TicketTier, discount_code: DiscountCode) -> Decimal:
@@ -582,11 +587,12 @@ def calculate_discount_amount(tier: TicketTier, discount_code: DiscountCode) -> 
     Args:
         tier: The ticket tier.
         discount_code: The validated discount code.
+        currency: The ticket currency, used to round CLP to whole pesos.
 
     Returns:
         The discount amount per ticket.
     """
-    return calculate_unit_discount_amount(tier.price, discount_code)
+    return calculate_unit_discount_amount(tier.price, discount_code, tier.currency)
 
 
 def apply_discount(discount_code: DiscountCode, user: RevelUser, batch_size: int) -> None:

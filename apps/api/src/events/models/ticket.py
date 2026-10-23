@@ -1,5 +1,6 @@
 import typing as t
 from datetime import datetime, timedelta
+from decimal import Decimal
 from uuid import UUID
 
 from django.conf import settings
@@ -14,8 +15,9 @@ from django.utils.translation import gettext_lazy as _
 
 from common.fields import MarkdownField, ProtectedFileField
 from common.models import TimeStampedModel
+from common.money import valid_currency_precision
 from events.utils import apple_wallet_configured, get_event_timezone, google_wallet_configured
-from events.utils.tier_pricing import validate_category_prices
+from events.utils.tier_pricing import parse_price_map, validate_category_prices
 from events.utils.visibility import get_invited_event_ids, get_valid_member_org_ids, owner_or_staff_q
 
 from .mixins import VisibilityMixin
@@ -349,7 +351,9 @@ class TicketTier(TimeStampedModel, VisibilityMixin):
         validators=[MinValueValidator(1)],
         help_text="Maximum amount for pay-what-you-can pricing (optional)",
     )
-    currency = models.CharField(max_length=3, default=settings.DEFAULT_CURRENCY, help_text="ISO 4217 currency code")
+    currency = models.CharField(
+        max_length=3, default=settings.DEFAULT_TICKET_CURRENCY, help_text="ISO 4217 currency code"
+    )
     sales_start_at = models.DateTimeField(
         null=True, blank=True, db_index=True, help_text="When ticket sales begin for this tier"
     )
@@ -638,6 +642,28 @@ class TicketTier(TimeStampedModel, VisibilityMixin):
         self._validate_membership_tiers()
         self._validate_venue_sector()
         validate_category_prices(self)
+        if self.currency == "CLP":
+            amounts = {field: getattr(self, field) for field in ("price", "pwyc_min", "pwyc_max")}
+            if self.refund_policy:
+                amounts["refund_policy"] = Decimal(str(self.refund_policy.get("flat_fee", 0)))
+            invalid = {
+                field: _("Enter a whole number.")
+                for field, value in amounts.items()
+                if not valid_currency_precision(value, self.currency)
+            }
+            if any(
+                not valid_currency_precision(value, self.currency)
+                for value in parse_price_map(self.category_prices).values()
+            ):
+                invalid["category_prices"] = _("Enter a whole number.")
+            if invalid:
+                raise DjangoValidationError(invalid)
+        original_currency = type(self).objects.filter(pk=self.pk).values_list("currency", flat=True).first()
+        if original_currency and original_currency != self.currency and self.tickets.exists():
+            raise DjangoValidationError(
+                {"currency": _("Create a new ticket tier to change currency after tickets have been issued.")}
+            )
+
         self._validate_invitation_restrictions()
 
     def can_purchase(self) -> bool:

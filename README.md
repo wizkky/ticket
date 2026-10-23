@@ -47,7 +47,7 @@ Todos los puertos de esta configuración se enlazan a loopback. No es una config
 
 El setup crea dos productores con organizaciones y eventos separados, un comprador y un administrador. Las contraseñas aleatorias se guardan únicamente en `.local/demo-credentials.json` con permisos privados; los identificadores y rutas de eventos quedan en `.local/demo.json`. Estos archivos no se suben a GitHub.
 
-Hay una entrada gratuita y una reserva de 10 EUR con pago en puerta por evento. El comprador puede reservar y recibir un ticket PDF; el productor puede escanear su QR. El correo se entrega a Mailpit local, sin enviarlo a destinatarios reales. Los eventos de demostración están en Valdivia, Los Ríos, con zona `America/Santiago`. Se utiliza EUR: CLP todavía no está admitido por los esquemas de tarifas de Revel y requiere adaptación.
+Hay una entrada gratuita y una reserva con pago en puerta por evento: $5.000 CLP en el evento A y $5.500 CLP en el B. El comprador puede reservar y recibir un ticket PDF; el productor puede escanear su QR. El correo se entrega a Mailpit local, sin enviarlo a destinatarios reales. Los eventos de demostración están en Valdivia, Los Ríos, con zona `America/Santiago`. Las nuevas tarifas usan pesos chilenos (CLP), sin decimales y con punto de miles. Los registros históricos en EUR conservan su moneda; no se realiza conversión cambiaria.
 
 El modo demo propio se habilita con `CAUDAL_DEMO=True`. El bypass de autenticación original de Revel permanece desactivado (`DEMO_MODE=False`): las cuentas acceden con contraseña real.
 

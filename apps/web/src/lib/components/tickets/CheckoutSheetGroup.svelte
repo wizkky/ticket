@@ -78,7 +78,12 @@
 	// the disabled button + footer hint already cover it.
 	function groupPwycError(): string {
 		const { minAmount, maxAmount } = pwycBounds(group.tier);
-		const validation = validatePwycAmount(group.pwycAmount ?? '', minAmount, maxAmount);
+		const validation = validatePwycAmount(
+			group.pwycAmount ?? '',
+			minAmount,
+			maxAmount,
+			group.tier.currency
+		);
 		if (validation.valid || validation.error === 'empty') return '';
 		return pwycErrorMessage(validation.error, group.tier.currency, minAmount, maxAmount);
 	}

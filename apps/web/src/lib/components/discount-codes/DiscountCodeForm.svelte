@@ -7,6 +7,7 @@
 	import { AlertCircle, Loader2 } from '@lucide/svelte';
 	import type { DiscountCodeSchema, DiscountType } from '$lib/api/generated/types.gen';
 	import ScopeAssignment from './ScopeAssignment.svelte';
+	import { normalizeMoneyInput, moneyInputPattern, moneyInputValue } from '$lib/utils/money-input';
 	import DateTimePicker from '$lib/components/forms/DateTimePicker.svelte';
 
 	interface FormData {
@@ -46,8 +47,14 @@
 	// Form state
 	let code = $state(existingCode?.code || '');
 	let discountType = $state<DiscountType>(existingCode?.discount_type || 'percentage');
-	let discountValue = $state(existingCode?.discount_value || '');
+	let discountValue = $state(
+		moneyInputValue(
+			existingCode?.discount_value || '',
+			existingCode?.discount_type === 'percentage' ? 'EUR' : existingCode?.currency || 'CLP'
+		)
+	);
 	const SUPPORTED_CURRENCIES = [
+		{ code: 'CLP', name: 'Peso chileno' },
 		{ code: 'AUD', name: 'Australian Dollar' },
 		{ code: 'BRL', name: 'Brazilian Real' },
 		{ code: 'CAD', name: 'Canadian Dollar' },
@@ -79,7 +86,7 @@
 		{ code: 'USD', name: 'US Dollar' },
 		{ code: 'ZAR', name: 'South African Rand' }
 	];
-	let currency = $state(existingCode?.currency || 'EUR');
+	let currency = $state(existingCode?.currency || 'CLP');
 	// `validFrom` / `validUntil` hold ISO 8601 strings (DateTimePicker's value format).
 	let validFrom = $state(existingCode?.valid_from ?? '');
 	let validUntil = $state(existingCode?.valid_until ?? '');
@@ -89,7 +96,9 @@
 	let validUntilManuallyEdited = $state(false);
 	let maxUses = $state(existingCode?.max_uses?.toString() || '');
 	let maxUsesPerUser = $state(existingCode?.max_uses_per_user?.toString() || '1');
-	let minPurchaseAmount = $state(existingCode?.min_purchase_amount || '0');
+	let minPurchaseAmount = $state(
+		moneyInputValue(existingCode?.min_purchase_amount || '0', existingCode?.currency || 'CLP')
+	);
 	let isActive = $state(existingCode?.is_active ?? true);
 	let seriesIds = $state<string[]>(existingCode?.series_ids || []);
 	let eventIds = $state<string[]>(existingCode?.event_ids || []);
@@ -308,14 +317,16 @@
 				<Input
 					id="discount_value"
 					type="text"
-					inputmode="decimal"
+					inputmode={discountType === 'fixed_amount' && currency === 'CLP' ? 'numeric' : 'decimal'}
+					pattern={discountType === 'fixed_amount' ? moneyInputPattern(currency) : undefined}
 					value={discountValue}
 					oninput={(e) => {
-						discountValue = (e.currentTarget as HTMLInputElement).value
-							.replace(/,/g, '.')
-							.replace(/[^\d.]/g, '');
+						discountValue = normalizeMoneyInput(
+							e.currentTarget.value,
+							discountType === 'percentage' ? 'EUR' : currency
+						);
 					}}
-					placeholder={discountType === 'percentage' ? '20' : '5.00'}
+					placeholder={discountType === 'percentage' ? '20' : currency === 'CLP' ? '5000' : '5.00'}
 					disabled={isSubmitting}
 					aria-invalid={validationErrors.discount_value ? 'true' : undefined}
 					aria-describedby={validationErrors.discount_value ? 'value-error' : undefined}
@@ -435,12 +446,14 @@
 			<Input
 				id="min_purchase_amount"
 				type="text"
-				inputmode="decimal"
+				inputmode={discountType === 'fixed_amount' && currency === 'CLP' ? 'numeric' : 'decimal'}
+				pattern={discountType === 'fixed_amount' ? moneyInputPattern(currency) : undefined}
 				value={minPurchaseAmount}
 				oninput={(e) => {
-					minPurchaseAmount = (e.currentTarget as HTMLInputElement).value
-						.replace(/,/g, '.')
-						.replace(/[^\d.]/g, '');
+					minPurchaseAmount = normalizeMoneyInput(
+						e.currentTarget.value,
+						discountType === 'fixed_amount' ? currency : 'EUR'
+					);
 				}}
 				disabled={isSubmitting}
 				aria-invalid={validationErrors.min_purchase_amount ? 'true' : undefined}

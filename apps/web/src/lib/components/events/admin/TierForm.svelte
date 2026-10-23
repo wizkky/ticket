@@ -20,6 +20,7 @@
 		RefundPolicy
 	} from '$lib/api/generated/types.gen';
 	import { Dialog, DialogContent, DialogHeader, DialogTitle } from '$lib/components/ui/dialog';
+	import { normalizeMoneyInput, moneyInputValue } from '$lib/utils/money-input';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
@@ -97,10 +98,16 @@
 		(tier?.payment_method as 'free' | 'offline' | 'at_the_door' | 'online') ?? 'free'
 	);
 	let priceType = $state<'fixed' | 'pwyc'>((tier?.price_type as 'fixed' | 'pwyc') ?? 'fixed');
-	let price = $state(tier?.price ? String(tier.price) : '0');
-	let pwycMin = $state(tier?.pwyc_min ? String(tier.pwyc_min) : '1');
-	let pwycMax = $state(tier?.pwyc_max ? String(tier.pwyc_max) : '');
-	let currency = $state(tier?.currency ?? 'EUR');
+	let price = $state(
+		moneyInputValue(tier?.price ? String(tier.price) : '0', tier?.currency ?? 'CLP')
+	);
+	let pwycMin = $state(
+		moneyInputValue(tier?.pwyc_min ? String(tier.pwyc_min) : '1', tier?.currency ?? 'CLP')
+	);
+	let pwycMax = $state(
+		moneyInputValue(tier?.pwyc_max ? String(tier.pwyc_max) : '', tier?.currency ?? 'CLP')
+	);
+	let currency = $state(tier?.currency ?? 'CLP');
 	let vatRateOverride = $state(tier?.vat_rate != null ? String(tier.vat_rate) : '');
 	let manualPaymentInstructions = $state(tier?.manual_payment_instructions ?? '');
 	let totalQuantity = $state<string>(
@@ -383,10 +390,10 @@
 			finalPrice = '0';
 		} else if (priceType === 'pwyc') {
 			// For PWYC (especially with Stripe), use minimum price as the price field
-			finalPrice = normalizeDecimalInput(pwycMin || '1');
+			finalPrice = normalizeMoneyInput(pwycMin || '1', currency);
 		} else {
 			// Fixed price
-			finalPrice = normalizeDecimalInput(price);
+			finalPrice = normalizeMoneyInput(price, currency);
 		}
 
 		// Build the data object, omitting null values for pwyc fields
@@ -449,10 +456,10 @@
 		// Only include pwyc fields if price_type is 'pwyc' and they have values
 		if (priceType === 'pwyc') {
 			if (pwycMin) {
-				baseData.pwyc_min = normalizeDecimalInput(pwycMin);
+				baseData.pwyc_min = normalizeMoneyInput(pwycMin, currency);
 			}
 			if (pwycMax) {
-				baseData.pwyc_max = normalizeDecimalInput(pwycMax);
+				baseData.pwyc_max = normalizeMoneyInput(pwycMax, currency);
 			}
 		}
 
@@ -616,6 +623,7 @@
 						/>
 
 						<RefundPolicyEditor
+							{currency}
 							value={refundPolicy}
 							disabled={isPending}
 							{currencySymbol}
@@ -650,6 +658,7 @@
 			/>
 
 			<TierFormSeatingSection
+				{currency}
 				bind:seatAssignmentMode
 				bind:maxTicketsPerUser
 				bind:sectorId

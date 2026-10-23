@@ -182,7 +182,7 @@
 				<PassTierMappingSection
 					events={uncoveredEvents}
 					{accessToken}
-					currency={pass.currency ?? 'EUR'}
+					currency={pass.currency ?? 'CLP'}
 					selections={tierSelections}
 					onSelectionsChange={(next) => (tierSelections = next)}
 					disabled={extendMutation.isPending}

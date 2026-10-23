@@ -1,13 +1,23 @@
 /**
  * Formatting utilities for prices and currencies.
  *
- * All currency formatting is pinned to the active UI language (via
+ * CLP uses Chilean formatting. Other currencies follow the active UI language (via
  * `getDateLocale()`), never the runtime's default locale — the server's ICU
  * locale and the browser's can differ, which made SSR render "95,00 €" and
  * the client re-render "€95.00" on the same page.
  */
 
 import { getDateLocale } from './date';
+
+/** CLP is always rendered using Chilean separators, independently of UI language. */
+function moneyFormatter(currency?: string | null): Intl.NumberFormat {
+	const code = currency?.toUpperCase() || 'CLP';
+	return new Intl.NumberFormat(code === 'CLP' ? 'es-CL' : getDateLocale(), {
+		style: 'currency',
+		currency: code,
+		...(code === 'CLP' ? { minimumFractionDigits: 0, maximumFractionDigits: 0 } : {})
+	});
+}
 
 /**
  * Format a price with currency using Intl.NumberFormat.
@@ -21,11 +31,7 @@ export function formatPrice(
 	if (price === undefined || price === null) return freeLabel;
 	const numPrice = typeof price === 'string' ? parseFloat(price) : price;
 	if (numPrice === 0) return freeLabel;
-	const currencyCode = currency?.toUpperCase() || 'USD';
-	return new Intl.NumberFormat(getDateLocale(), {
-		style: 'currency',
-		currency: currencyCode
-	}).format(numPrice);
+	return moneyFormatter(currency).format(numPrice);
 }
 
 /**
@@ -40,19 +46,10 @@ export function formatMoney(
 ): string {
 	const parsed = typeof amount === 'string' ? parseFloat(amount) : (amount ?? 0);
 	const safe = Number.isFinite(parsed) ? parsed : 0;
-	const currencyCode = currency?.toUpperCase() || 'USD';
 	try {
-		return new Intl.NumberFormat(getDateLocale(), {
-			style: 'currency',
-			currency: currencyCode
-		}).format(safe);
+		return moneyFormatter(currency).format(safe);
 	} catch {
-		// Intl.NumberFormat throws RangeError on a malformed currency code
-		// (not exactly 3 letters). Fall back to USD rather than break rendering.
-		return new Intl.NumberFormat(getDateLocale(), {
-			style: 'currency',
-			currency: 'USD'
-		}).format(safe);
+		return moneyFormatter('CLP').format(safe);
 	}
 }
 

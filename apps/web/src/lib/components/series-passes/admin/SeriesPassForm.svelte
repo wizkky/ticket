@@ -26,10 +26,10 @@
 	import {
 		SUPPORTED_CURRENCIES,
 		CURRENCY_SYMBOLS,
-		normalizeDecimalInput,
 		toDatetimeLocal,
 		toTimezoneAwareISO
 	} from '$lib/components/events/admin/tier-form-helpers';
+	import { normalizeMoneyInput, moneyInputPattern, moneyInputValue } from '$lib/utils/money-input';
 	import { extractErrorMessage, extractFieldErrors } from '$lib/utils/errors';
 	import { formatDateTimeReadback } from '$lib/utils/date';
 	import PassTierMappingSection from './PassTierMappingSection.svelte';
@@ -53,9 +53,11 @@
 	// Scalar form state, seeded from the pass in edit mode.
 	let name = $state(pass?.name ?? '');
 	let description = $state(pass?.description ?? '');
-	let price = $state(pass?.price ?? '');
-	let proRataDiscount = $state(pass?.pro_rata_discount ?? '');
-	let currency = $state(pass?.currency?.toUpperCase() ?? 'EUR');
+	let price = $state(moneyInputValue(pass?.price ?? '', pass?.currency ?? 'CLP'));
+	let proRataDiscount = $state(
+		moneyInputValue(pass?.pro_rata_discount ?? '', pass?.currency ?? 'CLP')
+	);
+	let currency = $state(pass?.currency?.toUpperCase() ?? 'CLP');
 	let paymentMethod = $state<PaymentMethod>(pass?.payment_method ?? 'online');
 	let purchasableBy = $state<PurchasableBy>(pass?.purchasable_by ?? 'public');
 	let visibility = $state<Visibility>(pass?.visibility ?? 'public');
@@ -145,8 +147,8 @@
 			updateMutationObj.mutate({
 				name: name.trim(),
 				description: description.trim() || null,
-				price: normalizeDecimalInput(price) || '0',
-				pro_rata_discount: normalizeDecimalInput(proRataDiscount) || '0',
+				price: normalizeMoneyInput(price, currency) || '0',
+				pro_rata_discount: normalizeMoneyInput(proRataDiscount, currency) || '0',
 				payment_method: paymentMethod,
 				purchasable_by: purchasableBy,
 				visibility,
@@ -158,8 +160,8 @@
 			createMutationObj.mutate({
 				name: name.trim(),
 				description: description.trim() || null,
-				price: normalizeDecimalInput(price) || '0',
-				pro_rata_discount: normalizeDecimalInput(proRataDiscount) || '0',
+				price: normalizeMoneyInput(price, currency) || '0',
+				pro_rata_discount: normalizeMoneyInput(proRataDiscount, currency) || '0',
 				currency: currency as SeriesPassCreateSchema['currency'],
 				payment_method: paymentMethod,
 				purchasable_by: purchasableBy,
@@ -230,9 +232,10 @@
 						<Input
 							id="pass-price"
 							type="text"
-							inputmode="decimal"
+							inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+							pattern={moneyInputPattern(currency)}
 							bind:value={price}
-							oninput={() => (price = normalizeDecimalInput(price))}
+							oninput={() => (price = normalizeMoneyInput(price, currency))}
 							required
 							class="pl-8"
 							disabled={isPending}
@@ -255,9 +258,10 @@
 						<Input
 							id="pass-discount"
 							type="text"
-							inputmode="decimal"
+							inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+							pattern={moneyInputPattern(currency)}
 							bind:value={proRataDiscount}
-							oninput={() => (proRataDiscount = normalizeDecimalInput(proRataDiscount))}
+							oninput={() => (proRataDiscount = normalizeMoneyInput(proRataDiscount, currency))}
 							required
 							class="pl-8"
 							disabled={isPending}

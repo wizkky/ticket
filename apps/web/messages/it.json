@@ -10317,7 +10317,7 @@
 		"commune": "Località dell’evento",
 		"allCommunes": "Tutta la regione di Los Ríos",
 		"communeHint": "Filtra per luogo dell’evento. Puoi prenotare da qualsiasi luogo.",
-		"paymentScope": "Demo funzionale · Gratuito o pagamento all’ingresso. Importi demo in EUR; nessun pagamento online o liquidazione.",
+		"paymentScope": "Anteprima funzionale · Biglietti gratuiti o pagamento all’ingresso in pesos cileni (CLP), senza decimali. Nessun addebito online o liquidazione.",
 		"eventLocationHint": "Questa agenda raccoglie eventi di Los Ríos. Il luogo non modifica la residenza degli acquirenti.",
 		"fromPrice": "Da {price}",
 		"freeTicket": "Opzioni gratuite",
@@ -10327,6 +10327,7 @@
 		"createdAt": "Creata:",
 		"salesAlways": "Vendita senza limiti di data",
 		"salesFrom": "Dal {date}",
-		"salesUntil": "Fino al {date}"
+		"salesUntil": "Fino al {date}",
+		"pesoHint": "Pesos cileni, senza decimali. Esempi: $5.000 o $5.500."
 	}
 }

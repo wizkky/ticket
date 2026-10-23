@@ -310,7 +310,7 @@ def cart_is_certainly_free(
     if discount_code is None:
         return False
     candidates = [tier.price, *parse_price_map(tier.category_prices).values()]
-    return all(calculate_discounted_unit_price(price, discount_code) <= ZERO for price in candidates)
+    return all(calculate_discounted_unit_price(price, discount_code, tier.currency) <= ZERO for price in candidates)
 
 
 def build_batch_pricing(
@@ -353,7 +353,7 @@ def build_batch_pricing(
         if discount_code is None:
             lines.append(TicketPrice(unit_price=base_price, discount_amount=ZERO))
             continue
-        unit_price = calculate_discounted_unit_price(base_price, discount_code)
+        unit_price = calculate_discounted_unit_price(base_price, discount_code, tier.currency)
         lines.append(TicketPrice(unit_price=unit_price, discount_amount=base_price - unit_price))
 
     return BatchPricing(lines=lines, total=sum((line.unit_price for line in lines), ZERO))

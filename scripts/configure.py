@@ -57,6 +57,7 @@ write_new(
         "BASE_URL": "http://localhost:8000",
         "FRONTEND_BASE_URL": "http://localhost:5173",
         "SITE_NAME": "CaudalTickets",
+        "DEFAULT_TICKET_CURRENCY": "CLP",
         "FEATURE_ORGANIZATION_CREATION": "True",
         "FEATURE_MALWARE_SCAN": "False",
         "FEATURE_TELEGRAM": "False",

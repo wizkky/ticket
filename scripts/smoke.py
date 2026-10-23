@@ -12,6 +12,7 @@ import argparse
 import json
 import shutil
 import subprocess
+from decimal import Decimal
 import sys
 import typing as t
 from concurrent.futures import ThreadPoolExecutor
@@ -149,7 +150,7 @@ def main() -> None:
     door_tier_path = (
         f"/api/event-admin/{event_a}/ticket-tier/{demo['tiers']['a']['at_the_door']}"
     )
-    tier_update = {"currency": "EUR", "price": "10.00"}
+    tier_update = {"currency": demo["tiers"]["a"]["currency"], "price": demo["tiers"]["a"]["price"]}
     request(
         "PUT",
         door_tier_path,
@@ -159,7 +160,7 @@ def main() -> None:
     )
     request("PUT", door_tier_path, token=tokens["producer_a"], body=tier_update)
     passed(
-        "Tarifa EUR editable vía API por su productor; otro productor no puede modificarla"
+        "Tarifa CLP editable vía API por su productor; otro productor no puede modificarla"
     )
 
     checkout_path = f"/api/events/{event_a}/checkout"
@@ -301,15 +302,15 @@ def main() -> None:
         "La reserva usa otro medio de pago.",
     )
     require(
-        door_ticket["tier"]["currency"] == "EUR"
-        and float(door_ticket["tier"]["price"]) == 10,
-        "La reserva no respeta el precio configurado de 10 EUR.",
+        door_ticket["tier"]["currency"] == demo["tiers"]["a"]["currency"]
+        and Decimal(str(door_ticket["tier"]["price"])) == Decimal(demo["tiers"]["a"]["price"]),
+        "La reserva no respeta el precio configurado en pesos chilenos.",
     )
     require(
         door_ticket["payment"] is None,
         "La reserva en puerta creó un pago online inesperado.",
     )
-    passed("Reserva de 10 EUR en puerta sin simular pago de tarjeta")
+    passed("Reserva en CLP con pago en puerta sin simular pago de tarjeta")
 
     buyer_tickets = request("GET", "/api/dashboard/tickets", token=tokens["buyer"])
     ids = {item["id"] for item in buyer_tickets["results"]}

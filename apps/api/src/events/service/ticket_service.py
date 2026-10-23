@@ -14,6 +14,7 @@ from django.utils.translation import gettext_lazy as _
 from ninja.errors import HttpError
 
 from accounts.models import RevelUser
+from common.money import valid_currency_precision
 from events.compliance import enforcement as compliance
 from events.exceptions import (
     BillingInfoRequiredError,
@@ -424,6 +425,9 @@ def confirm_ticket_payment(ticket: Ticket, price_paid: Decimal | None = None) ->
 
     if is_pwyc and price_paid is None and ticket.price_paid is None:
         raise HttpError(400, str(_("Price paid is required for Pay What You Can tiers.")))
+
+    if not valid_currency_precision(price_paid, ticket.tier.currency):
+        raise HttpError(400, str(_("Enter a whole number.")))
 
     update_fields = ["status"]
 

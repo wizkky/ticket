@@ -166,8 +166,8 @@ def _block_reason(ticket: Ticket, now: datetime) -> CancellationBlockReason | No
     return None
 
 
-def _refund_for_tier(gross: Decimal, tier_pct: Decimal, flat_fee: Decimal) -> Decimal:
-    """Per-tier refund: ``gross × pct / 100 − flat_fee``, clamped to zero, quantized to cents.
+def _refund_for_tier(gross: Decimal, tier_pct: Decimal, flat_fee: Decimal, currency: str = "EUR") -> Decimal:
+    """Per-tier refund: ``gross × pct / 100 − flat_fee``, clamped to zero, rounded to the currency precision.
 
     Single source of truth for the refund formula — used by both ``_compute_refund``
     (live quote against the user's current ``hours_remaining``) and ``_derive_windows``
@@ -176,13 +176,13 @@ def _refund_for_tier(gross: Decimal, tier_pct: Decimal, flat_fee: Decimal) -> De
     adjusted = (gross * tier_pct) / Decimal(100) - flat_fee
     if adjusted <= _ZERO:
         return _ZERO
-    return adjusted.quantize(_CENT, rounding=ROUND_HALF_UP)
+    return adjusted.quantize(Decimal("1") if currency == "CLP" else _CENT, rounding=ROUND_HALF_UP)
 
 
-def _compute_refund(policy: RefundPolicy, hours_remaining: Decimal, gross: Decimal) -> Decimal:
+def _compute_refund(policy: RefundPolicy, hours_remaining: Decimal, gross: Decimal, currency: str = "EUR") -> Decimal:
     for tier in policy.tiers:
         if hours_remaining >= tier.hours_before_event:
-            return _refund_for_tier(gross, tier.refund_percentage, policy.flat_fee)
+            return _refund_for_tier(gross, tier.refund_percentage, policy.flat_fee, currency)
     return _ZERO
 
 
@@ -236,7 +236,7 @@ def quote_cancellation(ticket: Ticket, now: datetime) -> RefundQuote:
     delta = ticket.event.start - now
     total_microseconds = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
     hours_remaining = Decimal(total_microseconds) / Decimal(3_600_000_000)
-    refund = _compute_refund(policy, hours_remaining, gross)
+    refund = _compute_refund(policy, hours_remaining, gross, currency)
     # Policy math stays gross-based (the preview windows display policy tiers),
     # but the quoted amount must never exceed what is actually still refundable —
     # a prior organizer partial refund (#865) reduces the remainder while the
@@ -256,10 +256,11 @@ def _derive_windows(
     policy: RefundPolicy,
     event_start: datetime,
     gross: Decimal,
+    currency: str = "EUR",
 ) -> list[RefundWindowDto]:
     windows: list[RefundWindowDto] = []
     for tier in policy.tiers:
-        amount = _refund_for_tier(gross, tier.refund_percentage, policy.flat_fee)
+        amount = _refund_for_tier(gross, tier.refund_percentage, policy.flat_fee, currency)
         windows.append(
             RefundWindowDto(
                 refund_percentage=tier.refund_percentage,
@@ -283,7 +284,11 @@ def build_cancellation_preview(ticket: Ticket, now: datetime) -> CancellationPre
     quote = quote_cancellation(ticket, now)
     policy = _load_snapshot(ticket)
     gross = _ticket_amount(ticket)
-    windows = _derive_windows(policy, ticket.event.start, gross) if policy is not None and gross > _ZERO else []
+    windows = (
+        _derive_windows(policy, ticket.event.start, gross, quote.currency)
+        if policy is not None and gross > _ZERO
+        else []
+    )
     flat_fee = policy.flat_fee if policy is not None else _ZERO
     return CancellationPreview(
         can_cancel=quote.can_cancel,

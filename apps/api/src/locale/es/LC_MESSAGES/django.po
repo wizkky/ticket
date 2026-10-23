@@ -6594,3 +6594,7 @@ msgid ""
 msgstr ""
 "La generación del pase para Wallet no está disponible temporalmente. "
 "Inténtalo de nuevo más tarde."
+
+#: events/models/ticket.py
+msgid "Create a new ticket tier to change currency after tickets have been issued."
+msgstr "Crea un nuevo tipo de entrada para cambiar la moneda después de emitir entradas."

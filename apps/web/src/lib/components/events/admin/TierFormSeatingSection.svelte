@@ -13,7 +13,9 @@
 		PriceCategorySchema
 	} from '$lib/api/generated/types.gen';
 
+	import { normalizeMoneyInput, moneyInputPattern, moneyInputValue } from '$lib/utils/money-input';
 	interface Props {
+		currency?: string;
 		seatAssignmentMode: SeatAssignmentMode;
 		maxTicketsPerUser: string;
 		sectorId: string | null;
@@ -41,6 +43,7 @@
 	}
 
 	let {
+		currency = 'CLP',
 		seatAssignmentMode = $bindable(),
 		maxTicketsPerUser = $bindable(),
 		sectorId = $bindable(),
@@ -74,7 +77,7 @@
 	// Keep money inputs dot-decimal as the user types (mirrors the VAT input).
 	function handlePriceInput(categoryId: string, event: Event): void {
 		const raw = (event.currentTarget as HTMLInputElement).value;
-		categoryPrices = { ...categoryPrices, [categoryId]: raw.replace(',', '.') };
+		categoryPrices = { ...categoryPrices, [categoryId]: normalizeMoneyInput(raw, currency) };
 	}
 </script>
 
@@ -419,11 +422,14 @@
 											<Input
 												id="category-price-{category.id}"
 												type="text"
-												inputmode="decimal"
+												inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+												pattern={moneyInputPattern(currency)}
 												class="pl-8"
-												value={categoryPrices[category.id] ?? ''}
+												value={moneyInputValue(categoryPrices[category.id] ?? '', currency)}
 												oninput={(e) => category.id && handlePriceInput(category.id, e)}
-												placeholder={m['tierForm.categoryPrices.placeholder']()}
+												placeholder={currency === 'CLP'
+													? '5000'
+													: m['tierForm.categoryPrices.placeholder']()}
 												disabled={isPending}
 											/>
 										</div>

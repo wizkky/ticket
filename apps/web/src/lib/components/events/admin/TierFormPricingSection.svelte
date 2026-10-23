@@ -11,7 +11,9 @@
 	import { Info } from '@lucide/svelte';
 	import { estimateNetPayout, type PlatformFeeInfo } from '$lib/utils/fees';
 	import { formatMoney } from '$lib/utils/format';
-	import { SUPPORTED_CURRENCIES, normalizeDecimalInput } from './tier-form-helpers';
+	import { SUPPORTED_CURRENCIES } from './tier-form-helpers';
+
+	import { normalizeMoneyInput, moneyInputPattern } from '$lib/utils/money-input';
 
 	interface Props {
 		priceType: 'fixed' | 'pwyc';
@@ -44,7 +46,7 @@
 	const netPayout = $derived.by(() => {
 		if (!showNetPayout || !platformFees) return null;
 		const effectivePrice = parseFloat(
-			normalizeDecimalInput(priceType === 'fixed' ? price : pwycMin)
+			normalizeMoneyInput(priceType === 'fixed' ? price : pwycMin, currency)
 		);
 		return estimateNetPayout({
 			price: effectivePrice,
@@ -82,7 +84,7 @@
 		{/each}
 	</select>
 	<p class="mt-1 text-xs text-muted-foreground">
-		{m['tierForm.currencyHelp']()}
+		{currency === 'CLP' ? m['workspace.pesoHint']() : m['tierForm.currencyHelp']()}
 	</p>
 </div>
 
@@ -96,10 +98,11 @@
 			<Input
 				id="price"
 				type="text"
-				inputmode="decimal"
+				inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+				pattern={moneyInputPattern(currency)}
 				value={price}
 				oninput={(e) => {
-					price = normalizeDecimalInput((e.currentTarget as HTMLInputElement).value);
+					price = normalizeMoneyInput((e.currentTarget as HTMLInputElement).value, currency);
 				}}
 				required
 				disabled={isPending}
@@ -118,10 +121,11 @@
 				<Input
 					id="pwyc-min"
 					type="text"
-					inputmode="decimal"
+					inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+					pattern={moneyInputPattern(currency)}
 					value={pwycMin}
 					oninput={(e) => {
-						pwycMin = normalizeDecimalInput((e.currentTarget as HTMLInputElement).value);
+						pwycMin = normalizeMoneyInput((e.currentTarget as HTMLInputElement).value, currency);
 					}}
 					required
 					disabled={isPending}
@@ -138,10 +142,11 @@
 				<Input
 					id="pwyc-max"
 					type="text"
-					inputmode="decimal"
+					inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+					pattern={moneyInputPattern(currency)}
 					value={pwycMax}
 					oninput={(e) => {
-						pwycMax = normalizeDecimalInput((e.currentTarget as HTMLInputElement).value);
+						pwycMax = normalizeMoneyInput((e.currentTarget as HTMLInputElement).value, currency);
 					}}
 					disabled={isPending}
 					class="pl-10"

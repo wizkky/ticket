@@ -75,8 +75,9 @@ reservas de la organización.
 
 ## Límites pendientes
 
-- Pagos online, CLP y liquidaciones siguen pendientes. La demostración conserva
-  importes en EUR y no realiza cargos. El estado activo de una reserva en puerta habilita su entrada; no prueba que se
+- Las nuevas tarifas de demostración usan CLP, sin decimales ($5.000 / $5.500).
+  Las tarifas anteriores en EUR se retiran de la venta pública y conservan su historial.
+  Pagos online y liquidaciones siguen pendientes; la demostración no realiza cargos. El estado activo de una reserva en puerta habilita su entrada; no prueba que se
   haya cobrado. El productor debe comprobar el cobro presencial. La confirmación
   de pagos pendientes conserva las reglas existentes de Revel.
 - Los controles con cámara necesitan un dispositivo y permiso reales; el recorrido

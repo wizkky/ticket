@@ -10317,7 +10317,7 @@
 		"commune": "Localidade do evento",
 		"allCommunes": "Toda a região de Los Ríos",
 		"communeHint": "Filtra pelo local do evento. Podes reservar de qualquer lugar.",
-		"paymentScope": "Demonstração funcional · Gratuito ou pagamento à entrada. Valores demo em EUR; sem cobranças online ou liquidações.",
+		"paymentScope": "Prévia funcional · Entradas gratuitas ou pagamento na porta em pesos chilenos (CLP), sem decimais. Sem cobranças online ou liquidações.",
 		"eventLocationHint": "Esta agenda reúne eventos de Los Ríos. O local não altera a residência dos compradores.",
 		"fromPrice": "Desde {price}",
 		"freeTicket": "Opções gratuitas",
@@ -10327,6 +10327,7 @@
 		"createdAt": "Criada:",
 		"salesAlways": "Venda sem limite de datas",
 		"salesFrom": "A partir de {date}",
-		"salesUntil": "Até {date}"
+		"salesUntil": "Até {date}",
+		"pesoHint": "Pesos chilenos, sem decimais. Exemplos: $5.000 ou $5.500."
 	}
 }

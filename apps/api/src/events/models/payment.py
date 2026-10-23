@@ -39,7 +39,7 @@ class Payment(TimeStampedModel):
     status = models.CharField(max_length=20, choices=PaymentStatus.choices, default=PaymentStatus.PENDING)
     amount = models.DecimalField(max_digits=10, decimal_places=2)
     platform_fee = models.DecimalField(max_digits=10, decimal_places=2)
-    currency = models.CharField(max_length=3, default=settings.DEFAULT_CURRENCY)
+    currency = models.CharField(max_length=3, default=settings.DEFAULT_TICKET_CURRENCY)
 
     # Ticket sale VAT breakdown (calculated in-house, all nullable for historical payments)
     net_amount = models.DecimalField(

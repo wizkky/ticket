@@ -5,6 +5,8 @@ from decouple import Csv, config
 # Platform settlement currency — used as the default for ticket tiers, payments,
 # exchange rate base, and referral payouts.
 DEFAULT_CURRENCY = config("DEFAULT_CURRENCY", "EUR")
+# Ticket sales in Chile use whole pesos, independently of the platform's FX base.
+DEFAULT_TICKET_CURRENCY = config("DEFAULT_TICKET_CURRENCY", "CLP")
 DEFAULT_PLATFORM_FEE_PERCENT = config("DEFAULT_PLATFORM_FEE_PERCENT", cast=Decimal, default="1.50")
 DEFAULT_PLATFORM_FEE_FIXED = config("DEFAULT_PLATFORM_FEE_FIXED", cast=Decimal, default="0.25")
 STRIPE_SECRET_KEY = config("STRIPE_SECRET_KEY", default="sk_test_...")

@@ -183,6 +183,10 @@ def format_ticket_price(amount: Decimal | int | float, currency: str) -> str:
     """Price as printed on tickets and passes: ``EUR 25.00``, or the translated "Free"."""
     if amount == 0:
         return str(_("Free"))
+    if currency.upper() == "CLP":
+        from common.service.invoice_utils import format_currency
+
+        return format_currency(amount, currency)
     return f"{currency.upper()} {Decimal(str(amount)):.2f}"
 
 

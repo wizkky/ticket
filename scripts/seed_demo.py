@@ -172,25 +172,32 @@ def seed_demo() -> dict[str, t.Any]:
                 event.city = city
                 event.address = "Espacio de demostración · Valdivia, Chile"
                 event.save(update_fields=["city", "address"])
-            # Configure Revel's auto-created default tier rather than leaving a stray 0-price offline tier.
-            tier = event.ticket_tiers.filter(name="Entrada demo gratuita").first()
+            # Historic tickets read their currency from the tier: never relabel EUR as CLP.
+            # Retire only the old, explicitly seeded demo tiers. Their tickets and PDFs remain valid.
+            event.ticket_tiers.filter(
+                name__in=["Entrada demo gratuita", "Reserva demo · Pago en puerta"], currency="EUR"
+            ).update(sales_paused=True, visibility=TicketTier.Visibility.STAFF_ONLY)
+            free_name = "Entrada demo gratuita · CLP"
+            tier = event.ticket_tiers.filter(name=free_name).first()
             if tier is None:
-                tier = event.ticket_tiers.get(name=DEFAULT_TICKET_TIER_NAME)
-                tier.name = "Entrada demo gratuita"
+                tier = event.ticket_tiers.filter(name=DEFAULT_TICKET_TIER_NAME, currency="CLP").first()
+                if tier is None:
+                    tier = TicketTier(event=event)
+                tier.name = free_name
                 tier.payment_method = TicketTier.PaymentMethod.FREE
-                tier.currency = "EUR"
-                tier.description = (
-                    "Entrada sin costo para probar emisión de PDF y control de acceso."
-                )
+                tier.price = 0
+                tier.currency = "CLP"
+                tier.description = "Entrada sin costo para probar emisión de PDF y control de acceso."
                 tier.save()
+            demo_price = 5000 if suffix == "a" else 5500
             door_tier, _ = TicketTier.objects.get_or_create(
                 event=event,
-                name="Reserva demo · Pago en puerta",
+                name="Reserva demo · Pago en puerta · CLP",
                 defaults={
                     "payment_method": TicketTier.PaymentMethod.AT_THE_DOOR,
-                    "price": 10,
-                    "currency": "EUR",
-                    "description": "Reserva de prueba de 10 EUR. No cobra tarjeta ni confirma pago bancario.",
+                    "price": demo_price,
+                    "currency": "CLP",
+                    "description": "Reserva de demostración en pesos chilenos. Pago presencial, sin cobro online.",
                     "display_order": 1,
                 },
             )
@@ -208,6 +215,8 @@ def seed_demo() -> dict[str, t.Any]:
             manifest["tiers"][suffix] = {
                 "free": str(tier.id),
                 "at_the_door": str(door_tier.id),
+                "currency": door_tier.currency,
+                "price": str(door_tier.price),
             }
 
     write_private_json(MANIFEST_PATH, manifest)

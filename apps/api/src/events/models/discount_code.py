@@ -6,6 +6,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from common.models import TimeStampedModel
+from common.money import valid_currency_precision
 
 if t.TYPE_CHECKING:
     from .organization import Organization
@@ -167,6 +168,15 @@ class DiscountCode(TimeStampedModel):
         # Validate currency for FIXED_AMOUNT
         if self.discount_type == self.DiscountType.FIXED_AMOUNT and not self.currency:
             raise ValidationError({"currency": _("Currency is required for fixed amount discounts.")})
+
+        if self.discount_type == self.DiscountType.FIXED_AMOUNT and self.currency:
+            precision_errors = {
+                field: _("Enter a whole number.")
+                for field in ("discount_value", "min_purchase_amount")
+                if not valid_currency_precision(getattr(self, field), self.currency)
+            }
+            if precision_errors:
+                raise ValidationError(precision_errors)
 
     def __str__(self) -> str:
         return f"{self.code} ({self.organization})"

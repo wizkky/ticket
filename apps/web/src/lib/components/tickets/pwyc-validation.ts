@@ -39,11 +39,14 @@ export function pwycBounds(
 export function validatePwycAmount(
 	raw: string,
 	minAmount: number,
-	maxAmount: number | null
+	maxAmount: number | null,
+	currency?: string
 ): PwycValidation {
 	const trimmed = raw.trim();
 	if (!trimmed) return { valid: false, error: 'empty' };
 	const value = parseFloat(trimmed);
+	if (currency?.toUpperCase() === 'CLP' && !/^\d+$/.test(trimmed))
+		return { valid: false, error: 'invalid' };
 	if (isNaN(value)) return { valid: false, error: 'invalid' };
 	if (value < minAmount) return { valid: false, error: 'below_min' };
 	if (maxAmount !== null && value > maxAmount) return { valid: false, error: 'above_max' };

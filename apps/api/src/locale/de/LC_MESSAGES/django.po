@@ -6682,3 +6682,7 @@ msgid ""
 msgstr ""
 "Die Erstellung des Wallet-Passes ist vorübergehend nicht verfügbar. Bitte "
 "versuche es später erneut."
+
+#: events/models/ticket.py
+msgid "Create a new ticket tier to change currency after tickets have been issued."
+msgstr "Erstelle eine neue Ticketkategorie, um die Währung nach der Ticketausgabe zu ändern."

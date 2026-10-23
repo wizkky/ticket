@@ -10317,7 +10317,7 @@
 		"commune": "Comuna del evento",
 		"allCommunes": "Toda la Región de Los Ríos",
 		"communeHint": "Filtra por dónde ocurre el evento. Puedes comprar desde cualquier lugar.",
-		"paymentScope": "Prueba funcional · Gratuitas o pago en puerta. Importes de demostración en EUR; sin cobros online ni liquidaciones.",
+		"paymentScope": "Prueba funcional · Entradas gratuitas o con pago en puerta, en pesos chilenos (CLP), sin decimales. Sin cobros online ni liquidaciones.",
 		"eventLocationHint": "Esta agenda reúne eventos de Los Ríos. El lugar del evento no cambia la residencia de quienes compran.",
 		"fromPrice": "Desde {price}",
 		"freeTicket": "Opciones gratuitas",
@@ -10327,6 +10327,7 @@
 		"createdAt": "Creada:",
 		"salesAlways": "Venta sin límite de fechas",
 		"salesFrom": "Desde {date}",
-		"salesUntil": "Hasta {date}"
+		"salesUntil": "Hasta {date}",
+		"pesoHint": "Pesos chilenos, sin decimales. Ejemplos: $5.000 o $5.500."
 	}
 }

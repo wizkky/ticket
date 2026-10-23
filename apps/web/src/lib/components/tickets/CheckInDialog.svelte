@@ -12,6 +12,7 @@
 		saleSourceLabel
 	} from '$lib/utils/ticket-helpers';
 
+	import { normalizeMoneyInput, moneyInputPattern } from '$lib/utils/money-input';
 	interface TicketUser {
 		email?: string;
 		first_name?: string;
@@ -104,7 +105,11 @@
 	 * Whether the confirm button can be clicked
 	 */
 	const canSubmit = $derived(
-		!isLoading && (!needsPwycInput || (pwycPricePaid !== '' && parseFloat(pwycPricePaid) > 0))
+		!isLoading &&
+			(!needsPwycInput ||
+				(pwycPricePaid !== '' &&
+					parseFloat(pwycPricePaid) > 0 &&
+					(ticket?.tier?.currency !== 'CLP' || /^\d+$/.test(pwycPricePaid))))
 	);
 
 	/**
@@ -117,7 +122,7 @@
 
 		const min = ticket.tier.pwyc_min ? parseFloat(ticket.tier.pwyc_min) : null;
 		const max = ticket.tier.pwyc_max ? parseFloat(ticket.tier.pwyc_max) : null;
-		const currency = ticket.tier.currency?.toUpperCase() || 'EUR';
+		const currency = ticket.tier.currency?.toUpperCase() || 'CLP';
 		const fmt = (v: number) => formatMoney(v, currency);
 
 		if (min !== null && max !== null && (num < min || num > max)) {
@@ -136,7 +141,7 @@
 		if (!needsPwycInput || !ticket?.tier) return null;
 		const min = ticket.tier.pwyc_min ? parseFloat(ticket.tier.pwyc_min) : null;
 		const max = ticket.tier.pwyc_max ? parseFloat(ticket.tier.pwyc_max) : null;
-		const currency = ticket.tier.currency?.toUpperCase() || 'EUR';
+		const currency = ticket.tier.currency?.toUpperCase() || 'CLP';
 		const fmt = (v: number) => formatMoney(v, currency);
 
 		if (min !== null && max !== null)
@@ -398,20 +403,22 @@
 					<div class="space-y-2">
 						<label for="checkin-pwyc-price-input" class="block text-sm font-medium text-foreground">
 							{m['checkInDialog.amountPaid']({
-								currency: ticket.tier?.currency?.toUpperCase() || 'EUR'
+								currency: ticket.tier?.currency?.toUpperCase() || 'CLP'
 							})}
 						</label>
 						<Input
 							id="checkin-pwyc-price-input"
 							type="text"
-							inputmode="decimal"
+							inputmode={ticket.tier?.currency === 'CLP' ? 'numeric' : 'decimal'}
+							pattern={moneyInputPattern(ticket.tier?.currency ?? 'CLP')}
 							value={pwycPricePaid}
 							oninput={(e) => {
-								pwycPricePaid = (e.currentTarget as HTMLInputElement).value
-									.replace(/,/g, '.')
-									.replace(/[^\d.]/g, '');
+								pwycPricePaid = normalizeMoneyInput(
+									(e.currentTarget as HTMLInputElement).value,
+									ticket.tier?.currency ?? 'CLP'
+								);
 							}}
-							placeholder={ticket.tier?.pwyc_min || '0.00'}
+							placeholder={ticket.tier?.pwyc_min || '0'}
 							aria-describedby={pwycWarning
 								? 'checkin-pwyc-warning'
 								: pwycRangeHint

@@ -15,6 +15,7 @@ from django.template.loader import render_to_string
 from weasyprint import HTML
 
 CURRENCY_SYMBOLS: dict[str, str] = {
+    "CLP": "$",
     "EUR": "\u20ac",
     "USD": "$",
     "GBP": "\u00a3",
@@ -37,6 +38,8 @@ def format_currency(value: Decimal | float | str, currency: str = "EUR") -> str:
     """
     symbol = CURRENCY_SYMBOLS.get(currency, currency + " ")
     numeric = Decimal(str(value)) if not isinstance(value, (int, float, Decimal)) else value
+    if currency.upper() == "CLP":
+        return f"${numeric:,.0f}".replace(",", ".")
     return f"{symbol}{numeric:,.2f}"
 
 

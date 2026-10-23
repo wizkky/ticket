@@ -6533,3 +6533,7 @@ msgid ""
 msgstr ""
 "A geração do passe para a Wallet está temporariamente indisponível. Tenta "
 "novamente mais tarde."
+
+#: events/models/ticket.py
+msgid "Create a new ticket tier to change currency after tickets have been issued."
+msgstr "Crie um novo tipo de entrada para alterar a moeda após a emissão das entradas."

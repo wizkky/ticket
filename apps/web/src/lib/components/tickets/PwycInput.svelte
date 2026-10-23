@@ -5,6 +5,7 @@
 	import { Label } from '$lib/components/ui/label';
 	import { formatMoney } from '$lib/utils/format';
 
+	import { normalizeMoneyInput, moneyInputPattern } from '$lib/utils/money-input';
 	interface Props {
 		currency: string;
 		minAmount: number;
@@ -57,17 +58,16 @@
 			<Input
 				id={amountId}
 				type="text"
-				inputmode="decimal"
+				inputmode={currency === 'CLP' ? 'numeric' : 'decimal'}
+				pattern={moneyInputPattern(currency)}
 				value={pwycAmount}
 				oninput={(e) => {
-					const val = (e.currentTarget as HTMLInputElement).value
-						.replace(/,/g, '.')
-						.replace(/[^\d.]/g, '');
+					const val = normalizeMoneyInput((e.currentTarget as HTMLInputElement).value, currency);
 					onAmountChange(val);
 				}}
 				onkeydown={onKeydown}
 				class="pl-12 text-lg font-semibold"
-				placeholder={minAmount.toFixed(2)}
+				placeholder={minAmount.toFixed(currency === 'CLP' ? 0 : 2)}
 				disabled={isProcessing}
 				aria-invalid={hasError ? 'true' : 'false'}
 				aria-describedby={hasError ? errorId : undefined}
@@ -89,7 +89,7 @@
 					variant="outline"
 					size="sm"
 					onclick={() => {
-						onAmountChange(suggested.toFixed(2));
+						onAmountChange(suggested.toFixed(currency === 'CLP' ? 0 : 2));
 					}}
 					disabled={isProcessing}
 				>

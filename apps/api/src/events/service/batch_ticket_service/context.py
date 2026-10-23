@@ -9,6 +9,7 @@ from django.utils.translation import gettext_lazy as _
 from ninja.errors import HttpError
 
 from accounts.models import RevelUser
+from common.money import valid_currency_precision
 from events.models import Event, TicketAttribution, TicketTier
 from events.models.discount_code import DiscountCode
 from events.schema import TicketPurchaseItem
@@ -50,6 +51,9 @@ def assert_pwyc_amount(group: CartGroup) -> None:
         raise HttpError(400, str(_("This tier does not accept a pay-what-you-can amount.")))
     if group.pwyc_amount is None:
         return
+    if not valid_currency_precision(group.pwyc_amount, tier.currency):
+        raise HttpError(400, str(_("Enter a whole number.")))
+
     if group.pwyc_amount < tier.pwyc_min:
         raise HttpError(400, str(_("PWYC amount must be at least {min_amount}")).format(min_amount=tier.pwyc_min))
     if tier.pwyc_max and group.pwyc_amount > tier.pwyc_max:

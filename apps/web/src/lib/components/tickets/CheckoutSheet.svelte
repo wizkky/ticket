@@ -183,7 +183,8 @@
 			const validation = validatePwycAmount(
 				group.pwycAmount ?? '',
 				bounds.minAmount,
-				bounds.maxAmount
+				bounds.maxAmount,
+				group.tier.currency
 			);
 			if (!validation.valid) return { group, validation, bounds };
 		}

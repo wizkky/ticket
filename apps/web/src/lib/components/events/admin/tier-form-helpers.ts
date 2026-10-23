@@ -3,6 +3,8 @@
  * Extracted verbatim during the #544 file-length split — no behavior change.
  */
 
+import { normalizeMoneyInput } from '$lib/utils/money-input';
+
 export const CURRENCY_SYMBOLS: Record<string, string> = {
 	AUD: 'A$',
 	BRL: 'R$',
@@ -11,6 +13,7 @@ export const CURRENCY_SYMBOLS: Record<string, string> = {
 	CNY: 'CN¥',
 	CZK: 'Kč',
 	DKK: 'kr',
+	CLP: '$',
 	EUR: '€',
 	GBP: '£',
 	HKD: 'HK$',
@@ -37,6 +40,7 @@ export const CURRENCY_SYMBOLS: Record<string, string> = {
 };
 
 export const SUPPORTED_CURRENCIES = [
+	{ code: 'CLP', name: 'Peso chileno' },
 	{ code: 'AUD', name: 'Australian Dollar' },
 	{ code: 'BRL', name: 'Brazilian Real' },
 	{ code: 'CAD', name: 'Canadian Dollar' },
@@ -121,15 +125,7 @@ export function toTimezoneAwareISO(datetimeLocal: string): string {
 
 /** Normalize decimal input: replace comma with dot, strip invalid chars, allow only one dot */
 export function normalizeDecimalInput(value: string): string {
-	let normalized = value.replace(/,/g, '.');
-	normalized = normalized.replace(/[^\d.]/g, '');
-	const firstDotIndex = normalized.indexOf('.');
-	if (firstDotIndex !== -1) {
-		normalized =
-			normalized.slice(0, firstDotIndex + 1) +
-			normalized.slice(firstDotIndex + 1).replace(/\./g, '');
-	}
-	return normalized;
+	return normalizeMoneyInput(value, 'EUR');
 }
 
 /**

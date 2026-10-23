@@ -20,6 +20,7 @@ from django.utils.translation import gettext_lazy as _
 from ninja.errors import HttpError
 
 from accounts.models import RevelUser
+from common.money import valid_currency_precision
 from events.models import Event, HeldSeriesPass, Ticket, TicketTier
 from events.service.seating.pricing import price_paid_is_admin_entered
 
@@ -188,6 +189,9 @@ def check_in_ticket(
 
     if is_pwyc_offsite and price_paid is None and ticket.price_paid is None:
         raise HttpError(400, str(_("Price paid is required for Pay What You Can tickets without a recorded payment.")))
+
+    if not valid_currency_precision(price_paid, ticket.tier.currency):
+        raise HttpError(400, str(_("Enter a whole number.")))
 
     # Update ticket status
     update_fields = ["status", "checked_in_at", "checked_in_by"]

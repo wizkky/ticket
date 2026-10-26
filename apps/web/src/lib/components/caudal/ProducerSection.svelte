@@ -8,13 +8,13 @@
 
 <section id="productores" class="producer-section" aria-labelledby="producer-title">
 	<div class="wrap producer-inner" use:reveal>
-		<p class="eyebrow">{m['caudal.producerLabel']()}</p>
+		<p class="eyebrow">{m['creative.publishLabel']()}</p>
 		<div class="producer-content">
 			<div>
 				<h2 id="producer-title">
-					{m['caudal.producerTitle']()}<br /><em>{m['caudal.producerSecond']()}</em>
+					{m['creative.publishTitle']()}
 				</h2>
-				<p>{m['caudal.producerCopy']()}</p>
+				<p>{m['creative.publishCopy']()}</p>
 				<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- producerHref is resolved above for both auth states -->
 				<a class="pill" href={producerHref}
 					>{m['caudal.producerAction']()}<ArrowUpRight size={20} strokeWidth={1.5} /></a
@@ -31,7 +31,7 @@
 	.wrap {
 		width: min(100%, 1700px);
 		margin-inline: auto;
-		padding-inline: var(--gutter);
+		padding-inline: clamp(22px, 4.7vw, 88px);
 	}
 	.eyebrow {
 		font-size: 10px;
@@ -80,10 +80,6 @@
 	}
 	.producer-content h2 {
 		max-width: 850px;
-	}
-	.producer-content em {
-		font-family: Georgia, serif;
-		font-weight: 400;
 	}
 	.producer-content p {
 		color: hsl(var(--muted-foreground));

@@ -1,3 +1,4 @@
+import { parseCategory, categoryTags } from '$lib/caudal/categories';
 import * as m from '$lib/paraglide/messages.js';
 import type { PageServerLoad } from './$types';
 import { eventpublicdiscoveryListEvents } from '$lib/api';
@@ -38,7 +39,8 @@ export const load: PageServerLoad = async ({ request, url, fetch, locals }) => {
 	const eventType = pickAllowed(url.searchParams.get('event_type'), EVENT_TYPES);
 	const visibility = pickAllowed(url.searchParams.get('visibility'), VISIBILITIES);
 	const tagsParam = url.searchParams.get('tags');
-	const tags = tagsParam ? tagsParam.split(',').filter(Boolean) : undefined;
+	const category = parseCategory(url.searchParams.get('category'));
+	const tags = categoryTags(category, tagsParam ? tagsParam.split(',').filter(Boolean) : undefined);
 	const includePast = url.searchParams.get('include_past') === 'true';
 	const ticketType = url.searchParams.get('ticket_type') || undefined;
 	const requiresTicket =
@@ -98,6 +100,7 @@ export const load: PageServerLoad = async ({ request, url, fetch, locals }) => {
 			nextUrl: response.data.next,
 			previousUrl: response.data.previous,
 			filters: {
+				category,
 				search,
 				cityId: cityId ? parseInt(cityId) : undefined,
 				organization,

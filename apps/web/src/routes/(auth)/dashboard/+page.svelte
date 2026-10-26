@@ -1,4 +1,5 @@
 <script lang="ts">
+	import MyCaudalLinks from '$lib/components/caudal/MyCaudalLinks.svelte';
 	import { authStore } from '$lib/stores/auth.svelte';
 	import { createQuery } from '@tanstack/svelte-query';
 	import {
@@ -403,6 +404,7 @@
 	</section>
 
 	<div class="container mx-auto -mt-12 px-4 pb-8 md:pb-12">
+		<MyCaudalLinks hasActivities={hasAnyEvents} />
 		<!-- Activity Summary Cards. `DashboardActivityCards` renders NOTHING
 		     when all three counts are zero (a brand-new user), so it cannot be
 		     trusted alone to land the -mt-12 pull-up on an opaque surface —

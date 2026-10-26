@@ -9,16 +9,19 @@
 <footer class="caudal-footer">
 	<div class="footer-top">
 		<a href={resolve('/(public)', {})}><RevelWordmark class="text-3xl" /></a>
-		<p>{m['caudal.footerLine']()}</p>
+		<p>{m['creative.heroOne']()}</p>
 		<a href="https://www.instagram.com/caudalcreativocl/"
 			>{m['caudal.followCaudal']()}<ArrowUpRight size={18} strokeWidth={1.5} /></a
 		>
 	</div>
-	<div class="footer-links">
-		<a href={resolve('/(public)/events', {})}>{m['caudal.explore']()}</a><a
-			href={resolve('/(public)/organizations', {})}>{m['nav.organizations']()}</a
-		><a href={resolve('/(auth)/dashboard/tickets', {})}>{m['nav.myTickets']()}</a>
-	</div>
+	<nav class="footer-links" aria-label={m['creative.ecosystem']()}>
+		<a href={resolve('/(public)/events', {})}>{m['creative.explore']()}</a>
+		<a href={resolve('/(public)/agenda', {})}>{m['creative.agenda']()}</a>
+		<a href={resolve('/(public)/comunidad', {})}>{m['creative.community']()}</a>
+		<a href={resolve('/(public)/ecosistema', {})}>{m['creative.ecosystem']()}</a>
+		<!-- i18n-ignore: service name --><a href={resolve('/(public)/tickets', {})}>Caudal Tickets</a>
+		<a href={resolve('/(auth)/dashboard', {})}>{m['creative.myCaudal']()}</a>
+	</nav>
 	<div class="mx-auto flex max-w-[1524px] justify-end pb-4"><MotionToggle /></div>
 	<div class="footer-bottom">
 		<p>{m['caudal.footerOrigin']()}</p>

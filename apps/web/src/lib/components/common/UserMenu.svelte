@@ -109,6 +109,20 @@
 			label: m['userMenu.dashboard'](),
 			icon: LayoutDashboard
 		},
+		{
+			href: resolve('/(auth)/producer', {}),
+			label: m['workspace.producerSpace'](),
+			icon: Building2
+		},
+		...($page.data.workspace?.platform_admin
+			? [
+					{
+						href: resolve('/(auth)/administration', {}),
+						label: m['workspace.administration'](),
+						icon: Shield
+					}
+				]
+			: []),
 		{ href: resolve('/(auth)/account/profile', {}), label: m['userMenu.profile'](), icon: User },
 		{
 			href: resolve('/(auth)/account/security', {}),

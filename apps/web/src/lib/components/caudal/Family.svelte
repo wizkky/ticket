@@ -7,12 +7,11 @@
 	const brands = {
 		creative: 'Caudal Creativo',
 		factoria: 'La Factoría',
-		subte: 'El Subte',
-		emergia: 'Emergia'
+		subte: 'El Subte'
 	};
 </script>
 
-<section class="family" aria-labelledby="family-title">
+<section id="ecosistema" class="family" aria-labelledby="family-title">
 	<div class="family-heading" use:reveal>
 		<p class="eyebrow">{m['caudal.familyLabel']()}</p>
 		<div class="family-intro">
@@ -50,15 +49,10 @@
 			/>
 			<p>{m['caudal.culture']()}</p>
 		</div>
-		<div class="sister emergia">
-			<img
-				src={asset('/brand/caudal/emergia.png')}
-				alt={brands.emergia}
-				width="1254"
-				height="1254"
-				loading="lazy"
-			/>
-			<p>{m['caudal.innovation']()}</p>
+		<div class="sister territorial">
+			<!-- i18n-ignore: initiative name -->
+			<h3>Hecho en<br /><em>Valdivia</em></h3>
+			<p>{m['creative.hechoCopy']()}</p>
 		</div>
 	</div>
 	<a class="family-link" href="https://www.instagram.com/caudalcreativocl/"
@@ -132,6 +126,16 @@
 	}
 	.family-grid .parent img {
 		height: auto;
+	}
+	.territorial h3 {
+		font-size: clamp(23px, 2.2vw, 36px);
+		font-weight: 400;
+		line-height: 1.15;
+		letter-spacing: -0.04em;
+		text-align: center;
+	}
+	.territorial em {
+		font-family: Georgia, serif;
 	}
 	.sister p {
 		font-size: 10px;

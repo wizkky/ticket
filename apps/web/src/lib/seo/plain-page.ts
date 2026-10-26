@@ -2,7 +2,7 @@
 import { OG_IMAGE_PATH, SITE_NAME, TWITTER_SITE } from './constants';
 import type { Robots, SeoConfig } from './types';
 
-export const DEFAULT_OG_IMAGE_ALT = 'Revel — Event Management for Communities';
+export const DEFAULT_OG_IMAGE_ALT = 'Caudal Creativo';
 
 export function defaultOgImage(origin: string): string {
 	return `${origin}${OG_IMAGE_PATH}`;
@@ -23,8 +23,8 @@ export function defaultOgImageMeta(origin: string): DefaultOgImageMeta {
 	return {
 		image: defaultOgImage(origin),
 		imageAlt: DEFAULT_OG_IMAGE_ALT,
-		imageWidth: 1200,
-		imageHeight: 630,
+		imageWidth: 2048,
+		imageHeight: 682,
 		imageType: 'image/png'
 	};
 }

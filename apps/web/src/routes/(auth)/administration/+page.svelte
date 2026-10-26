@@ -15,7 +15,7 @@
 </script>
 
 <svelte:head
-	><title>{m['workspace.administration']()} · CaudalTickets</title><meta
+	><title>{m['workspace.administration']()} · Caudal Creativo</title><meta
 		name="robots"
 		content="noindex,nofollow"
 	/></svelte:head

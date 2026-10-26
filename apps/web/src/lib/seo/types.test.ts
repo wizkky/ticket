@@ -22,7 +22,7 @@ describe('seo constants', () => {
 	});
 
 	it('defines site name and twitter handle', () => {
-		expect(SITE_NAME).toBe('CaudalTickets');
-		expect(TWITTER_SITE).toBe('@letsrevel');
+		expect(SITE_NAME).toBe('Caudal Creativo');
+		expect(TWITTER_SITE).toBe('');
 	});
 });

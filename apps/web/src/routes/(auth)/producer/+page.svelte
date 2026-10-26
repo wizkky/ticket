@@ -9,7 +9,7 @@
 </script>
 
 <svelte:head
-	><title>{m['workspace.producerSpace']()} · CaudalTickets</title><meta
+	><title>{m['workspace.producerSpace']()} · Caudal Creativo</title><meta
 		name="robots"
 		content="noindex,nofollow"
 	/></svelte:head

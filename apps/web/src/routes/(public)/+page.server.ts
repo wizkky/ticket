@@ -1,10 +1,13 @@
+import { buildSeo } from '$lib/seo';
+import { resolveLang } from '$lib/seo/server';
 import type { PageServerLoad } from './$types';
 import { eventpublicdiscoveryListEvents } from '$lib/api';
+import { loadCommunity } from '$lib/server/caudal/community';
 import { log } from '$lib/server/logger';
 import type { EventOffer } from '$lib/caudal/offers';
 import { loadOffers } from '$lib/server/caudal/offers';
 
-export const load: PageServerLoad = async ({ fetch }) => {
+async function loadActivities(fetch: typeof globalThis.fetch) {
 	try {
 		const response = await eventpublicdiscoveryListEvents({
 			fetch,
@@ -21,4 +24,13 @@ export const load: PageServerLoad = async ({ fetch }) => {
 		log.warning('caudal_home_events_unavailable');
 		return { events: [], offers: {} as Record<string, EventOffer>, eventsUnavailable: true };
 	}
+}
+
+export const load: PageServerLoad = async ({ fetch, url, request }) => {
+	const [activities, community] = await Promise.all([loadActivities(fetch), loadCommunity(fetch)]);
+	return {
+		...activities,
+		...community,
+		seo: buildSeo({ kind: 'home', url, lang: resolveLang(request) })
+	};
 };

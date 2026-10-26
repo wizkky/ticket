@@ -1,6 +1,15 @@
-# CaudalTickets · Plataforma en desarrollo
+# Caudal Creativo · Plataforma en desarrollo
 
-Base de desarrollo de una ticketera y comunidad para productores, compradores y creativos. Esta primera versión integra snapshots MIT de Revel v2.22.1, con identidad Caudal, recorridos de comprador, productor y administración, y datos de demostración propios.
+Plataforma cultural y creativa nacida en Valdivia. Integra Caudal Tickets como servicio de entradas y prepara la presencia de Caudal Agenda. Esta primera versión integra snapshots MIT de Revel v2.22.1, con identidad Caudal, recorridos de comprador, productor y administración, y datos de demostración propios.
+
+## Evolución del ecosistema
+
+La portada y navegación presentan Caudal Creativo como plataforma principal.
+Explorar conserva el catálogo y calendario reales; Comunidad reúne perfiles
+publicados y espacios de la programación. Caudal Agenda distingue las herramientas
+existentes de sus futuras funciones de clases, inscripciones y horarios.
+Consulta [la implementación y proyección móvil](docs/evolucion-caudal-creativo.md) y
+[las comprobaciones y capturas](docs/validacion-caudal-creativo.md).
 
 ## Inicio
 
@@ -69,7 +78,7 @@ Cada ejecución crea nuevas entradas de prueba; no borra órdenes anteriores. Lo
 - Sistema visual Caudal compartido, catálogo de Los Ríos, espacio productor y administración general con acceso protegido. Consulta [los recorridos y límites de esta etapa](docs/experiencia-caudal-v3.md).
 - Sin cuenta Stripe conectada: no se ha validado un cobro online ni liquidaciones a productores. No se debe presentar una reserva offline como un pago procesado.
 - Apple/Google Wallet, Telegram, evaluación con IA y escaneo antivirus no forman parte de esta prueba. Las integraciones que requieren credenciales están desactivadas o sin configurar.
-- Los perfiles y el mercado de servicios creativos todavía requieren diseño y desarrollo.
+- Los perfiles individuales y el mercado de servicios creativos, las clases recurrentes y las reservas de horas siguen en desarrollo. Las organizaciones conservan sus perfiles públicos operativos.
 
 Para un servicio real faltan configuración de producción, dominio/HTTPS, correos propios, pasarela compatible con el país y modelo comercial, políticas legales, operación de copias/actualizaciones y pruebas de carga y seguridad del recorrido completo.
 

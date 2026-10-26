@@ -20,7 +20,10 @@
 
 	// Check if link is active
 	function isActive(href: string): boolean {
-		return currentPath === href || currentPath.startsWith(href + '/');
+		return (
+			currentPath === href ||
+			(href !== resolve('/(public)', {}) && currentPath.startsWith(href + '/'))
+		);
 	}
 
 	// Handle link click
@@ -139,6 +142,25 @@
 				{/each}
 			</ul>
 
+			<div class="mt-4 border-t pt-4">
+				<a
+					href={resolve('/(auth)/dashboard', {})}
+					onclick={handleLinkClick}
+					class="block rounded-md px-4 py-3 text-base font-medium">{m['creative.myCaudal']()}</a
+				>
+				<a
+					href={resolve('/(auth)/producer', {})}
+					onclick={handleLinkClick}
+					class="block rounded-md px-4 py-3 text-sm text-muted-foreground"
+					>{m['workspace.producerSpace']()}</a
+				>
+				{#if $page.data.workspace?.platform_admin}<a
+						href={resolve('/(auth)/administration', {})}
+						onclick={handleLinkClick}
+						class="block rounded-md px-4 py-3 text-sm text-muted-foreground"
+						>{m['workspace.administration']()}</a
+					>{/if}
+			</div>
 			<!-- Auth Actions -->
 			{#if !isAuthenticated}
 				<div class="mt-6 space-y-2 border-t pt-6">

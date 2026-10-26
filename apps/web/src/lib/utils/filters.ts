@@ -1,3 +1,4 @@
+import { parseCategory, categoryTags, type ActivityCategory } from '$lib/caudal/categories';
 /**
  * Filter state management utilities for event listing
  * Handles URL param synchronization and filter state
@@ -7,6 +8,7 @@
  * Filter state interface
  */
 export interface EventFilters {
+	category?: ActivityCategory;
 	search?: string;
 	cityId?: number;
 	organizationId?: string;
@@ -34,6 +36,8 @@ export type DatePreset = 'today' | 'this-week' | 'this-month' | 'future';
  */
 export function parseFilters(searchParams: URLSearchParams): EventFilters {
 	const filters: EventFilters = {};
+	const category = parseCategory(searchParams.get('category'));
+	if (category) filters.category = category;
 
 	// Search text
 	const search = searchParams.get('search');
@@ -106,6 +110,7 @@ export function parseFilters(searchParams: URLSearchParams): EventFilters {
  */
 export function filtersToParams(filters: EventFilters): URLSearchParams {
 	const params = new URLSearchParams();
+	if (filters.category) params.set('category', filters.category);
 
 	if (filters.search) params.set('search', filters.search);
 	if (filters.cityId) params.set('city_id', filters.cityId.toString());
@@ -141,7 +146,7 @@ export function filtersToApiParams(filters: EventFilters) {
 		organization: filters.organizationId,
 		event_type: filters.eventType,
 		visibility: filters.visibility,
-		tags: filters.tags,
+		tags: categoryTags(filters.category, filters.tags),
 		include_past: filters.includePast ?? false,
 		requires_ticket:
 			filters.ticketType === 'ticketed' ? true : filters.ticketType === 'free' ? false : undefined,
@@ -158,6 +163,7 @@ export function filtersToApiParams(filters: EventFilters) {
  */
 export function hasActiveFilters(filters: EventFilters): boolean {
 	return !!(
+		filters.category ||
 		filters.search ||
 		filters.cityId ||
 		filters.organizationId ||
@@ -177,6 +183,7 @@ export function hasActiveFilters(filters: EventFilters): boolean {
  */
 export function countActiveFilters(filters: EventFilters): number {
 	let count = 0;
+	if (filters.category) count++;
 
 	if (filters.search) count++;
 	if (filters.cityId) count++;

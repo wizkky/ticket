@@ -1,4 +1,6 @@
 <script lang="ts">
+	import CategoryLinks from '$lib/components/caudal/CategoryLinks.svelte';
+	import { categoryTags } from '$lib/caudal/categories';
 	import type { PageData } from './$types';
 	import type { EventInListSchema } from '$lib/api/generated/types.gen';
 	import { goto } from '$app/navigation';
@@ -75,7 +77,7 @@
 					organization: currentFilters.organizationId,
 					event_type: currentFilters.eventType,
 					visibility: currentFilters.visibility,
-					tags: currentFilters.tags,
+					tags: categoryTags(currentFilters.category, currentFilters.tags),
 					requires_ticket:
 						currentFilters.ticketType === 'ticketed'
 							? true
@@ -128,6 +130,8 @@
 	// Filter update handlers
 	function handleUpdateFilters(updates: Partial<FilterState>): void {
 		const newFilters = { ...currentFilters, ...updates };
+		// A manual tag selection replaces the editorial category rather than being ignored.
+		if ('tags' in updates) newFilters.category = undefined;
 
 		// Reset to page 1 when filters change (not pagination)
 		const nonPaginationChanged = Object.keys(updates).some(
@@ -225,7 +229,7 @@
 				volume="poster"
 				onBand
 				kicker={m['workspace.territoryKicker']()}
-				title={m['workspace.territoryTitle']()}
+				title={m['creative.categoriesTitle']()}
 				subtitle={countLabel}
 				subtitleAttrs={{ 'aria-live': 'polite' }}
 			>
@@ -255,6 +259,7 @@
 					>{m['workspace.paymentScope']()}</span
 				>
 			</p>
+			<div class="mt-6"><CategoryLinks compact active={currentFilters.category} /></div>
 		</div>
 	</section>
 
@@ -310,12 +315,14 @@
 								level={2}
 								icon={Calendar}
 								title={m['browse.events_noEventsFound']()}
-								body={currentFilters.search || currentFilters.cityId || currentFilters.tags
-									? m['browse.events_tryAdjustingFilters']()
-									: m['browse.events_noUpcomingEvents']()}
+								body={currentFilters.category
+									? m['creative.categoryEmpty']()
+									: currentFilters.search || currentFilters.cityId || currentFilters.tags
+										? m['browse.events_tryAdjustingFilters']()
+										: m['browse.events_noUpcomingEvents']()}
 							>
 								{#snippet action()}
-									{#if currentFilters.search || currentFilters.cityId || currentFilters.tags}
+									{#if currentFilters.category || currentFilters.search || currentFilters.cityId || currentFilters.tags}
 										<Button onclick={handleClearFilters}>
 											{m['browse.events_clearFilters']()}
 										</Button>
@@ -431,6 +438,7 @@
 								baseUrl="/events"
 								preserveParams={[
 									'viewMode',
+									'category',
 									'city_id',
 									'organization',
 									'event_type',

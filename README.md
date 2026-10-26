@@ -11,6 +11,8 @@ existentes de sus futuras funciones de clases, inscripciones y horarios.
 Consulta [la implementación y proyección móvil](docs/evolucion-caudal-creativo.md) y
 [las comprobaciones y capturas](docs/validacion-caudal-creativo.md).
 
+Para bajar esta revisión en tu servidor, consulta [descarga y actualización local](docs/actualizar-prueba-local.md).
+
 ## Inicio
 
 Requisitos: Linux, Docker con Compose v2, Node.js 24 con Corepack, Python 3 y `uv`. El backend usa Python 3.14, instalado por `uv` según su versión fijada. También necesita las bibliotecas nativas de GDAL/GEOS, Pango y libmagic. La comprobación del QR usa `pdftoppm` (Poppler) y libzbar.

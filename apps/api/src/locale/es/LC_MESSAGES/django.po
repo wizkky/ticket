@@ -8223,3 +8223,15 @@ msgstr "Perfil de facturación de usuario"
 
 msgid "Whitelist Request"
 msgstr "Solicitud de lista de admitidos"
+
+msgid "Mixed"
+msgstr "Mixto"
+
+msgid "Fixed Price"
+msgstr "Precio fijo"
+
+msgid "Staff Only"
+msgstr "Solo personal"
+
+msgid "At The Door"
+msgstr "Pago en puerta"

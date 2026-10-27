@@ -11,6 +11,7 @@ from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
 from common.admin_localization import ModelAdmin
+from common.service.invoice_utils import format_currency
 from events import models
 from events.admin.base import (
     EventLinkMixin,
@@ -24,7 +25,6 @@ class TicketTierAdmin(ModelAdmin, EventLinkMixin, VenueLinkMixin):  # type: igno
     """Admin view for TicketTier."""
 
     list_display = [
-        "__str__",
         "name",
         "event_link",
         "price_display",
@@ -51,7 +51,7 @@ class TicketTierAdmin(ModelAdmin, EventLinkMixin, VenueLinkMixin):  # type: igno
 
     @admin.display(description=_("Price"), ordering="price")
     def price_display(self, obj: models.TicketTier) -> str:
-        return f"{obj.price} {obj.currency}"
+        return format_currency(obj.price, obj.currency)
 
     @admin.display(description=_("Sold"), ordering="quantity_sold")
     def quantity_display(self, obj: models.TicketTier) -> str:
@@ -74,7 +74,7 @@ class TicketAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin, VenueLinkMixin):  #
         "sector_name",
         "seat_label",
         "status",
-        "price_paid",
+        "price_paid_display",
         "checked_in_at",
         "created_at",
     ]
@@ -136,6 +136,10 @@ class TicketAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin, VenueLinkMixin):  #
         ),
         (_("Metadata"), {"fields": ["file_content_hash", "created_at", "updated_at"], "classes": ["collapse"]}),
     ]
+
+    @admin.display(description=_("Price paid"), ordering="price_paid")
+    def price_paid_display(self, obj: models.Ticket) -> str:
+        return format_currency(obj.price_paid, obj.tier.currency) if obj.price_paid is not None and obj.tier else "—"
 
     @admin.display(description=_("Tier"))
     def tier_name(self, obj: models.Ticket) -> str | None:
@@ -245,7 +249,7 @@ class PaymentAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[m
 
     @admin.display(description=_("Amount"))
     def amount_display(self, obj: models.Payment) -> str:
-        return f"{obj.amount} {obj.currency}"
+        return format_currency(obj.amount, obj.currency)
 
     @admin.display(description=_("Status"))
     def status_display(self, obj: models.Payment) -> str:
@@ -261,20 +265,20 @@ class PaymentAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[m
     @admin.display(description=_("VAT"))
     def vat_display(self, obj: models.Payment) -> str:
         if obj.vat_amount is not None:
-            return f"{obj.vat_amount} ({obj.vat_rate}%)"
+            return f"{format_currency(obj.vat_amount, obj.currency)} ({obj.vat_rate}%)"
         return "—"
 
     @admin.display(description=_("P. Fee"))
     def platform_fee_display(self, obj: models.Payment) -> str:
         if obj.platform_fee_reverse_charge:
-            return f"{obj.platform_fee} (RC)"
+            return f"{format_currency(obj.platform_fee, obj.currency)} ({_('RC')})"
         if obj.platform_fee_net is not None:
-            parts = [f"{obj.platform_fee}"]
+            parts = [format_currency(obj.platform_fee, obj.currency)]
             if obj.platform_fee_vat:
-                parts.append(f"VAT {obj.platform_fee_vat}")
+                parts.append(f"{_('VAT')} {format_currency(obj.platform_fee_vat, obj.currency)}")
             return " / ".join(parts)
         if obj.platform_fee:
-            return str(obj.platform_fee)
+            return format_currency(obj.platform_fee, obj.currency)
         return "—"
 
     @admin.display(description=_("Stripe Session"))

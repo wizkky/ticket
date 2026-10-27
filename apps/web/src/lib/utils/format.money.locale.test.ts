@@ -11,6 +11,13 @@ import { formatMoney, formatMoneyRange } from './format';
 const norm = (s: string): string => s.replace(/[\u00a0\u202f]/g, ' ');
 
 describe('formatMoney / formatMoneyRange locale switching (#949)', () => {
+	it('CLP uses whole pesos and Chilean grouping in every UI language', () => {
+		for (const locale of ['en', 'es', 'de']) {
+			getLocale.mockReturnValue(locale);
+			expect(norm(formatMoney('5000.00', 'CLP'))).toBe('$5.000');
+			expect(norm(formatMoney('5500', 'CLP'))).toBe('$5.500');
+		}
+	});
 	it('en → symbol first, dot decimals', () => {
 		getLocale.mockReturnValue('en');
 		expect(formatMoney(18, 'EUR')).toBe('€18.00');

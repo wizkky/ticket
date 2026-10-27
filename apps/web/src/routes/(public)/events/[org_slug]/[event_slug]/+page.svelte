@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import * as m from '$lib/paraglide/messages.js';
 	import type { PageData } from './$types';
 	import { useQueryClient } from '@tanstack/svelte-query';
@@ -473,7 +474,7 @@
 
 						<!-- Potluck Coordination Section -->
 						<!-- Show if potluck is open OR if there are existing items -->
-						{#if event.potluck_open || data.potluckItems.length > 0}
+						{#if showOptionalModules && (event.potluck_open || data.potluckItems.length > 0)}
 							<div class="space-y-6">
 								<!-- Potluck Items -->
 								<PotluckSection

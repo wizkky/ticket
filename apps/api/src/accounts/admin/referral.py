@@ -14,6 +14,7 @@ from accounts.exceptions import ReferralApplicationConflictError
 from accounts.models import Referral, ReferralCode, ReferralPayout, ReferralPayoutStatement, RevelUser
 from accounts.service import referral_application_service, referral_payout_service
 from common.admin_localization import ModelAdmin
+from common.service.invoice_utils import format_currency
 from common.signing import get_file_url
 
 
@@ -313,7 +314,7 @@ class ReferralPayoutStatementAdmin(ModelAdmin):  # type: ignore[misc]
     @admin.display(description=_("Amount (gross)"))
     def amount_display(self, obj: ReferralPayoutStatement) -> str:
         """Display gross amount with currency."""
-        return f"{obj.amount_gross} {obj.currency}"
+        return format_currency(obj.amount_gross, obj.currency)
 
     @admin.display(description=_("VAT"))
     def vat_display(self, obj: ReferralPayoutStatement) -> str:
@@ -321,7 +322,7 @@ class ReferralPayoutStatementAdmin(ModelAdmin):  # type: ignore[misc]
         if obj.reverse_charge:
             return "RC"
         if obj.amount_vat:
-            return f"{obj.amount_vat} ({obj.vat_rate}%)"
+            return f"{format_currency(obj.amount_vat, obj.currency)} ({obj.vat_rate}%)"
         return "—"
 
     @admin.display(description=_("RC"), boolean=True)

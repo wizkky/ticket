@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import { resolve } from '$app/paths';
 	import * as m from '$lib/paraglide/messages.js';
 	import { enhance } from '$app/forms';
@@ -414,7 +415,7 @@
 				</div>
 
 				<!-- Telegram -->
-				{#if features.telegram}
+				{#if showOptionalModules && features.telegram}
 					<div>
 						<label for="telegram_url" class="flex items-center gap-2 text-sm font-medium">
 							<Send class="h-4 w-4 text-[hsl(var(--brand-telegram-text))]" aria-hidden="true" />
@@ -433,83 +434,88 @@
 			</div>
 		</section>
 
-		<!-- Membership Settings -->
+		<!-- Membership and contact settings share the native form; preserve their saved values. -->
 		<section class="space-y-4 rounded-lg border border-border bg-card p-6 shadow-sm">
-			<SectionHeader title={m['orgAdmin.settings.membership.heading']()} />
-
-			<!-- Accept New Members -->
-			<div class="space-y-2">
-				<div class="flex items-center gap-2">
-					<input
-						type="checkbox"
-						id="accept_membership_requests"
-						name="accept_membership_requests"
-						value="true"
-						bind:checked={acceptNewMembers}
-						class="h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-primary focus:ring-offset-2"
-					/>
-					<label for="accept_membership_requests" class="text-sm font-medium">
-						{m['orgAdmin.settings.membership.acceptRequestsLabel']()}
-					</label>
-				</div>
-				<p class="text-xs text-muted-foreground">
-					{m['orgAdmin.settings.membership.acceptRequestsHelp']()}
-				</p>
-			</div>
-
-			<!-- Default membership questionnaire -->
-			<div>
-				<label for="default_membership_questionnaire_id" class="block text-sm font-medium">
-					{m['orgAdmin.settings.membership.defaultQuestionnaireLabel']()}
-				</label>
-				<select
-					id="default_membership_questionnaire_id"
-					name="default_membership_questionnaire_id"
-					bind:value={defaultQuestionnaireId}
-					class="mt-1 flex w-full rounded-md border-2 border-input bg-background px-3 py-2 text-sm text-foreground transition-colors focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 sm:max-w-xs"
-				>
-					<option value="">{m['orgAdmin.settings.membership.defaultQuestionnaireNone']()}</option>
-					{#each data.membershipQuestionnaires as oq (oq.id)}
-						<option value={oq.id}>{oq.questionnaire.name}</option>
-					{/each}
-				</select>
-				<p class="mt-1 text-xs text-muted-foreground">
-					{m['orgAdmin.settings.membership.defaultQuestionnaireHelp']()}
-				</p>
-				{#if data.membershipQuestionnaires.length === 0}
-					<p class="mt-1 text-xs text-muted-foreground">
-						{m['orgAdmin.settings.membership.noMembershipQuestionnaires']()}
-						<a
-							href={resolve('/(auth)/org/[slug]/admin/questionnaires', {
-								slug: data.organization.slug
-							})}
-							class="font-medium underline underline-offset-2"
-						>
-							{m['orgAdmin.settings.membership.manageQuestionnairesLink']()}
-						</a>
+			<SectionHeader
+				title={showOptionalModules
+					? m['orgAdmin.settings.membership.heading']()
+					: m['orgAdmin.settings.membership.contactEmailLabel']()}
+			/>
+			<div hidden={!showOptionalModules} class="space-y-4">
+				<!-- Accept New Members -->
+				<div class="space-y-2">
+					<div class="flex items-center gap-2">
+						<input
+							type="checkbox"
+							id="accept_membership_requests"
+							name="accept_membership_requests"
+							value="true"
+							bind:checked={acceptNewMembers}
+							class="h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-primary focus:ring-offset-2"
+						/>
+						<label for="accept_membership_requests" class="text-sm font-medium">
+							{m['orgAdmin.settings.membership.acceptRequestsLabel']()}
+						</label>
+					</div>
+					<p class="text-xs text-muted-foreground">
+						{m['orgAdmin.settings.membership.acceptRequestsHelp']()}
 					</p>
-				{/if}
-			</div>
-
-			<!-- Require manual approval by default -->
-			<div class="space-y-2">
-				<div class="flex items-center gap-2">
-					<input type="hidden" name="default_requires_membership_approval_present" value="1" />
-					<input
-						type="checkbox"
-						id="default_requires_membership_approval"
-						name="default_requires_membership_approval"
-						value="true"
-						bind:checked={defaultRequiresApproval}
-						class="h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-primary focus:ring-offset-2"
-					/>
-					<label for="default_requires_membership_approval" class="text-sm font-medium">
-						{m['orgAdmin.settings.membership.requireApprovalLabel']()}
-					</label>
 				</div>
-				<p class="text-xs text-muted-foreground">
-					{m['orgAdmin.settings.membership.requireApprovalHelp']()}
-				</p>
+
+				<!-- Default membership questionnaire -->
+				<div>
+					<label for="default_membership_questionnaire_id" class="block text-sm font-medium">
+						{m['orgAdmin.settings.membership.defaultQuestionnaireLabel']()}
+					</label>
+					<select
+						id="default_membership_questionnaire_id"
+						name="default_membership_questionnaire_id"
+						bind:value={defaultQuestionnaireId}
+						class="mt-1 flex w-full rounded-md border-2 border-input bg-background px-3 py-2 text-sm text-foreground transition-colors focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 sm:max-w-xs"
+					>
+						<option value="">{m['orgAdmin.settings.membership.defaultQuestionnaireNone']()}</option>
+						{#each data.membershipQuestionnaires as oq (oq.id)}
+							<option value={oq.id}>{oq.questionnaire.name}</option>
+						{/each}
+					</select>
+					<p class="mt-1 text-xs text-muted-foreground">
+						{m['orgAdmin.settings.membership.defaultQuestionnaireHelp']()}
+					</p>
+					{#if data.membershipQuestionnaires.length === 0}
+						<p class="mt-1 text-xs text-muted-foreground">
+							{m['orgAdmin.settings.membership.noMembershipQuestionnaires']()}
+							<a
+								href={resolve('/(auth)/org/[slug]/admin/questionnaires', {
+									slug: data.organization.slug
+								})}
+								class="font-medium underline underline-offset-2"
+							>
+								{m['orgAdmin.settings.membership.manageQuestionnairesLink']()}
+							</a>
+						</p>
+					{/if}
+				</div>
+
+				<!-- Require manual approval by default -->
+				<div class="space-y-2">
+					<div class="flex items-center gap-2">
+						<input type="hidden" name="default_requires_membership_approval_present" value="1" />
+						<input
+							type="checkbox"
+							id="default_requires_membership_approval"
+							name="default_requires_membership_approval"
+							value="true"
+							bind:checked={defaultRequiresApproval}
+							class="h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-primary focus:ring-offset-2"
+						/>
+						<label for="default_requires_membership_approval" class="text-sm font-medium">
+							{m['orgAdmin.settings.membership.requireApprovalLabel']()}
+						</label>
+					</div>
+					<p class="text-xs text-muted-foreground">
+						{m['orgAdmin.settings.membership.requireApprovalHelp']()}
+					</p>
+				</div>
 			</div>
 
 			<!-- Contact Email (Read-only with Change Button) -->
@@ -603,10 +609,12 @@
 			</div>
 		</section>
 
-		<!-- Subscription policy — rules for paid memberships. Its fields always render and
+		<div hidden={!showOptionalModules}>
+			<!-- Subscription policy — rules for paid memberships. Its fields always render and
 		     always post; the action includes each one only when it actually arrived (the
 		     component explains why). -->
-		<OrgSubscriptionPolicySection organization={data.organization} />
+			<OrgSubscriptionPolicySection organization={data.organization} />
+		</div>
 
 		<!-- Financial Reports (owner-only — mirrors the owner-only financials/revenue
 		     endpoints; staff with edit_organization must not change report delivery) -->

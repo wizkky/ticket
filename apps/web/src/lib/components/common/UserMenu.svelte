@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import { goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/stores';
@@ -61,7 +62,7 @@
 	}));
 
 	const userOrganizations = $derived(organizationsQuery.data || []);
-	const isReferrer = $derived(!!user?.referral_code);
+	const isReferrer = $derived(showOptionalModules && !!user?.referral_code);
 
 	// Helper to check if user has admin permissions for an organization
 	function hasAdminPermissions(orgId: string): boolean {
@@ -126,11 +127,15 @@
 			label: m['userMenu.invoices'](),
 			icon: Receipt
 		},
-		{
-			href: resolve('/(auth)/account/memberships', {}),
-			label: m['userMenu.memberships'](),
-			icon: CreditCard
-		},
+		...(showOptionalModules
+			? [
+					{
+						href: resolve('/(auth)/account/memberships', {}),
+						label: m['userMenu.memberships'](),
+						icon: CreditCard
+					}
+				]
+			: []),
 		// Flag-gated (fail-closed): the route 404s without the provider.
 		...(features.oauth_provider
 			? [

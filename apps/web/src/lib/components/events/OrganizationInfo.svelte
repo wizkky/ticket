@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import { page } from '$app/state';
 	import { resolve } from '$app/paths';
 	import * as m from '$lib/paraglide/messages.js';
@@ -118,7 +119,7 @@
 			     branches come from MembershipCta (which owns the ported badges);
 			     joining itself lives on the org page, so this side only links to
 			     it — no eligibility round trip per event page. -->
-			{#if isOwner || isStaff || isMember}
+			{#if showOptionalModules && (isOwner || isStaff || isMember)}
 				<MembershipCta
 					organizationSlug={organization.slug}
 					organizationName={organization.name}
@@ -130,7 +131,7 @@
 					{isStaff}
 					class="inline-flex"
 				/>
-			{:else if organization.accept_membership_requests}
+			{:else if showOptionalModules && organization.accept_membership_requests}
 				<Button href={membershipHref} variant="outline">
 					{m['membershipPlans.viewMembership']()}
 				</Button>

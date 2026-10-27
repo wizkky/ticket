@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import * as m from '$lib/paraglide/messages.js';
 	import { setLocale } from '$lib/paraglide/runtime.js';
 	import { enhance, applyAction } from '$app/forms';
@@ -617,7 +618,7 @@
 		</div>
 	</form>
 
-	{#if authStore.accessToken}
+	{#if showOptionalModules && authStore.accessToken}
 		<!-- Telegram Connection Section -->
 		<div class="mt-12" id="telegram-section">
 			<div class="border-t pt-8">
@@ -643,7 +644,7 @@
 	     as null, so without that an enrolled referrer is shown the "apply"
 	     link for the length of the auth bootstrap and then has it taken away
 	     again. -->
-	{#if authStore.user && features.referral_applications && !isReferrer}
+	{#if showOptionalModules && authStore.user && features.referral_applications && !isReferrer}
 		<div class="mt-12 border-t pt-8" id="referral-section">
 			<SectionHeader title={m['referralApply.accountTitle']()} />
 			<p class="mt-2 text-sm text-muted-foreground">{m['referralApply.accountBody']()}</p>

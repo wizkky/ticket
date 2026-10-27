@@ -26,3 +26,6 @@ Para actualizar una instalación local, aplicar las migraciones y ejecutar
 
 La demostración sigue usando reservas con pago presencial. Estos cambios no habilitan
 cobros online, liquidaciones ni conversión de divisas. Google no se modifica en esta etapa.
+
+La revisión posterior también aplica el formato CLP a los listados administrativos
+y configura el horario chileno: [Chile, limpieza y regresiones](revision-chile-y-modulos.md).

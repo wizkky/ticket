@@ -10,6 +10,7 @@ from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 
 from common.admin_localization import ModelAdmin
+from common.service.invoice_utils import format_currency
 from common.signing import get_file_url
 from events import models
 from events.admin.base import EmailDeliveryAdminMixin, OrganizationLinkMixin
@@ -91,13 +92,13 @@ class PlatformFeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationL
 
     @admin.display(description=_("Fee (gross)"))
     def fee_display(self, obj: models.PlatformFeeInvoice) -> str:
-        return f"{obj.fee_gross} {obj.currency}"
+        return format_currency(obj.fee_gross, obj.currency)
 
     @admin.display(description=_("VAT"))
     def vat_display(self, obj: models.PlatformFeeInvoice) -> str:
         if obj.reverse_charge:
             return "RC"
-        return f"{obj.fee_vat} ({obj.fee_vat_rate}%)"
+        return f"{format_currency(obj.fee_vat, obj.currency)} ({obj.fee_vat_rate}%)"
 
     @admin.display(description=_("Status"))
     def status_display(self, obj: models.PlatformFeeInvoice) -> str:
@@ -162,4 +163,4 @@ class PlatformFeeCreditNoteAdmin(ModelAdmin):  # type: ignore[misc]
 
     @admin.display(description=_("Fee (gross)"))
     def fee_display(self, obj: models.PlatformFeeCreditNote) -> str:
-        return str(obj.fee_gross)
+        return format_currency(obj.fee_gross, obj.invoice.currency)

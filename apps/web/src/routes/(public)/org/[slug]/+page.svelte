@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/state';
 	import type { PageData } from './$types';
@@ -355,14 +356,14 @@
 					{/if}
 
 					<!-- Claim Membership Button (if token present and grants membership) -->
-					{#if data.organizationTokenDetails && data.organizationTokenDetails.grants_membership && !data.isMember && !data.isOwner && !data.isStaff}
+					{#if showOptionalModules && data.organizationTokenDetails && data.organizationTokenDetails.grants_membership && !data.isMember && !data.isOwner && !data.isStaff}
 						<ClaimMembershipButton
 							tokenId={data.organizationTokenDetails.id || ''}
 							tokenDetails={data.organizationTokenDetails}
 							class="inline-flex items-center gap-2"
 						/>
 						<!-- Membership CTA (if org accepts members and user is not a member) -->
-					{:else if organization.accept_membership_requests}
+					{:else if showOptionalModules && organization.accept_membership_requests}
 						<MembershipCta
 							organizationSlug={organization.slug}
 							organizationName={organization.name}
@@ -400,7 +401,7 @@
 				</div>
 			</div>
 
-			{#if data.isAuthenticated && organization.id}
+			{#if showOptionalModules && data.isAuthenticated && organization.id}
 				<div class="mb-6">
 					<OrgMembershipInline
 						orgId={organization.id}
@@ -418,14 +419,8 @@
 				/>
 			</div>
 
-			<!-- Membership entry point.
-
-		     The plan grid used to live here, above the resources, series and
-		     events this page exists to show. It moved to /org/[slug]/membership
-		     (#720) — a tier can only be *chosen* there — and what is left is the
-		     pointer at it. The `id="membership"` stays so the deep links that
-		     predate the move still land on something that explains itself. -->
-			{#if organization.accept_membership_requests || data.membershipPlans.length > 0}
+			<!-- Optional membership entry point; historical records remain available. -->
+			{#if showOptionalModules && (organization.accept_membership_requests || data.membershipPlans.length > 0)}
 				<section id="membership" aria-labelledby="membership-heading" class="mb-12">
 					<SectionHeader
 						volume="celebration"

@@ -5,6 +5,7 @@ from django.utils.text import format_lazy
 from django.utils.translation import gettext_lazy as _
 
 from .base import SITE_NAME
+from .features import CAUDAL_SHOW_OPTIONAL_MODULES
 
 # Unfold configuration
 UNFOLD = {
@@ -65,26 +66,31 @@ UNFOLD = {
                         "link": reverse_lazy("admin:accounts_globalban_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Referral Applications"),
                         "icon": "how_to_reg",
                         "link": reverse_lazy("admin:accounts_referralapplication_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Referral Codes"),
                         "icon": "loyalty",
                         "link": reverse_lazy("admin:accounts_referralcode_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Referrals"),
                         "icon": "share",
                         "link": reverse_lazy("admin:accounts_referral_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Referral Payouts"),
                         "icon": "payments",
                         "link": reverse_lazy("admin:accounts_referralpayout_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Payout Statements"),
                         "icon": "receipt_long",
                         "link": reverse_lazy("admin:accounts_referralpayoutstatement_changelist"),
@@ -107,6 +113,7 @@ UNFOLD = {
                         "link": reverse_lazy("admin:events_organization_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Members"),
                         "icon": "group",
                         "link": reverse_lazy("admin:events_organizationmember_changelist"),
@@ -117,11 +124,13 @@ UNFOLD = {
                         "link": reverse_lazy("admin:events_organizationstaff_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Membership Tiers"),
                         "icon": "workspace_premium",
                         "link": reverse_lazy("admin:events_membershiptier_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Membership Requests"),
                         "icon": "how_to_reg",
                         "link": reverse_lazy("admin:events_organizationmembershiprequest_changelist"),
@@ -266,6 +275,7 @@ UNFOLD = {
                         "link": reverse_lazy("admin:events_eventtoken_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Potluck Items"),
                         "icon": "lunch_dining",
                         "link": reverse_lazy("admin:events_potluckitem_changelist"),
@@ -362,16 +372,19 @@ UNFOLD = {
                 "collapsible": True,
                 "items": [
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Subscription Plans"),
                         "icon": "subscriptions",
                         "link": reverse_lazy("admin:events_membershipsubscriptionplan_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Subscriptions"),
                         "icon": "card_membership",
                         "link": reverse_lazy("admin:events_membershipsubscription_changelist"),
                     },
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Subscription Payments"),
                         "icon": "payments",
                         "link": reverse_lazy("admin:events_membershippayment_changelist"),
@@ -509,6 +522,7 @@ UNFOLD = {
                 "collapsible": True,
                 "items": [
                     {
+                        "permission": lambda request: CAUDAL_SHOW_OPTIONAL_MODULES,
                         "title": _("Telegram Users"),
                         "icon": "chat",
                         "link": reverse_lazy("admin:telegram_telegramuser_changelist"),

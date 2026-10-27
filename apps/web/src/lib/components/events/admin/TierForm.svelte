@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
 	import { resolve } from '$app/paths';
 	import * as m from '$lib/paraglide/messages.js';
 	import { createMutation, createQuery, useQueryClient } from '@tanstack/svelte-query';
@@ -25,8 +26,7 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import MarkdownEditor from '$lib/components/forms/MarkdownEditor.svelte';
-	import { DurationInput } from '$lib/components/forms';
-	import RefundPolicyEditor from './RefundPolicyEditor.svelte';
+	import TierFormRefundSection from './TierFormRefundSection.svelte';
 	import TierFormPricingSection from './TierFormPricingSection.svelte';
 	import TierFormAvailabilitySection from './TierFormAvailabilitySection.svelte';
 	import TierFormSeatingSection from './TierFormSeatingSection.svelte';
@@ -53,7 +53,6 @@
 		buildTierSeatingFields,
 		retainedSectorIdForMode
 	} from './tier-seating-payload';
-	import { Undo2 } from '@lucide/svelte';
 	import type { EventRules } from '$lib/utils/compliance';
 	import { formatDateTimeReadback } from '$lib/utils/date';
 	import type { PlatformFeeInfo } from '$lib/utils/fees';
@@ -91,63 +90,81 @@
 
 	const queryClient = useQueryClient();
 
+	// Seed each dialog once; reactive props continue to drive validation and saving.
+	const initial = untrack(() => ({ tier, eventContext, eventVenueId }));
+
 	// Form state
-	let name = $state(tier?.name ?? '');
-	let description = $state(tier?.description ?? '');
+	let name = $state(initial.tier?.name ?? '');
+	let description = $state(initial.tier?.description ?? '');
 	let paymentMethod = $state<'free' | 'offline' | 'at_the_door' | 'online'>(
-		(tier?.payment_method as 'free' | 'offline' | 'at_the_door' | 'online') ?? 'free'
+		(initial.tier?.payment_method as 'free' | 'offline' | 'at_the_door' | 'online') ?? 'free'
 	);
-	let priceType = $state<'fixed' | 'pwyc'>((tier?.price_type as 'fixed' | 'pwyc') ?? 'fixed');
+	let priceType = $state<'fixed' | 'pwyc'>(
+		(initial.tier?.price_type as 'fixed' | 'pwyc') ?? 'fixed'
+	);
 	let price = $state(
-		moneyInputValue(tier?.price ? String(tier.price) : '0', tier?.currency ?? 'CLP')
+		moneyInputValue(
+			initial.tier?.price ? String(initial.tier.price) : '0',
+			initial.tier?.currency ?? 'CLP'
+		)
 	);
 	let pwycMin = $state(
-		moneyInputValue(tier?.pwyc_min ? String(tier.pwyc_min) : '1', tier?.currency ?? 'CLP')
+		moneyInputValue(
+			initial.tier?.pwyc_min ? String(initial.tier.pwyc_min) : '1',
+			initial.tier?.currency ?? 'CLP'
+		)
 	);
 	let pwycMax = $state(
-		moneyInputValue(tier?.pwyc_max ? String(tier.pwyc_max) : '', tier?.currency ?? 'CLP')
+		moneyInputValue(
+			initial.tier?.pwyc_max ? String(initial.tier.pwyc_max) : '',
+			initial.tier?.currency ?? 'CLP'
+		)
 	);
-	let currency = $state(tier?.currency ?? 'CLP');
-	let vatRateOverride = $state(tier?.vat_rate != null ? String(tier.vat_rate) : '');
-	let manualPaymentInstructions = $state(tier?.manual_payment_instructions ?? '');
+	let currency = $state(initial.tier?.currency ?? 'CLP');
+	let vatRateOverride = $state(initial.tier?.vat_rate != null ? String(initial.tier.vat_rate) : '');
+	let manualPaymentInstructions = $state(initial.tier?.manual_payment_instructions ?? '');
 	let totalQuantity = $state<string>(
-		tier?.total_quantity !== null && tier?.total_quantity !== undefined
-			? String(tier.total_quantity)
+		initial.tier?.total_quantity !== null && initial.tier?.total_quantity !== undefined
+			? String(initial.tier.total_quantity)
 			: ''
 	);
-	let salesStartAt = $state(toDatetimeLocal(tier?.sales_start_at));
-	let salesEndAt = $state(toDatetimeLocal(tier?.sales_end_at));
-	let salesPaused = $state(tier?.sales_paused ?? false);
+	let salesStartAt = $state(toDatetimeLocal(initial.tier?.sales_start_at));
+	let salesEndAt = $state(toDatetimeLocal(initial.tier?.sales_end_at));
+	let salesPaused = $state(initial.tier?.sales_paused ?? false);
 	// Per-tier check-in window (#945): picked times ↔ offsets from event start.
-	const checkInPicks = $state(initialCheckInPicks(eventContext.start, tier));
+	const checkInPicks = $state(initialCheckInPicks(initial.eventContext.start, initial.tier));
 	// Unambiguous textual readbacks for the native datetime inputs; '' when the
 	// value is empty or unparseable, so each hint is gated on the rendered text.
 	const salesStartReadback = $derived(formatDateTimeReadback(salesStartAt));
 	const salesEndReadback = $derived(formatDateTimeReadback(salesEndAt));
 	let visibility = $state<'public' | 'private' | 'members-only' | 'staff-only'>(
-		(tier?.visibility as 'public' | 'private' | 'members-only' | 'staff-only') ?? 'public'
+		(initial.tier?.visibility as 'public' | 'private' | 'members-only' | 'staff-only') ?? 'public'
 	);
 	let purchasableBy = $state<'public' | 'members' | 'invited' | 'invited_and_members'>(
-		(tier?.purchasable_by as 'public' | 'members' | 'invited' | 'invited_and_members') ?? 'public'
+		(initial.tier?.purchasable_by as 'public' | 'members' | 'invited' | 'invited_and_members') ??
+			'public'
 	);
 	let restrictedToMembershipTiersIds = $state<string[]>(
-		tier?.restricted_to_membership_tiers?.map((t) => t.id).filter((id): id is string => !!id) ?? []
+		initial.tier?.restricted_to_membership_tiers
+			?.map((t) => t.id)
+			.filter((id): id is string => !!id) ?? []
 	);
 	let restrictVisibilityToLinkedInvitations = $state(
-		tier?.restrict_visibility_to_linked_invitations ?? false
+		initial.tier?.restrict_visibility_to_linked_invitations ?? false
 	);
 	let restrictPurchaseToLinkedInvitations = $state(
-		tier?.restrict_purchase_to_linked_invitations ?? false
+		initial.tier?.restrict_purchase_to_linked_invitations ?? false
 	);
 
 	// Cancellation & refund policy state
-	let allowUserCancellation = $state(tier?.allow_user_cancellation ?? false);
+	let allowUserCancellation = $state(initial.tier?.allow_user_cancellation ?? false);
 	let cancellationDeadlineHours = $state<number | null>(
-		tier?.cancellation_deadline_hours !== null && tier?.cancellation_deadline_hours !== undefined
-			? tier.cancellation_deadline_hours
+		initial.tier?.cancellation_deadline_hours !== null &&
+			initial.tier?.cancellation_deadline_hours !== undefined
+			? initial.tier.cancellation_deadline_hours
 			: null
 	);
-	let refundPolicy = $state<RefundPolicy | null>(tier?.refund_policy ?? null);
+	let refundPolicy = $state<RefundPolicy | null>(initial.tier?.refund_policy ?? null);
 	let refundPolicyValid = $state(true);
 
 	// Switching to a free tier removes the entire refund policy — backend ignores it.
@@ -170,22 +187,22 @@
 	});
 
 	// Venue and seating state
-	let seatAssignmentMode = $state<SeatAssignmentMode>(tier?.seat_assignment_mode ?? 'none');
+	let seatAssignmentMode = $state<SeatAssignmentMode>(initial.tier?.seat_assignment_mode ?? 'none');
 	let maxTicketsPerUser = $state<string>(
-		tier?.max_tickets_per_user !== null && tier?.max_tickets_per_user !== undefined
-			? String(tier.max_tickets_per_user)
+		initial.tier?.max_tickets_per_user !== null && initial.tier?.max_tickets_per_user !== undefined
+			? String(initial.tier.max_tickets_per_user)
 			: ''
 	);
 	// Pre-fill venue: use tier's venue if editing, else fall back to event's venue
 	// Venue is read-only - it always comes from the event
-	const venueId = $state<string | null>(tier?.venue?.id ?? eventVenueId ?? null);
+	const venueId = $state<string | null>(initial.tier?.venue?.id ?? initial.eventVenueId ?? null);
 
 	// Check if event has a venue configured
 	const hasEventVenue = $derived(!!eventVenueId);
 
 	// Seat assignment modes other than 'none' require an event venue
 	const canUseSeatAssignment = $derived(hasEventVenue);
-	let sectorId = $state<string | null>(tier?.sector?.id ?? null);
+	let sectorId = $state<string | null>(initial.tier?.sector?.id ?? null);
 
 	// Per-category prices — the single pricing mechanism for BOTH seated modes
 	// (pricing convergence). The baseline is what the server stored; the payload
@@ -193,7 +210,7 @@
 	// write semantics: omit = untouched, {} = clear, non-empty = replace), so an
 	// unrelated edit can't wipe prices.
 	const initialCategoryPrices: Record<string, string> = Object.fromEntries(
-		Object.entries(tier?.category_prices ?? {}).map(([id, value]) => [id, String(value)])
+		Object.entries(initial.tier?.category_prices ?? {}).map(([id, value]) => [id, String(value)])
 	);
 	let categoryPrices = $state<Record<string, string>>({ ...initialCategoryPrices });
 
@@ -584,54 +601,16 @@
 				</div>
 			{/if}
 
-			<!-- Cancellation & Refunds (only for paid tiers) -->
 			{#if paymentMethod !== 'free'}
-				<div class="space-y-4 rounded-lg border border-border bg-muted/30 p-4">
-					<div class="flex items-center gap-2 text-sm font-medium">
-						<Undo2 class="h-4 w-4 text-primary" aria-hidden="true" />
-						{m['refundPolicy.sectionTitle']()}
-					</div>
-
-					<label class="flex cursor-pointer items-start gap-2">
-						<input
-							type="checkbox"
-							bind:checked={allowUserCancellation}
-							disabled={isPending}
-							class="mt-0.5 h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-primary"
-						/>
-						<div>
-							<span class="text-sm font-medium">
-								{m['refundPolicy.allowCancellationLabel']()}
-							</span>
-							<p class="text-xs text-muted-foreground">
-								{m['refundPolicy.allowCancellationHelp']()}
-							</p>
-						</div>
-					</label>
-
-					{#if allowUserCancellation}
-						<DurationInput
-							id="cancellation-deadline-hours"
-							label={m['refundPolicy.deadlineLabel']()}
-							helpText={m['refundPolicy.deadlineHelp']()}
-							bind:value={cancellationDeadlineHours}
-							storageUnit="hours"
-							defaultUnit="days"
-							emptyValue={null}
-							emptyLabel={m['refundPolicy.deadlineNoLimit']()}
-							disabled={isPending}
-						/>
-
-						<RefundPolicyEditor
-							{currency}
-							value={refundPolicy}
-							disabled={isPending}
-							{currencySymbol}
-							onChange={(next) => (refundPolicy = next)}
-							onValidityChange={(valid) => (refundPolicyValid = valid)}
-						/>
-					{/if}
-				</div>
+				<TierFormRefundSection
+					bind:allowUserCancellation
+					bind:cancellationDeadlineHours
+					bind:refundPolicy
+					onValidityChange={(valid) => (refundPolicyValid = valid)}
+					{currency}
+					{currencySymbol}
+					{isPending}
+				/>
 			{/if}
 
 			<TierFormAvailabilitySection

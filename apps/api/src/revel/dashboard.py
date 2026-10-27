@@ -4,6 +4,7 @@ import typing as t
 from datetime import date, datetime, timedelta
 
 from dateutil.relativedelta import relativedelta
+from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.db.models import Count, Exists, OuterRef
 from django.http import HttpRequest
@@ -454,11 +455,6 @@ def dashboard_callback(request: HttpRequest, context: dict[str, t.Any]) -> dict[
             "icon": "⚙️",
         },
         {
-            "title": "Grafana",
-            "url": "https://grafana.letsrevel.io",
-            "icon": "📊",
-        },
-        {
             "title": _("Send Announcement"),
             "url": reverse("admin:notifications_notification_send_announcement"),
             "icon": "📢",
@@ -469,6 +465,7 @@ def dashboard_callback(request: HttpRequest, context: dict[str, t.Any]) -> dict[
     context.update(
         {
             "dashboard": {
+                "show_optional_modules": settings.CAUDAL_SHOW_OPTIONAL_MODULES,
                 "maintenance_banner": maintenance_banner,
                 "quick_actions": quick_actions,
                 "quick_stats": {

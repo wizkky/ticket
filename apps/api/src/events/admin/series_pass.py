@@ -2,8 +2,10 @@
 """Admin classes for SeriesPass, SeriesPassTierLink, and HeldSeriesPass models."""
 
 from django.contrib import admin
+from django.utils.translation import gettext_lazy as _
 
 from common.admin_localization import ModelAdmin
+from common.service.invoice_utils import format_currency
 from events import models
 from events.admin.base import (
     EventLinkMixin,
@@ -19,7 +21,7 @@ class SeriesPassAdmin(ModelAdmin):  # type: ignore[misc]
     list_display = [
         "name",
         "event_series",
-        "price",
+        "price_display",
         "pro_rata_discount",
         "currency",
         "payment_method",
@@ -32,6 +34,10 @@ class SeriesPassAdmin(ModelAdmin):  # type: ignore[misc]
     search_fields = ["name", "event_series__name"]
     autocomplete_fields = ["event_series"]
     inlines = [SeriesPassTierLinkInline]
+
+    @admin.display(description=_("Price"), ordering="price")
+    def price_display(self, obj: models.SeriesPass) -> str:
+        return format_currency(obj.price, obj.currency)
 
 
 @admin.register(models.SeriesPassTierLink)
@@ -57,10 +63,14 @@ class HeldSeriesPassAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
     through the service layer, not admin delete.
     """
 
-    list_display = ["id", "series_pass", "user_link", "status", "price_paid", "created_at"]
+    list_display = ["id", "series_pass", "user_link", "status", "price_paid_display", "created_at"]
     list_select_related = ["series_pass", "user"]
     list_filter = ["status"]
     search_fields = ["user__email", "series_pass__name"]
     autocomplete_fields = ["series_pass", "user"]
     readonly_fields = ["id", "stripe_session_id", "price_paid", "attribution", "created_at", "updated_at"]
     date_hierarchy = "created_at"
+
+    @admin.display(description=_("Price paid"), ordering="price_paid")
+    def price_paid_display(self, obj: models.HeldSeriesPass) -> str:
+        return format_currency(obj.price_paid, obj.series_pass.currency)

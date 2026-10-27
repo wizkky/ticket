@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import { resolve } from '$app/paths';
 	import * as m from '$lib/paraglide/messages.js';
 	import { page } from '$app/stores';
@@ -29,7 +30,7 @@
 	// listed when the event actually has it enabled, so the list stays accurate.
 	const perks = $derived.by((): PerkItem[] => {
 		const items: PerkItem[] = [];
-		if (event.potluck_open) {
+		if (showOptionalModules && event.potluck_open) {
 			items.push({
 				icon: UtensilsCrossed,
 				label: m['eventGuestPrompt.item_potluck'](),

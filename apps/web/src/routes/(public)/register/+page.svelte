@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import { resolve } from '$app/paths';
 	import { enhance } from '$app/forms';
 	import { invalidateAll } from '$app/navigation';
@@ -502,14 +503,16 @@
 					</p>
 				{/if}
 
-				<!-- Referral Code (collapsible) -->
-				<ReferralCodeInput
-					initialCode={initialReferralCode}
-					isProcessing={isSubmitting}
-					validatedCode={referralCode}
-					onValidated={(code) => (referralCode = code)}
-					onRemove={() => (referralCode = '')}
-				/>
+				{#if showOptionalModules}
+					<!-- Referral Code (collapsible) -->
+					<ReferralCodeInput
+						initialCode={initialReferralCode}
+						isProcessing={isSubmitting}
+						validatedCode={referralCode}
+						onValidated={(code) => (referralCode = code)}
+						onRemove={() => (referralCode = '')}
+					/>
+				{/if}
 
 				<!-- Hidden referral code input for form submission -->
 				{#if referralCode}

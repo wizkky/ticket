@@ -221,7 +221,7 @@ LOCALE_PATHS = [
     BASE_DIR / "locale",
 ]
 
-TIME_ZONE = "Europe/Vienna"
+TIME_ZONE = "America/Santiago"
 
 USE_I18N = True
 

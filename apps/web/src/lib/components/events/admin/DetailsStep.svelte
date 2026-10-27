@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import * as m from '$lib/paraglide/messages.js';
 	import type {
 		EventCreateSchema,
@@ -558,22 +559,24 @@
 				{/if}
 
 				<!-- Potluck Open -->
-				<label
-					class="flex cursor-pointer items-center gap-3 rounded-md border border-input p-3 transition-colors hover:bg-accent"
-				>
-					<input
-						type="checkbox"
-						checked={formData.potluck_open || false}
-						onchange={(e) => onUpdate({ potluck_open: e.currentTarget.checked })}
-						class="h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-ring"
-					/>
-					<div class="flex-1">
-						<div class="font-medium">{m['detailsStep.enablePotluck']()}</div>
-						<div class="text-sm text-muted-foreground">
-							{m['detailsStep.potluckHint']()}
+				<div hidden={!showOptionalModules}>
+					<label
+						class="flex cursor-pointer items-center gap-3 rounded-md border border-input p-3 transition-colors hover:bg-accent"
+					>
+						<input
+							type="checkbox"
+							checked={formData.potluck_open || false}
+							onchange={(e) => onUpdate({ potluck_open: e.currentTarget.checked })}
+							class="h-4 w-4 rounded border-input text-primary focus:ring-2 focus:ring-ring"
+						/>
+						<div class="flex-1">
+							<div class="font-medium">{m['detailsStep.enablePotluck']()}</div>
+							<div class="text-sm text-muted-foreground">
+								{m['detailsStep.potluckHint']()}
+							</div>
 						</div>
-					</div>
-				</label>
+					</label>
+				</div>
 
 				<!-- Public Pronoun Distribution -->
 				<label

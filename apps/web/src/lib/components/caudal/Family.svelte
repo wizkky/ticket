@@ -7,8 +7,7 @@
 	const brands = {
 		creative: 'Caudal Creativo',
 		factoria: 'La Factoría',
-		subte: 'El Subte',
-		emergia: 'Emergia'
+		subte: 'El Subte'
 	};
 </script>
 
@@ -50,16 +49,6 @@
 			/>
 			<p>{m['caudal.culture']()}</p>
 		</div>
-		<div class="sister emergia">
-			<img
-				src={asset('/brand/caudal/emergia.png')}
-				alt={brands.emergia}
-				width="1254"
-				height="1254"
-				loading="lazy"
-			/>
-			<p>{m['caudal.innovation']()}</p>
-		</div>
 	</div>
 	<a class="family-link" href="https://www.instagram.com/caudalcreativocl/"
 		>{m['caudal.followCaudal']()}<ArrowUpRight size={18} strokeWidth={1.5} /></a
@@ -100,7 +89,7 @@
 	}
 	.family-grid {
 		display: grid;
-		grid-template-columns: 1.25fr 1fr 1fr 1fr;
+		grid-template-columns: 1.25fr 1fr 1fr;
 		margin-top: 60px;
 		border-block: 1px solid hsl(var(--border));
 	}
@@ -171,6 +160,12 @@
 		}
 		.family-grid .parent {
 			padding: 10px;
+			grid-column: 1 / -1;
+			border-right: 0;
+		}
+		.family-grid > div:nth-child(2) {
+			border-right: 1px solid hsl(var(--border));
+			border-bottom: 0;
 		}
 	}
 </style>

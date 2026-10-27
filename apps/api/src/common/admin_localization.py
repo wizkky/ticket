@@ -6,6 +6,7 @@ import re
 import typing as t
 
 from django import forms
+from django.conf import settings
 from django.contrib import admin
 from django.contrib.admin.filters import ChoicesFieldListFilter
 from django.core.exceptions import FieldDoesNotExist
@@ -16,6 +17,10 @@ from unfold.admin import StackedInline as UnfoldStackedInline
 from unfold.admin import TabularInline as UnfoldTabularInline
 
 from common.admin_labels import admin_label
+from common.admin_modules import OPTIONAL_ADMIN_MODELS
+
+if t.TYPE_CHECKING:
+    from django.contrib.admin.filters import _ListFilterChoices
 
 
 def _translate_form(form: t.Any) -> None:
@@ -28,7 +33,7 @@ def _translate_form(form: t.Any) -> None:
                 (value, [(option, admin_label(label)) for option, label in title])
                 if isinstance(title, (list, tuple))
                 else (value, admin_label(title))
-                for value, title in field.choices
+                for value, title in t.cast("t.Iterable[tuple[t.Any, t.Any]]", field.choices)
             ]
 
 
@@ -56,7 +61,7 @@ def _translate_response(response: HttpResponse) -> HttpResponse:
 class TranslatedChoicesFilter(ChoicesFieldListFilter):
     """Translate option captions while preserving the filter's query values."""
 
-    def choices(self, changelist: t.Any) -> t.Iterator[dict[str, t.Any]]:
+    def choices(self, changelist: t.Any) -> t.Iterator["_ListFilterChoices"]:
         """Return the original filter options with localized display text."""
         for option in super().choices(changelist):
             yield {**option, "display": admin_label(option["display"])}
@@ -74,6 +79,13 @@ def _choice_column(name: str, label: str) -> t.Callable[[t.Any], str]:
 
 class ModelAdmin(UnfoldModelAdmin):  # type: ignore[misc]
     """Localize admin forms and headings at rendering time, preserving model contracts."""
+
+    def get_inlines(self, request: HttpRequest, obj: t.Any = None) -> t.Any:
+        """Hide optional embedded editors without deleting their records."""
+        inlines = super().get_inlines(request, obj)
+        if settings.CAUDAL_SHOW_OPTIONAL_MODULES:
+            return inlines
+        return [inline for inline in inlines if inline.model.__name__ not in OPTIONAL_ADMIN_MODELS]
 
     def get_list_display(self, request: HttpRequest) -> t.Any:
         """Localize enum captions without changing editable fields or explicit links."""
@@ -110,6 +122,11 @@ class ModelAdmin(UnfoldModelAdmin):  # type: ignore[misc]
         """Return the existing form with localized presentation labels."""
         form = super().get_form(request, obj, change=change, **kwargs)
         _translate_form(form)
+        if not settings.CAUDAL_SHOW_OPTIONAL_MODULES:
+            for name in ("potluck_open", "accept_membership_requests", "telegram_url"):
+                if name in form.base_fields:
+                    # Native hidden fields still post their saved values on unrelated edits.
+                    form.base_fields[name].widget = forms.HiddenInput()
         return form
 
     def changelist_view(self, request: HttpRequest, extra_context: t.Any = None) -> HttpResponse:

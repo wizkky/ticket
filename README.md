@@ -9,6 +9,10 @@ la administración y retira la gestión de alimentos, restricciones y preferenci
 alimentarias de la API, del administrador y de las pantallas de perfil/evento.
 [Alcance, captura y actualización local](docs/administracion-es-sin-alimentacion.md).
 
+La actualización posterior incorpora horario chileno, montos CLP en el administrador,
+limpieza de marcas, módulos opcionales ocultos y nuevas verificaciones funcionales.
+[Cambios, resultados y comandos de actualización](docs/revision-chile-y-modulos.md).
+
 ## Inicio
 
 Requisitos: Linux, Docker con Compose v2, Node.js 24 con Corepack, Python 3 y `uv`. El backend usa Python 3.14, instalado por `uv` según su versión fijada. También necesita las bibliotecas nativas de GDAL/GEOS, Pango y libmagic. La comprobación del QR usa `pdftoppm` (Poppler) y libzbar.

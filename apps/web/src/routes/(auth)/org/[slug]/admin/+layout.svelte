@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showModuleLink } from '$lib/caudal/modules';
 	import { resolve } from '$app/paths';
 	import { page } from '$app/stores';
 	import { ArrowLeft, ChevronDown } from '@lucide/svelte';
@@ -97,17 +98,21 @@
 		data.isOwner || canPerformAction(data.permissions, data.organization.id, 'manage_tickets')
 	);
 	const primary = $derived(
-		navItems.filter(
-			(item) =>
-				item.href.endsWith('/admin') ||
-				item.href.endsWith('/events') ||
-				(item.href.endsWith('/tickets') && canManageTickets)
-		)
+		navItems
+			.filter((item) => showModuleLink(item.href))
+			.filter(
+				(item) =>
+					item.href.endsWith('/admin') ||
+					item.href.endsWith('/events') ||
+					(item.href.endsWith('/tickets') && canManageTickets)
+			)
 	);
 	const secondary = $derived(
-		navItems.filter(
-			(item) => !primary.includes(item) && !(item.href.endsWith('/tickets') && !canManageTickets)
-		)
+		navItems
+			.filter((item) => showModuleLink(item.href))
+			.filter(
+				(item) => !primary.includes(item) && !(item.href.endsWith('/tickets') && !canManageTickets)
+			)
 	);
 	function isActive(href: string): boolean {
 		// For the dashboard (admin root), only match exact path

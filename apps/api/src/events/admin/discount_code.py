@@ -6,6 +6,7 @@ from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
 from common.admin_localization import ModelAdmin
+from common.service.invoice_utils import format_currency
 from events import models
 from events.admin.base import OrganizationLinkMixin
 
@@ -45,7 +46,7 @@ class DiscountCodeAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc
     def discount_display(self, obj: models.DiscountCode) -> str:
         if obj.discount_type == models.DiscountCode.DiscountType.PERCENTAGE:
             return f"{obj.discount_value}%"
-        return f"{obj.discount_value} {obj.currency or ''}"
+        return format_currency(obj.discount_value, obj.currency) if obj.currency else str(obj.discount_value)
 
     @admin.display(description=_("Usage"))
     def usage_display(self, obj: models.DiscountCode) -> str:

@@ -9,6 +9,7 @@ from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 
 from common.admin_localization import ModelAdmin
+from common.service.invoice_utils import format_currency
 from common.signing import get_file_url
 from events import models
 from events.admin.base import EmailDeliveryAdminMixin, OrganizationLinkMixin
@@ -110,7 +111,7 @@ class AttendeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationLink
 
     @admin.display(description=_("Total"))
     def total_display(self, obj: models.AttendeeInvoice) -> str:
-        return f"{obj.total_gross} {obj.currency}"
+        return format_currency(obj.total_gross, obj.currency)
 
     @admin.display(description=_("VAT"))
     def vat_display(self, obj: models.AttendeeInvoice) -> str:
@@ -119,8 +120,8 @@ class AttendeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationLink
         # A mixed-rate cart (#846) has no single rate: `obj.vat_rate` is only the
         # first payment's. Same guard as the PDF totals row (#897).
         if obj.has_mixed_vat_rates:
-            return f"{obj.total_vat} (mixed)"
-        return f"{obj.total_vat} ({obj.vat_rate}%)"
+            return f"{format_currency(obj.total_vat, obj.currency)} ({_('Mixed')})"
+        return f"{format_currency(obj.total_vat, obj.currency)} ({obj.vat_rate}%)"
 
     @admin.display(description=_("Status"))
     def status_display(self, obj: models.AttendeeInvoice) -> str:
@@ -194,4 +195,4 @@ class AttendeeInvoiceCreditNoteAdmin(ModelAdmin, EmailDeliveryAdminMixin):  # ty
 
     @admin.display(description=_("Amount (gross)"))
     def amount_display(self, obj: models.AttendeeInvoiceCreditNote) -> str:
-        return f"{obj.amount_gross} {obj.invoice.currency}"
+        return format_currency(obj.amount_gross, obj.invoice.currency)

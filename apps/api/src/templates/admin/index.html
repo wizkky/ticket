@@ -64,6 +64,7 @@
                     <p class="text-3xl font-bold text-primary-600 dark:text-primary-500">{{ dashboard.quick_stats.total_users }}</p>
                     <span class="text-4xl">👥</span>
                 </div>
+                {% if dashboard.show_optional_modules %}
                 <div class="mt-3 pt-3 border-t border-base-200 dark:border-base-700">
                     <div class="flex items-center justify-between text-sm">
                         <span class="text-gray-600 dark:text-gray-400 flex items-center gap-1">
@@ -73,6 +74,7 @@
                         <span class="font-semibold text-gray-900 dark:text-gray-100">{{ dashboard.quick_stats.connected_telegram }}</span>
                     </div>
                 </div>
+                {% endif %}
             </div>
 
             {# Total Organizations #}
@@ -340,6 +342,8 @@
 
 </div>
 
+{% endblock %}
+
 {# JavaScript for Charts #}
 {% block extrahead %}
     {{ block.super }}
@@ -469,6 +473,4 @@
         });
     </script>
     {% endif %}
-{% endblock %}
-
 {% endblock %}

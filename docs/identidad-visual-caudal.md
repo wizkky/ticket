@@ -39,6 +39,8 @@ foco al control de apertura.
 `apps/web/static/brand/caudal/` contiene copias sin modificar de cinco archivos
 entregados en `Caudal-Creativo/dist/assets/`: símbolo, cabecera de Caudal Creativo,
 La Factoría, El Subte y Emergia. Se presentan con CSS sin modificar los originales.
+En la revisión del 27 de octubre, Emergia se retiró de la presentación pública;
+su archivo permanece como parte del material histórico recibido.
 Las marcas y gráficas del usuario **no se relicencian como MIT** por incluirlas
 en el repositorio. Sus derechos permanecen con sus respectivos titulares.
 

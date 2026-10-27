@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { showOptionalModules } from '$lib/caudal/modules';
 	import * as m from '$lib/paraglide/messages.js';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
@@ -99,7 +100,9 @@
 	>
 		<option value="public">{m['tierForm.public']()}</option>
 		<option value="private">{m['tierForm.private']()}</option>
-		<option value="members-only">{m['tierForm.membersOnly']()}</option>
+		{#if showOptionalModules || visibility === 'members-only'}<option value="members-only"
+				>{m['tierForm.membersOnly']()}</option
+			>{/if}
 		<option value="staff-only">{m['tierForm.staffOnly']()}</option>
 	</select>
 
@@ -131,9 +134,13 @@
 		class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm transition-colors focus:border-ring focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2"
 	>
 		<option value="public">{m['tierForm.anyone']()}</option>
-		<option value="members">{m['tierForm.membersOnly']()}</option>
+		{#if showOptionalModules || purchasableBy === 'members'}<option value="members"
+				>{m['tierForm.membersOnly']()}</option
+			>{/if}
 		<option value="invited">{m['tierForm.invitedOnly']()}</option>
-		<option value="invited_and_members">{m['tierForm.invitedAndMembers']()}</option>
+		{#if showOptionalModules || purchasableBy === 'invited_and_members'}<option
+				value="invited_and_members">{m['tierForm.invitedAndMembers']()}</option
+			>{/if}
 	</select>
 
 	{#if purchasableBy === 'invited' || purchasableBy === 'invited_and_members'}

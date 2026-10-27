@@ -10,7 +10,6 @@ from ninja_extra import NinjaExtraAPI
 from accounts.controllers.account import AccountController
 from accounts.controllers.auth import AuthController
 from accounts.controllers.billing import UserBillingController
-from accounts.controllers.dietary import DietaryController
 from accounts.controllers.otp import OtpController
 from accounts.controllers.referral import ReferralController
 from accounts.controllers.referral_payouts import ReferralPayoutController
@@ -174,7 +173,6 @@ api.register_controllers(
     AuthController,
     OtpController,
     AccountController,
-    DietaryController,
     ReferralController,
     ReferralPayoutController,
     ReferralStripeController,

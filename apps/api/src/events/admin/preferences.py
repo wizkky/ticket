@@ -4,9 +4,10 @@
 from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
+from common.admin_localization import ModelAdmin
 from events import models
 
 
@@ -25,12 +26,12 @@ class GeneralUserPreferencesAdmin(ModelAdmin):  # type: ignore[misc]
     search_fields = ["user__username", "user__email", "city__name"]
     autocomplete_fields = ["user", "city"]
 
-    @admin.display(description="User")
+    @admin.display(description=_("User"))
     def user_link(self, obj: models.GeneralUserPreferences) -> str:
         url = reverse("admin:accounts_reveluser_change", args=[obj.user.id])
         return format_html('<a href="{}">{}</a>', url, obj.user.username)
 
-    @admin.display(description="City")
+    @admin.display(description=_("City"))
     def city_link(self, obj: models.GeneralUserPreferences) -> str | None:
         if not obj.city:
             return "—"
@@ -49,17 +50,17 @@ class AttendeeVisibilityFlagAdmin(ModelAdmin):  # type: ignore[misc]
     search_fields = ["user__username", "target__username", "event__name"]
     autocomplete_fields = ["user", "target", "event"]
 
-    @admin.display(description="Viewer")
+    @admin.display(description=_("Viewer"))
     def user_link(self, obj: models.AttendeeVisibilityFlag) -> str:
         url = reverse("admin:accounts_reveluser_change", args=[obj.user.id])
         return format_html('<a href="{}">{}</a>', url, obj.user.username)
 
-    @admin.display(description="Target User")
+    @admin.display(description=_("Target User"))
     def target_link(self, obj: models.AttendeeVisibilityFlag) -> str:
         url = reverse("admin:accounts_reveluser_change", args=[obj.target.id])
         return format_html('<a href="{}">{}</a>', url, obj.target.username)
 
-    @admin.display(description="Event")
+    @admin.display(description=_("Event"))
     def event_link(self, obj: models.AttendeeVisibilityFlag) -> str:
         url = reverse("admin:events_event_change", args=[obj.event.id])
         return format_html('<a href="{}">{}</a>', url, obj.event.name)

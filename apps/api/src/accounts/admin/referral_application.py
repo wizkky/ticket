@@ -16,7 +16,6 @@ from django.http import HttpRequest, HttpResponse, HttpResponseRedirect
 from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.translation import gettext_lazy as _
-from unfold.admin import ModelAdmin
 from unfold.decorators import action
 from unfold.enums import ActionVariant
 from unfold.widgets import (
@@ -29,6 +28,7 @@ from unfold.widgets import (
 from accounts.exceptions import ReferralApplicationConflictError, ReferralApplicationError
 from accounts.models import REFERRAL_CODE_VALIDATOR, ReferralApplication, ReferralCode, RevelUser
 from accounts.service import referral_application_service
+from common.admin_localization import ModelAdmin
 
 PENDING = ReferralApplication.Status.PENDING
 

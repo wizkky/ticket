@@ -4,9 +4,10 @@
 from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
+from common.admin_localization import ModelAdmin
 from events import models
 from events.admin.base import (
     OrganizationLinkMixin,
@@ -31,7 +32,7 @@ class VenueAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
 
     fieldsets = [
         (
-            "Basic Information",
+            _("Basic Information"),
             {
                 "fields": (
                     "organization",
@@ -42,7 +43,7 @@ class VenueAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Location",
+            _("Location"),
             {
                 "fields": (
                     "city",
@@ -52,14 +53,14 @@ class VenueAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Metadata",
+            _("Metadata"),
             {"fields": (("created_at", "updated_at"),)},
         ),
     ]
 
     inlines = [VenueSectorInline]
 
-    @admin.display(description="City")
+    @admin.display(description=_("City"))
     def city_name(self, obj: models.Venue) -> str:
         return str(obj.city) if obj.city else "—"
 
@@ -79,7 +80,7 @@ class VenueSectorAdmin(ModelAdmin, VenueLinkMixin):  # type: ignore[misc]
 
     fieldsets = [
         (
-            "Basic Information",
+            _("Basic Information"),
             {
                 "fields": (
                     "venue",
@@ -89,7 +90,7 @@ class VenueSectorAdmin(ModelAdmin, VenueLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Display Configuration",
+            _("Display Configuration"),
             {
                 "fields": (
                     "metadata",
@@ -99,7 +100,7 @@ class VenueSectorAdmin(ModelAdmin, VenueLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Metadata",
+            _("Metadata"),
             {"fields": (("created_at", "updated_at"),)},
         ),
     ]
@@ -122,7 +123,7 @@ class VenueSeatAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = [
         (
-            "Basic Information",
+            _("Basic Information"),
             {
                 "fields": (
                     "sector",
@@ -132,7 +133,7 @@ class VenueSeatAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Position & Properties",
+            _("Position & Properties"),
             {
                 "fields": (
                     "position",
@@ -142,12 +143,12 @@ class VenueSeatAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Metadata",
+            _("Metadata"),
             {"fields": (("created_at", "updated_at"),)},
         ),
     ]
 
-    @admin.display(description="Sector")
+    @admin.display(description=_("Sector"))
     def sector_link(self, obj: models.VenueSeat) -> str:
         url = reverse("admin:events_venuesector_change", args=[obj.sector.id])
         return format_html('<a href="{}">{}</a>', url, str(obj.sector))

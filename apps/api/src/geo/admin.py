@@ -1,5 +1,6 @@
 from django.contrib import admin
-from unfold.admin import ModelAdmin
+
+from common.admin_localization import ModelAdmin
 
 from . import models
 

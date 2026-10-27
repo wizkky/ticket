@@ -11,9 +11,10 @@ from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter, RangeDateFilter
 
+from common.admin_localization import ModelAdmin
 from common.models import STRIPE_CONNECTED_Q
 from events import models
 from events.admin.base import (
@@ -162,15 +163,15 @@ class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
     actions = ["bind_platform_stripe_account", "unbind_platform_stripe_account", "clear_stripe_connect_account"]
 
     tabs = [
-        ("Settings", ["Settings", "Social"]),
-        ("Billing", ["Billing"]),
-        ("People", ["Staff", "Members", "Tiers"]),
-        ("Content", ["Series", "Questionnaires", "Venues"]),
+        (_("Settings"), ["Settings", "Social"]),
+        (_("Billing"), ["Billing"]),
+        (_("People"), ["Staff", "Members", "Tiers"]),
+        (_("Content"), ["Series", "Questionnaires", "Venues"]),
     ]
 
     fieldsets = [
         (
-            "Settings",
+            _("Settings"),
             {
                 "fields": [
                     "name",
@@ -187,7 +188,7 @@ class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Social",
+            _("Social"),
             {
                 "fields": [
                     "instagram_url",
@@ -198,7 +199,7 @@ class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Billing",
+            _("Billing"),
             {
                 "fields": [
                     "billing_name",
@@ -225,7 +226,7 @@ class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
         VenueInline,
     ]
 
-    @admin.action(description="Bind to platform Stripe account (superuser only)")
+    @admin.action(description=_("Bind to platform Stripe account (superuser only)"))
     def bind_platform_stripe_account(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> None:
         """Point ONE org at the platform's own Stripe account.
 
@@ -265,7 +266,7 @@ class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
         )
         self.message_user(request, f"{org.slug} bound to platform Stripe account.", level=messages.SUCCESS)
 
-    @admin.action(description="Unbind platform Stripe account (superuser only)")
+    @admin.action(description=_("Unbind platform Stripe account (superuser only)"))
     def unbind_platform_stripe_account(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> None:
         """Clear a platform-account binding. Refuses to touch real Connect accounts."""
         if not request.user.is_superuser:
@@ -287,7 +288,7 @@ class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
             )
             self.message_user(request, f"{org.slug} unbound from platform Stripe account.", level=messages.SUCCESS)
 
-    @admin.action(description="Clear stale Stripe Connect account (superuser only)")
+    @admin.action(description=_("Clear stale Stripe Connect account (superuser only)"))
     def clear_stripe_connect_account(self, request: HttpRequest, queryset: QuerySet[models.Organization]) -> None:
         """Detach a stale Connect account so the org can re-onboard from scratch.
 
@@ -352,28 +353,28 @@ class OrganizationAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[misc]
 
     owner_link.short_description = "Owner"  # type: ignore[attr-defined]
 
-    @admin.display(description="Members", ordering="_members_count")
+    @admin.display(description=_("Members"), ordering="_members_count")
     def members_count(self, obj: models.Organization) -> int:
         return t.cast(int, getattr(obj, "_members_count", 0))
 
-    @admin.display(description="Events", ordering="_events_count")
+    @admin.display(description=_("Events"), ordering="_events_count")
     def events_count(self, obj: models.Organization) -> int:
         return t.cast(int, getattr(obj, "_events_count", 0))
 
-    @admin.display(description="Payments", ordering="_payments_count")
+    @admin.display(description=_("Payments"), ordering="_payments_count")
     def payments_count(self, obj: models.Organization) -> int:
         return t.cast(int, getattr(obj, "_payments_count", 0))
 
-    @admin.display(description="Source", ordering="attribution__utm_source")
+    @admin.display(description=_("Source"), ordering="attribution__utm_source")
     def acquisition_source(self, obj: models.Organization) -> str:
         attribution: models.TicketAttribution = obj.attribution or models.TicketAttribution()
         return attribution.get("utm_source", "—")
 
-    @admin.display(description="Stripe", boolean=True)
+    @admin.display(description=_("Stripe"), boolean=True)
     def stripe_connected(self, obj: models.Organization) -> bool:
         return obj.is_stripe_connected
 
-    @admin.display(description="VAT")
+    @admin.display(description=_("VAT"))
     def vat_status(self, obj: models.Organization) -> str:
         if not obj.vat_id:
             return "—"
@@ -408,7 +409,7 @@ class OrganizationContactMessageAdmin(ModelAdmin, OrganizationLinkMixin):  # typ
     ]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Sender")
+    @admin.display(description=_("Sender"))
     def sender_link(self, obj: models.OrganizationContactMessage) -> str:
         if not obj.sender:
             return "—"
@@ -451,7 +452,7 @@ class MembershipTierAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[mi
         qs: QuerySet[models.MembershipTier] = super().get_queryset(request)
         return qs.annotate(_member_count=Count("members"))
 
-    @admin.display(description="Members", ordering="_member_count")
+    @admin.display(description=_("Members"), ordering="_member_count")
     def member_count(self, obj: models.MembershipTier) -> int:
         return t.cast(int, getattr(obj, "_member_count", 0))
 
@@ -469,7 +470,7 @@ class OrganizationStaffAdmin(ModelAdmin, UserLinkMixin, OrganizationLinkMixin): 
     readonly_fields = ["created_at", "updated_at"]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Permissions")
+    @admin.display(description=_("Permissions"))
     def permissions_summary(self, obj: models.OrganizationStaff) -> str:
         if not obj.permissions:
             return "None"
@@ -496,7 +497,7 @@ class OrganizationMemberAdmin(ModelAdmin, UserLinkMixin, OrganizationLinkMixin):
     readonly_fields = ["created_at", "updated_at"]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Tier")
+    @admin.display(description=_("Tier"))
     def tier_name(self, obj: models.OrganizationMember) -> str:
         return obj.tier.name if obj.tier else "—"
 
@@ -514,7 +515,7 @@ class OrganizationMembershipRequestAdmin(ModelAdmin, UserLinkMixin, Organization
     readonly_fields = ["created_at", "updated_at"]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.OrganizationMembershipRequest) -> str:
         colors: dict[t.Any, str] = {
             models.OrganizationMembershipRequest.Status.PENDING: "orange",
@@ -524,7 +525,7 @@ class OrganizationMembershipRequestAdmin(ModelAdmin, UserLinkMixin, Organization
         color = colors.get(obj.status, "gray")
         return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
 
-    @admin.display(description="Decided By")
+    @admin.display(description=_("Decided By"))
     def decided_by_link(self, obj: models.OrganizationMembershipRequest) -> str | None:
         if not obj.decided_by:
             return "—"
@@ -561,16 +562,16 @@ class OrganizationTokenAdmin(ModelAdmin, UserLinkMixin, OrganizationLinkMixin): 
     readonly_fields = ["id", "created_at", "updated_at"]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Tier")
+    @admin.display(description=_("Tier"))
     def tier_name(self, obj: models.OrganizationToken) -> str:
         return obj.membership_tier.name if obj.membership_tier else "—"
 
-    @admin.display(description="Issuer")
+    @admin.display(description=_("Issuer"))
     def issuer_link(self, obj: models.OrganizationToken) -> str:
         url = reverse("admin:accounts_reveluser_change", args=[obj.issuer.id])
         return format_html('<a href="{}">{}</a>', url, obj.issuer.username)
 
-    @admin.display(description="Uses")
+    @admin.display(description=_("Uses"))
     def uses_display(self, obj: models.OrganizationToken) -> str:
         if obj.max_uses > 0:
             return f"{obj.uses} / {obj.max_uses}"

@@ -9,11 +9,11 @@ from django.http import HttpRequest
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
-from unfold.admin import ModelAdmin
 
 from accounts.exceptions import ReferralApplicationConflictError
 from accounts.models import Referral, ReferralCode, ReferralPayout, ReferralPayoutStatement, RevelUser
 from accounts.service import referral_application_service, referral_payout_service
+from common.admin_localization import ModelAdmin
 from common.signing import get_file_url
 
 
@@ -47,7 +47,7 @@ class ReferralCodeAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = [
         (
-            "Referral Code",
+            _("Referral Code"),
             {
                 "fields": (
                     "user",
@@ -58,7 +58,7 @@ class ReferralCodeAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Metadata",
+            _("Metadata"),
             {
                 "fields": (
                     "created_at",
@@ -106,7 +106,7 @@ class ReferralAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = [
         (
-            "Referral",
+            _("Referral"),
             {
                 "fields": (
                     "referral_code",
@@ -117,7 +117,7 @@ class ReferralAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Metadata",
+            _("Metadata"),
             {
                 "fields": (
                     "created_at",
@@ -169,7 +169,7 @@ class ReferralPayoutAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = [
         (
-            "Payout",
+            _("Payout"),
             {
                 "fields": (
                     "referral",
@@ -185,7 +185,7 @@ class ReferralPayoutAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Metadata",
+            _("Metadata"),
             {
                 "fields": (
                     "created_at",
@@ -296,20 +296,26 @@ class ReferralPayoutStatementAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = [
         (None, {"fields": ["payout", "document_type", "document_number", "issued_at", "pdf_link"]}),
-        ("Amount", {"fields": ["amount_net", "amount_vat", "vat_rate", "amount_gross", "currency", "reverse_charge"]}),
-        ("Referrer Snapshot", {"fields": ["referrer_name", "referrer_address", "referrer_vat_id", "referrer_country"]}),
         (
-            "Platform Snapshot",
+            _("Amount"),
+            {"fields": ["amount_net", "amount_vat", "vat_rate", "amount_gross", "currency", "reverse_charge"]},
+        ),
+        (
+            _("Referrer Snapshot"),
+            {"fields": ["referrer_name", "referrer_address", "referrer_vat_id", "referrer_country"]},
+        ),
+        (
+            _("Platform Snapshot"),
             {"fields": ["platform_business_name", "platform_business_address", "platform_vat_id"]},
         ),
     ]
 
-    @admin.display(description="Amount (gross)")
+    @admin.display(description=_("Amount (gross)"))
     def amount_display(self, obj: ReferralPayoutStatement) -> str:
         """Display gross amount with currency."""
         return f"{obj.amount_gross} {obj.currency}"
 
-    @admin.display(description="VAT")
+    @admin.display(description=_("VAT"))
     def vat_display(self, obj: ReferralPayoutStatement) -> str:
         """Display VAT amount or reverse charge indicator."""
         if obj.reverse_charge:
@@ -318,12 +324,12 @@ class ReferralPayoutStatementAdmin(ModelAdmin):  # type: ignore[misc]
             return f"{obj.amount_vat} ({obj.vat_rate}%)"
         return "—"
 
-    @admin.display(description="RC", boolean=True)
+    @admin.display(description=_("RC"), boolean=True)
     def reverse_charge_display(self, obj: ReferralPayoutStatement) -> bool:
         """Display reverse charge as boolean icon."""
         return obj.reverse_charge
 
-    @admin.display(description="PDF")
+    @admin.display(description=_("PDF"))
     def pdf_link(self, obj: ReferralPayoutStatement) -> str:
         """Display signed download link for the PDF file."""
         if url := get_file_url(obj.pdf_file):

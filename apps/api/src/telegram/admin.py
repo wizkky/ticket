@@ -1,10 +1,11 @@
 # src/telegram/admin.py
-
 from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
+
+from common.admin_localization import ModelAdmin
 
 from . import models
 
@@ -45,7 +46,7 @@ class TelegramUserAdmin(ModelAdmin):  # type: ignore[misc]
     user_link.short_description = "User"  # type: ignore[attr-defined]
     user_link.admin_order_field = "user__username"  # type: ignore[attr-defined]
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.TelegramUser) -> str:
         if obj.blocked_by_user:
             return mark_safe('<span style="color: red;">Blocked by User</span>')
@@ -74,11 +75,11 @@ class AccountOTPAdmin(ModelAdmin):  # type: ignore[misc]
     date_hierarchy = "created_at"
     ordering = ["-created_at"]
 
-    @admin.display(description="Used", boolean=True)
+    @admin.display(description=_("Used"), boolean=True)
     def used_display(self, obj: models.AccountOTP) -> bool:
         return obj.used_at is not None
 
-    @admin.display(description="Expired", boolean=True)
+    @admin.display(description=_("Expired"), boolean=True)
     def expired_display(self, obj: models.AccountOTP) -> bool:
         return obj.is_expired()
 

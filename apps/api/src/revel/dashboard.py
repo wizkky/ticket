@@ -9,6 +9,8 @@ from django.db.models import Count, Exists, OuterRef
 from django.http import HttpRequest
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.formats import date_format
+from django.utils.translation import gettext as _
 
 from accounts.models import RevelUser
 from common.models import STRIPE_CONNECTED_Q, SiteSettings
@@ -115,7 +117,7 @@ def _get_pronoun_distribution() -> PronounDistribution:
 
     # Add "Not specified" category if there are users without pronouns
     if no_pronouns_count > 0:
-        labels.append("Not specified")
+        labels.append(_("Not specified"))
         data.append(no_pronouns_count)
 
     return {
@@ -155,7 +157,7 @@ def _get_user_growth_data(days: int = 30) -> UserGrowthData:
     sorted_weeks = sorted(weekly_data.items(), key=lambda x: x[0])
 
     return {
-        "labels": [week[0].strftime("%b %d") for week in sorted_weeks],
+        "labels": [date_format(week[0], "d M") for week in sorted_weeks],
         "data": [week[1] for week in sorted_weeks],
     }
 
@@ -196,11 +198,17 @@ def _get_event_analytics() -> dict[str, t.Any]:
             "ticket_required": {"count": ticket_count, "percentage": round((ticket_count / total_events) * 100, 1)},
         },
         "by_visibility": {
-            key: {"count": value, "percentage": round((value / total_events) * 100, 1)}
+            key: {
+                "count": value,
+                "percentage": round((value / total_events) * 100, 1),
+            }
             for key, value in visibility_data.items()
         },
         "by_event_type": {
-            key: {"count": value, "percentage": round((value / total_events) * 100, 1)}
+            key: {
+                "count": value,
+                "percentage": round((value / total_events) * 100, 1),
+            }
             for key, value in event_type_data.items()
         },
     }
@@ -436,12 +444,12 @@ def dashboard_callback(request: HttpRequest, context: dict[str, t.Any]) -> dict[
     # Quick action links
     quick_actions = [
         {
-            "title": "Go to Frontend",
+            "title": _("Go to Frontend"),
             "url": site_settings.frontend_base_url,
             "icon": "🌐",
         },
         {
-            "title": "Site Settings",
+            "title": _("Site Settings"),
             "url": reverse("admin:common_sitesettings_change", args=[site_settings.pk]),
             "icon": "⚙️",
         },
@@ -451,7 +459,7 @@ def dashboard_callback(request: HttpRequest, context: dict[str, t.Any]) -> dict[
             "icon": "📊",
         },
         {
-            "title": "Send Announcement",
+            "title": _("Send Announcement"),
             "url": reverse("admin:notifications_notification_send_announcement"),
             "icon": "📢",
         },

@@ -7,9 +7,9 @@ from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.translation import gettext_lazy as _
-from unfold.admin import ModelAdmin
 
 from accounts.models import GlobalBan, ImpersonationLog, RevelUser
+from common.admin_localization import ModelAdmin
 
 
 @admin.register(ImpersonationLog)
@@ -129,7 +129,7 @@ class GlobalBanAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = [
         (
-            "Ban Details",
+            _("Ban Details"),
             {
                 "fields": (
                     "ban_type",
@@ -140,7 +140,7 @@ class GlobalBanAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Linked Records",
+            _("Linked Records"),
             {
                 "fields": (
                     "user",
@@ -149,7 +149,7 @@ class GlobalBanAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Metadata",
+            _("Metadata"),
             {
                 "fields": (
                     "created_at",
@@ -160,20 +160,20 @@ class GlobalBanAdmin(ModelAdmin):  # type: ignore[misc]
         ),
     ]
 
-    @admin.display(description="User")
+    @admin.display(description=_("User"))
     def linked_user(self, obj: GlobalBan) -> str:
         if obj.user:
             url = reverse("admin:accounts_reveluser_change", args=[obj.user.id])
             return format_html('<a href="{}">{}</a>', url, obj.user.email)
         return "—"
 
-    @admin.display(description="Reason")
+    @admin.display(description=_("Reason"))
     def reason_preview(self, obj: GlobalBan) -> str:
         if obj.reason:
             return obj.reason[:80] + ("..." if len(obj.reason) > 80 else "")
         return "—"
 
-    @admin.display(description="Created By")
+    @admin.display(description=_("Created By"))
     def created_by_link(self, obj: GlobalBan) -> str:
         if obj.created_by:
             url = reverse("admin:accounts_reveluser_change", args=[obj.created_by.id])

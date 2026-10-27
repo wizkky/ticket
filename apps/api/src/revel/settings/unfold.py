@@ -1,14 +1,15 @@
 """Django Unfold admin configuration."""
 
 from django.urls import reverse_lazy
+from django.utils.text import format_lazy
 from django.utils.translation import gettext_lazy as _
 
-from .base import VERSION
+from .base import SITE_NAME
 
 # Unfold configuration
 UNFOLD = {
-    "SITE_TITLE": f"Revel v{VERSION} Admin",
-    "SITE_HEADER": f"Revel v{VERSION} Administration",
+    "SITE_TITLE": format_lazy(_("{site_name} administration"), site_name=SITE_NAME),
+    "SITE_HEADER": format_lazy(_("{site_name} administration"), site_name=SITE_NAME),
     "SITE_URL": "/",
     "DASHBOARD_CALLBACK": "revel.dashboard.dashboard_callback",
     "SHOW_HISTORY": True,
@@ -92,33 +93,6 @@ UNFOLD = {
                         "title": _("User Billing Profiles"),
                         "icon": "account_balance",
                         "link": reverse_lazy("admin:accounts_userbillingprofile_changelist"),
-                    },
-                ],
-            },
-            {
-                "title": _("Dietary Management"),
-                "separator": True,
-                "collapsible": True,
-                "items": [
-                    {
-                        "title": _("Dietary Restrictions"),
-                        "icon": "block",
-                        "link": reverse_lazy("admin:accounts_dietaryrestriction_changelist"),
-                    },
-                    {
-                        "title": _("Dietary Preferences"),
-                        "icon": "restaurant",
-                        "link": reverse_lazy("admin:accounts_dietarypreference_changelist"),
-                    },
-                    {
-                        "title": _("User Preferences"),
-                        "icon": "restaurant_menu",
-                        "link": reverse_lazy("admin:accounts_userdietarypreference_changelist"),
-                    },
-                    {
-                        "title": _("Food Items"),
-                        "icon": "fastfood",
-                        "link": reverse_lazy("admin:accounts_fooditem_changelist"),
                     },
                 ],
             },

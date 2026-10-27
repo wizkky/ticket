@@ -7,9 +7,10 @@ from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
+from common.admin_localization import ModelAdmin
 from events import models
 from events.admin.base import (
     EventLinkMixin,
@@ -48,16 +49,16 @@ class TicketTierAdmin(ModelAdmin, EventLinkMixin, VenueLinkMixin):  # type: igno
     autocomplete_fields = ["event", "venue", "sector"]
     filter_horizontal = ["restricted_to_membership_tiers"]
 
-    @admin.display(description="Price", ordering="price")
+    @admin.display(description=_("Price"), ordering="price")
     def price_display(self, obj: models.TicketTier) -> str:
         return f"{obj.price} {obj.currency}"
 
-    @admin.display(description="Sold", ordering="quantity_sold")
+    @admin.display(description=_("Sold"), ordering="quantity_sold")
     def quantity_display(self, obj: models.TicketTier) -> str:
         total = obj.total_quantity if obj.total_quantity is not None else "∞"
         return f"{obj.quantity_sold} / {total}"
 
-    @admin.display(description="Sector")
+    @admin.display(description=_("Sector"))
     def sector_name(self, obj: models.TicketTier) -> str:
         return obj.sector.name if obj.sector else "—"
 
@@ -113,9 +114,9 @@ class TicketAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin, VenueLinkMixin):  #
 
     fieldsets = [
         (None, {"fields": ["id", "event", "user", "guest_name", "status", "tier"]}),
-        ("Seating", {"fields": ["venue", "sector", "seat"]}),
+        (_("Seating"), {"fields": ["venue", "sector", "seat"]}),
         (
-            "Payment & Discounts",
+            _("Payment & Discounts"),
             {
                 "fields": [
                     "price_paid",
@@ -128,23 +129,23 @@ class TicketAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin, VenueLinkMixin):  #
                 ]
             },
         ),
-        ("Check-in", {"fields": ["checked_in_at", "checked_in_by"]}),
+        (_("Check-in"), {"fields": ["checked_in_at", "checked_in_by"]}),
         (
-            "Cancellation",
+            _("Cancellation"),
             {"fields": ["cancelled_at", "cancelled_by", "cancellation_source", "cancellation_reason"]},
         ),
-        ("Metadata", {"fields": ["file_content_hash", "created_at", "updated_at"], "classes": ["collapse"]}),
+        (_("Metadata"), {"fields": ["file_content_hash", "created_at", "updated_at"], "classes": ["collapse"]}),
     ]
 
-    @admin.display(description="Tier")
+    @admin.display(description=_("Tier"))
     def tier_name(self, obj: models.Ticket) -> str | None:
         return obj.tier.name if obj.tier else "—"
 
-    @admin.display(description="Sector")
+    @admin.display(description=_("Sector"))
     def sector_name(self, obj: models.Ticket) -> str | None:
         return obj.sector.name if obj.sector else "—"
 
-    @admin.display(description="Seat")
+    @admin.display(description=_("Seat"))
     def seat_label(self, obj: models.Ticket) -> str | None:
         return obj.seat.label if obj.seat else "—"
 
@@ -211,9 +212,9 @@ class PaymentAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[m
 
     fieldsets = [
         (None, {"fields": ["id", "user", "ticket", "status", "stripe_session_id"]}),
-        ("Amounts", {"fields": ["amount", "currency", "net_amount", "vat_amount", "vat_rate"]}),
+        (_("Amounts"), {"fields": ["amount", "currency", "net_amount", "vat_amount", "vat_rate"]}),
         (
-            "Platform Fee",
+            _("Platform Fee"),
             {
                 "fields": [
                     "platform_fee",
@@ -225,28 +226,28 @@ class PaymentAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[m
             },
         ),
         (
-            "Refund",
+            _("Refund"),
             {"fields": ["refund_status", "refund_amount", "stripe_refund_id", "refund_failure_reason", "refunded_at"]},
         ),
-        ("Billing Snapshot", {"fields": ["buyer_billing_snapshot"], "classes": ["collapse"]}),
-        ("Stripe", {"fields": ["stripe_payment_intent_id", "reservation_id", "raw_response"]}),
-        ("Dates", {"fields": ["expires_at", "created_at", "updated_at"]}),
+        (_("Billing Snapshot"), {"fields": ["buyer_billing_snapshot"], "classes": ["collapse"]}),
+        (_("Stripe"), {"fields": ["stripe_payment_intent_id", "reservation_id", "raw_response"]}),
+        (_("Dates"), {"fields": ["expires_at", "created_at", "updated_at"]}),
     ]
 
-    @admin.display(description="ID")
+    @admin.display(description=_("ID"))
     def id_short(self, obj: models.Payment) -> str:
         return str(obj.id)[:8] + "..."
 
-    @admin.display(description="Ticket")
+    @admin.display(description=_("Ticket"))
     def ticket_link(self, obj: models.Payment) -> str:
         url = reverse("admin:events_ticket_change", args=[obj.ticket.id])
         return format_html('<a href="{}">{}</a>', url, f"Ticket {str(obj.ticket.id)[:8]}...")
 
-    @admin.display(description="Amount")
+    @admin.display(description=_("Amount"))
     def amount_display(self, obj: models.Payment) -> str:
         return f"{obj.amount} {obj.currency}"
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.Payment) -> str:
         colors: dict[t.Any, str] = {
             models.Payment.PaymentStatus.PENDING: "orange",
@@ -257,13 +258,13 @@ class PaymentAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[m
         color = colors.get(obj.status, "gray")
         return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
 
-    @admin.display(description="VAT")
+    @admin.display(description=_("VAT"))
     def vat_display(self, obj: models.Payment) -> str:
         if obj.vat_amount is not None:
             return f"{obj.vat_amount} ({obj.vat_rate}%)"
         return "—"
 
-    @admin.display(description="P. Fee")
+    @admin.display(description=_("P. Fee"))
     def platform_fee_display(self, obj: models.Payment) -> str:
         if obj.platform_fee_reverse_charge:
             return f"{obj.platform_fee} (RC)"
@@ -276,7 +277,7 @@ class PaymentAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignore[m
             return str(obj.platform_fee)
         return "—"
 
-    @admin.display(description="Stripe Session")
+    @admin.display(description=_("Stripe Session"))
     def stripe_session_id_short(self, obj: models.Payment) -> str:
         if obj.stripe_session_id:
             return obj.stripe_session_id[:20] + "..."

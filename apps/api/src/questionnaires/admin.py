@@ -1,5 +1,4 @@
 # src/questionnaires/admin.py
-
 import json
 import typing as t
 
@@ -9,9 +8,10 @@ from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.html import format_html, format_html_join
 from django.utils.safestring import mark_safe
-from unfold.admin import ModelAdmin, StackedInline, TabularInline
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
+from common.admin_localization import ModelAdmin, StackedInline, TabularInline
 from common.signing import get_file_url
 
 from . import models
@@ -53,7 +53,7 @@ class MultipleChoiceQuestionInline(StackedInline):  # type: ignore[misc]
     fieldsets = (
         (None, {"fields": ("question", "hint", "section")}),
         (
-            "Configuration",
+            _("Configuration"),
             {
                 "fields": (
                     "allow_multiple_answers",
@@ -67,14 +67,14 @@ class MultipleChoiceQuestionInline(StackedInline):  # type: ignore[misc]
             },
         ),
         (
-            "Scoring",
+            _("Scoring"),
             {
                 "fields": ("positive_weight", "negative_weight"),
                 "classes": ["collapse"],
             },
         ),
         (
-            "Reviewer Notes",
+            _("Reviewer Notes"),
             {
                 "fields": ("reviewer_notes",),
                 "classes": ["collapse"],
@@ -93,21 +93,21 @@ class FreeTextQuestionInline(StackedInline):  # type: ignore[misc]
     fieldsets = (
         (None, {"fields": ("question", "hint", "section")}),
         (
-            "Configuration",
+            _("Configuration"),
             {
                 "fields": ("is_mandatory", "is_fatal", "order", "depends_on_option"),
                 "classes": ["collapse"],
             },
         ),
         (
-            "Scoring & AI",
+            _("Scoring & AI"),
             {
                 "fields": ("positive_weight", "negative_weight", "llm_guidelines"),
                 "classes": ["collapse"],
             },
         ),
         (
-            "Reviewer Notes",
+            _("Reviewer Notes"),
             {
                 "fields": ("reviewer_notes",),
                 "classes": ["collapse"],
@@ -126,28 +126,28 @@ class FileUploadQuestionInline(StackedInline):  # type: ignore[misc]
     fieldsets = (
         (None, {"fields": ("question", "hint", "section")}),
         (
-            "Configuration",
+            _("Configuration"),
             {
                 "fields": ("is_mandatory", "order", "depends_on_option"),
                 "classes": ["collapse"],
             },
         ),
         (
-            "File Settings",
+            _("File Settings"),
             {
                 "fields": ("max_files", "max_file_size", "allowed_mime_types"),
                 "classes": ["collapse"],
             },
         ),
         (
-            "Scoring",
+            _("Scoring"),
             {
                 "fields": ("positive_weight", "negative_weight"),
                 "classes": ["collapse"],
             },
         ),
         (
-            "Reviewer Notes",
+            _("Reviewer Notes"),
             {
                 "fields": ("reviewer_notes",),
                 "classes": ["collapse"],
@@ -177,13 +177,13 @@ class QuestionnaireAdmin(ModelAdmin):  # type: ignore[misc]
     ]
 
     tabs = [
-        ("Settings", ["Settings"]),
-        ("Content", ["Sections", "Questions"]),
+        (_("Settings"), ["Settings"]),
+        (_("Content"), ["Sections", "Questions"]),
     ]
 
     fieldsets = (
         (
-            "Settings",
+            _("Settings"),
             {
                 "fields": (
                     ("name",),
@@ -195,7 +195,7 @@ class QuestionnaireAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Evaluation",
+            _("Evaluation"),
             {
                 "fields": (
                     "evaluation_mode",
@@ -295,7 +295,7 @@ class FileUploadAnswerInline(TabularInline):  # type: ignore[misc]
         qs: QuerySet[models.FileUploadAnswer] = super().get_queryset(request)
         return qs.select_related("question").prefetch_related("files")
 
-    @admin.display(description="Files")
+    @admin.display(description=_("Files"))
     def files_display(self, obj: models.FileUploadAnswer) -> str:
         if not (files := list(obj.files.all())):
             return "—"
@@ -328,7 +328,7 @@ class QuestionnaireSubmissionAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[m
 
     fieldsets = (
         (None, {"fields": ("user", "questionnaire", "status", "submitted_at")}),
-        ("Metadata", {"fields": ("metadata_display",), "classes": ["collapse"]}),
+        (_("Metadata"), {"fields": ("metadata_display",), "classes": ["collapse"]}),
     )
 
     inlines = [
@@ -348,7 +348,7 @@ class QuestionnaireSubmissionAdmin(ModelAdmin, UserLinkMixin):  # type: ignore[m
 
     questionnaire_link.short_description = "Questionnaire"  # type: ignore[attr-defined]
 
-    @admin.display(description="Evaluation")
+    @admin.display(description=_("Evaluation"))
     def evaluation_status(self, obj: models.QuestionnaireSubmission) -> str:
         evaluation = getattr(obj, "evaluation", None)
         if not evaluation:
@@ -415,7 +415,7 @@ class QuestionnaireEvaluationAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (
-            "Evaluation Details",
+            _("Evaluation Details"),
             {
                 "fields": (
                     "submission_link",
@@ -427,7 +427,7 @@ class QuestionnaireEvaluationAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Workflow Information",
+            _("Workflow Information"),
             {
                 "fields": (
                     "evaluation_workflow_display",
@@ -436,7 +436,7 @@ class QuestionnaireEvaluationAdmin(ModelAdmin):  # type: ignore[misc]
                 "classes": ["collapse"],
             },
         ),
-        ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
+        (_("Timestamps"), {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
     )
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[models.QuestionnaireEvaluation]:
@@ -450,12 +450,12 @@ class QuestionnaireEvaluationAdmin(ModelAdmin):  # type: ignore[misc]
     submission_user.short_description = "User"  # type: ignore[attr-defined]
     submission_user.admin_order_field = "submission__user__username"  # type: ignore[attr-defined]
 
-    @admin.display(description="Questionnaire")
+    @admin.display(description=_("Questionnaire"))
     def questionnaire_name(self, obj: models.QuestionnaireEvaluation) -> str:
         url = reverse("admin:questionnaires_questionnaire_change", args=[obj.submission.questionnaire.id])
         return format_html('<a href="{}">{}</a>', url, obj.submission.questionnaire.name)
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.QuestionnaireEvaluation) -> str:
         colors = {
             models.QuestionnaireEvaluation.QuestionnaireEvaluationStatus.APPROVED: "green",
@@ -465,7 +465,7 @@ class QuestionnaireEvaluationAdmin(ModelAdmin):  # type: ignore[misc]
         color = colors.get(obj.status, "gray")  # type: ignore[call-overload]
         return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
 
-    @admin.display(description="Proposed Status")
+    @admin.display(description=_("Proposed Status"))
     def proposed_status_display(self, obj: models.QuestionnaireEvaluation) -> str:
         if not obj.proposed_status:
             return "—"
@@ -477,7 +477,7 @@ class QuestionnaireEvaluationAdmin(ModelAdmin):  # type: ignore[misc]
         color = colors.get(obj.proposed_status, "gray")  # type: ignore[call-overload]
         return mark_safe(f'<span style="color: {color};">{obj.get_proposed_status_display()}</span>')
 
-    @admin.display(description="Score")
+    @admin.display(description=_("Score"))
     def score_display(self, obj: models.QuestionnaireEvaluation) -> str:
         if obj.score is not None:
             min_score = obj.submission.questionnaire.min_score
@@ -485,7 +485,7 @@ class QuestionnaireEvaluationAdmin(ModelAdmin):  # type: ignore[misc]
             return mark_safe(f'<span style="color: {color};">{obj.score:.1f} / 100</span>')
         return "—"
 
-    @admin.display(description="Auto-Evaluated", boolean=True)
+    @admin.display(description=_("Auto-Evaluated"), boolean=True)
     def automatically_evaluated_display(self, obj: models.QuestionnaireEvaluation) -> bool:
         return obj.automatically_evaluated
 
@@ -548,7 +548,7 @@ class MultipleChoiceOptionAdmin(ModelAdmin):  # type: ignore[misc]
     autocomplete_fields = ["question"]
     ordering = ["question", "order"]
 
-    @admin.display(description="Question")
+    @admin.display(description=_("Question"))
     def question_link(self, obj: models.MultipleChoiceOption) -> str:
         url = reverse("admin:questionnaires_multiplechoicequestion_change", args=[obj.question.id])
         question_text = obj.question.question or ""
@@ -587,7 +587,7 @@ class MultipleChoiceQuestionAdmin(ModelAdmin):  # type: ignore[misc]
     fieldsets = (
         (None, {"fields": ("questionnaire", "section", "question", "hint")}),
         (
-            "Configuration",
+            _("Configuration"),
             {
                 "fields": (
                     "allow_multiple_answers",
@@ -599,21 +599,21 @@ class MultipleChoiceQuestionAdmin(ModelAdmin):  # type: ignore[misc]
                 ),
             },
         ),
-        ("Scoring", {"fields": ("positive_weight", "negative_weight")}),
-        ("Reviewer Notes", {"fields": ("reviewer_notes",), "classes": ["collapse"]}),
+        (_("Scoring"), {"fields": ("positive_weight", "negative_weight")}),
+        (_("Reviewer Notes"), {"fields": ("reviewer_notes",), "classes": ["collapse"]}),
     )
 
-    @admin.display(description="Question")
+    @admin.display(description=_("Question"))
     def question_short(self, obj: models.MultipleChoiceQuestion) -> str:
         question = obj.question or ""
         return question[:100] + "..." if len(question) > 100 else question
 
-    @admin.display(description="Questionnaire")
+    @admin.display(description=_("Questionnaire"))
     def questionnaire_link(self, obj: models.MultipleChoiceQuestion) -> str:
         url = reverse("admin:questionnaires_questionnaire_change", args=[obj.questionnaire.id])
         return format_html('<a href="{}">{}</a>', url, obj.questionnaire.name)
 
-    @admin.display(description="Section")
+    @admin.display(description=_("Section"))
     def section_link(self, obj: models.MultipleChoiceQuestion) -> str | None:
         if not obj.section:
             return "—"
@@ -648,32 +648,32 @@ class FreeTextQuestionAdmin(ModelAdmin):  # type: ignore[misc]
     fieldsets = (
         (None, {"fields": ("questionnaire", "section", "question", "hint")}),
         (
-            "Configuration",
+            _("Configuration"),
             {
                 "fields": ("is_mandatory", "is_fatal", "order", "depends_on_option"),
             },
         ),
-        ("Scoring & AI", {"fields": ("positive_weight", "negative_weight", "llm_guidelines")}),
-        ("Reviewer Notes", {"fields": ("reviewer_notes",), "classes": ["collapse"]}),
+        (_("Scoring & AI"), {"fields": ("positive_weight", "negative_weight", "llm_guidelines")}),
+        (_("Reviewer Notes"), {"fields": ("reviewer_notes",), "classes": ["collapse"]}),
     )
 
-    @admin.display(description="Question")
+    @admin.display(description=_("Question"))
     def question_short(self, obj: models.FreeTextQuestion) -> str:
         question = obj.question or ""
         return question[:100] + "..." if len(question) > 100 else question
 
-    @admin.display(description="Questionnaire")
+    @admin.display(description=_("Questionnaire"))
     def questionnaire_link(self, obj: models.FreeTextQuestion) -> str:
         url = reverse("admin:questionnaires_questionnaire_change", args=[obj.questionnaire.id])
         return format_html('<a href="{}">{}</a>', url, obj.questionnaire.name)
 
-    @admin.display(description="Section")
+    @admin.display(description=_("Section"))
     def section_link(self, obj: models.FreeTextQuestion) -> str | None:
         if not obj.section:
             return "—"
         return obj.section.name
 
-    @admin.display(description="Has LLM Guidelines", boolean=True)
+    @admin.display(description=_("Has LLM Guidelines"), boolean=True)
     def has_llm_guidelines(self, obj: models.FreeTextQuestion) -> bool:
         return bool(obj.llm_guidelines)
 
@@ -701,39 +701,39 @@ class FileUploadQuestionAdmin(ModelAdmin):  # type: ignore[misc]
     fieldsets = (
         (None, {"fields": ("questionnaire", "section", "question", "hint")}),
         (
-            "Configuration",
+            _("Configuration"),
             {
                 "fields": ("is_mandatory", "order", "depends_on_option"),
             },
         ),
         (
-            "File Settings",
+            _("File Settings"),
             {
                 "fields": ("max_files", "max_file_size", "allowed_mime_types"),
             },
         ),
-        ("Scoring", {"fields": ("positive_weight", "negative_weight")}),
-        ("Reviewer Notes", {"fields": ("reviewer_notes",), "classes": ["collapse"]}),
+        (_("Scoring"), {"fields": ("positive_weight", "negative_weight")}),
+        (_("Reviewer Notes"), {"fields": ("reviewer_notes",), "classes": ["collapse"]}),
     )
 
-    @admin.display(description="Question")
+    @admin.display(description=_("Question"))
     def question_short(self, obj: models.FileUploadQuestion) -> str:
         question = obj.question or ""
         return question[:50] + "..." if len(question) > 50 else question
 
-    @admin.display(description="Questionnaire")
+    @admin.display(description=_("Questionnaire"))
     def questionnaire_link(self, obj: models.FileUploadQuestion) -> str:
         url = reverse("admin:questionnaires_questionnaire_change", args=[obj.questionnaire.id])
         return format_html('<a href="{}">{}</a>', url, obj.questionnaire.name)
 
-    @admin.display(description="Section")
+    @admin.display(description=_("Section"))
     def section_link(self, obj: models.FileUploadQuestion) -> str | None:
         if not obj.section:
             return None
         url = reverse("admin:questionnaires_questionnairesection_change", args=[obj.section.id])
         return format_html('<a href="{}">{}</a>', url, obj.section.name)
 
-    @admin.display(description="Max Size")
+    @admin.display(description=_("Max Size"))
     def max_file_size_display(self, obj: models.FileUploadQuestion) -> str:
         size_mb = obj.max_file_size / (1024 * 1024)
         return f"{size_mb:.1f} MB"
@@ -760,12 +760,12 @@ class QuestionnaireSectionAdmin(ModelAdmin):  # type: ignore[misc]
             fu_count=Count("fileuploadquestion_questions", distinct=True),
         )
 
-    @admin.display(description="Questionnaire")
+    @admin.display(description=_("Questionnaire"))
     def questionnaire_link(self, obj: models.QuestionnaireSection) -> str:
         url = reverse("admin:questionnaires_questionnaire_change", args=[obj.questionnaire.id])
         return format_html('<a href="{}">{}</a>', url, obj.questionnaire.name)
 
-    @admin.display(description="Questions")
+    @admin.display(description=_("Questions"))
     def question_count(self, obj: models.QuestionnaireSection) -> int:
         return int(getattr(obj, "mc_count", 0) + getattr(obj, "ft_count", 0) + getattr(obj, "fu_count", 0))
 
@@ -797,34 +797,34 @@ class QuestionnaireFileAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (None, {"fields": ("uploader", "original_filename", "mime_type", "file")}),
-        ("File Details", {"fields": ("file_hash", "file_size")}),
-        ("Previews", {"fields": ("thumbnail_preview", "preview_image"), "classes": ["collapse"]}),
-        ("Timestamps", {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
+        (_("File Details"), {"fields": ("file_hash", "file_size")}),
+        (_("Previews"), {"fields": ("thumbnail_preview", "preview_image"), "classes": ["collapse"]}),
+        (_("Timestamps"), {"fields": ("created_at", "updated_at"), "classes": ["collapse"]}),
     )
 
     def get_queryset(self, request: HttpRequest) -> QuerySet[models.QuestionnaireFile]:
         qs: QuerySet[models.QuestionnaireFile] = super().get_queryset(request)
         return qs.select_related("uploader")
 
-    @admin.display(description="Uploader")
+    @admin.display(description=_("Uploader"))
     def uploader_link(self, obj: models.QuestionnaireFile) -> str:
         url = reverse("admin:accounts_reveluser_change", args=[obj.uploader.id])
         return format_html('<a href="{}">{}</a>', url, obj.uploader.username)
 
-    @admin.display(description="Size")
+    @admin.display(description=_("Size"))
     def file_size_display(self, obj: models.QuestionnaireFile) -> str:
         size_kb = obj.file_size / 1024
         if size_kb > 1024:
             return f"{size_kb / 1024:.1f} MB"
         return f"{size_kb:.1f} KB"
 
-    @admin.display(description="Thumbnail")
+    @admin.display(description=_("Thumbnail"))
     def thumbnail_preview(self, obj: models.QuestionnaireFile) -> str:
         if url := get_file_url(obj.thumbnail):
             return format_html('<img src="{}" style="max-height: 150px;" />', url)
         return "—"
 
-    @admin.display(description="Preview")
+    @admin.display(description=_("Preview"))
     def preview_image(self, obj: models.QuestionnaireFile) -> str:
         if url := get_file_url(obj.preview):
             return format_html('<img src="{}" style="max-height: 300px;" />', url)

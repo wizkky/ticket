@@ -19,7 +19,6 @@ from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext
 from django_google_sso.admin import GoogleSSOInlineAdmin, get_current_user_and_admin
-from unfold.admin import ModelAdmin, TabularInline
 
 from accounts.admin import formatters
 from accounts.admin.user_extras import (
@@ -29,17 +28,16 @@ from accounts.admin.user_extras import (
     ReferralCodeInline,
 )
 from accounts.models import (
-    DietaryRestriction,
     EmailVerificationReminderTracking,
     GlobalBan,
     RevelUser,
     UserBillingProfile,
     UserDataExport,
-    UserDietaryPreference,
 )
 from accounts.service.account import request_password_reset, send_verification_email_for_user
 from accounts.service.impersonation import can_impersonate, create_impersonation_request
 from accounts.utils.email_normalization import normalize_email_for_matching
+from common.admin_localization import ModelAdmin, TabularInline
 from common.client_ip import get_client_ip
 from common.models import SiteSettings
 from events.models import GeneralUserPreferences
@@ -72,24 +70,6 @@ class UserDataExportInline(TabularInline):  # type: ignore[misc]
     can_delete = False
     readonly_fields = ["status", "completed_at", "error_message", "file"]
     fields = ["status", "completed_at", "file", "error_message"]
-
-
-class DietaryRestrictionInline(TabularInline):  # type: ignore[misc]
-    """Inline for user dietary restrictions."""
-
-    model = DietaryRestriction
-    extra = 0
-    autocomplete_fields = ["food_item"]
-    fields = ["food_item", "restriction_type", "notes", "is_public"]
-
-
-class UserDietaryPreferenceInline(TabularInline):  # type: ignore[misc]
-    """Inline for user dietary preferences."""
-
-    model = UserDietaryPreference
-    extra = 0
-    autocomplete_fields = ["preference"]
-    fields = ["preference", "comment", "is_public"]
 
 
 class EmailVerificationReminderTrackingInline(TabularInline):  # type: ignore[misc]
@@ -176,7 +156,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
 
     fieldsets = (
         (
-            "Personal Information",
+            _("Personal Information"),
             {
                 "fields": (
                     "id",
@@ -190,7 +170,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             },
         ),
         (
-            "Profile Picture",
+            _("Profile Picture"),
             {
                 "fields": (
                     "profile_picture",
@@ -199,7 +179,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             },
         ),
         (
-            "Authentication & Security",
+            _("Authentication & Security"),
             {
                 "fields": (
                     "password",
@@ -210,7 +190,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             },
         ),
         (
-            "Permissions",
+            _("Permissions"),
             {
                 "fields": (
                     ("is_active", "is_staff", "is_superuser"),
@@ -221,7 +201,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             },
         ),
         (
-            "Stripe Connect",
+            _("Stripe Connect"),
             {
                 "fields": (
                     "stripe_account_id",
@@ -232,7 +212,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             },
         ),
         (
-            "Participation Summary",
+            _("Participation Summary"),
             {
                 "fields": (
                     "event_participation_display",
@@ -250,8 +230,6 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
         ReferralCodeInline,
         GlobalBanInline,
         ExternalIdentityInline,
-        DietaryRestrictionInline,
-        UserDietaryPreferenceInline,
         UserDataExportInline,
         EmailVerificationReminderTrackingInline,
     ]
@@ -267,7 +245,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
         "clear_stripe_connect_account",
     ]
 
-    @admin.action(description="Clear stale Stripe Connect account (superuser only)")
+    @admin.action(description=_("Clear stale Stripe Connect account (superuser only)"))
     def clear_stripe_connect_account(self, request: HttpRequest, queryset: QuerySet[RevelUser]) -> None:
         """Detach a stale Connect account so the referrer can re-onboard from scratch.
 
@@ -292,7 +270,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             cleared += 1
         self.message_user(request, f"Cleared the Stripe Connect account of {cleared} user(s).")
 
-    @admin.action(description="Send verification email")
+    @admin.action(description=_("Send verification email"))
     def send_verification_email(self, request: HttpRequest, queryset: QuerySet[RevelUser]) -> None:
         """Send verification email to selected users."""
         sent_count = 0
@@ -327,7 +305,7 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
                 messages.WARNING,
             )
 
-    @admin.action(description="Send password reset email")
+    @admin.action(description=_("Send password reset email"))
     def send_password_reset_email(self, request: HttpRequest, queryset: QuerySet[RevelUser]) -> None:
         """Send password reset email to selected users."""
         sent_count = 0
@@ -410,17 +388,17 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             )
 
     # Custom displays (rendering logic lives in accounts/admin/formatters.py)
-    @admin.display(description="")
+    @admin.display(description=_(""))
     def profile_thumbnail_display(self, obj: RevelUser) -> str:
         """Display profile picture thumbnail in list view."""
         return formatters.profile_thumbnail(obj)
 
-    @admin.display(description="Profile Picture Preview")
+    @admin.display(description=_("Profile Picture Preview"))
     def profile_image_preview_display(self, obj: RevelUser) -> str:
         """Display profile picture preview in detail view."""
         return formatters.profile_image_preview(obj)
 
-    @admin.display(description="Name", ordering="preferred_name")
+    @admin.display(description=_("Name"), ordering="preferred_name")
     def display_name_display(self, obj: RevelUser) -> str:
         name = obj.get_display_name()
         # Crown marks organization owners (see _is_owner annotation in get_queryset).
@@ -428,15 +406,15 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             return f"👑 {name}"
         return name
 
-    @admin.display(description="Email", ordering="email")
+    @admin.display(description=_("Email"), ordering="email")
     def email_link(self, obj: RevelUser) -> str:
         return format_html('<a href="mailto:{}">{}</a>', obj.email, obj.email)
 
-    @admin.display(description="Email Verified", boolean=True)
+    @admin.display(description=_("Email Verified"), boolean=True)
     def email_verified_display(self, obj: RevelUser) -> bool:
         return obj.email_verified
 
-    @admin.display(description="2FA Active", boolean=True)
+    @admin.display(description=_("2FA Active"), boolean=True)
     def totp_active_display(self, obj: RevelUser) -> bool:
         return obj.totp_active
 
@@ -475,20 +453,20 @@ class RevelUserAdmin(UserAdmin, ModelAdmin):  # type: ignore[type-arg,misc]
             ),
         )
 
-    @admin.display(description="Events", ordering="_event_count")
+    @admin.display(description=_("Events"), ordering="_event_count")
     def event_count(self, obj: RevelUser) -> int:
         return int(getattr(obj, "_event_count", 0))
 
-    @admin.display(description="Organizations", ordering="_organization_count")
+    @admin.display(description=_("Organizations"), ordering="_organization_count")
     def organization_count(self, obj: RevelUser) -> int:
         return int(getattr(obj, "_organization_count", 0))
 
-    @admin.display(description="Event Participation")
+    @admin.display(description=_("Event Participation"))
     def event_participation_display(self, obj: RevelUser) -> str:
         """Display user's event participation details."""
         return formatters.event_participation(obj)
 
-    @admin.display(description="Organization Participation")
+    @admin.display(description=_("Organization Participation"))
     def organization_participation_display(self, obj: RevelUser) -> str:
         """Display user's organization participation details."""
         return formatters.organization_participation(obj)
@@ -585,7 +563,7 @@ class UserDataExportAdmin(ModelAdmin):  # type: ignore[misc]
     user_link.short_description = "User"  # type: ignore[attr-defined]
     user_link.admin_order_field = "user__username"  # type: ignore[attr-defined]
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: UserDataExport) -> str:
         colors = {
             UserDataExport.UserDataExportStatus.PENDING: "orange",

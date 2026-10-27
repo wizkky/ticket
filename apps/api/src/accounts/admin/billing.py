@@ -3,9 +3,9 @@
 import typing as t
 
 from django.contrib import admin
-from unfold.admin import ModelAdmin
 
 from accounts.models import UserBillingProfile
+from common.admin_localization import ModelAdmin
 
 
 @admin.register(UserBillingProfile)

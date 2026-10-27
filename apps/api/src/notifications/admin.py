@@ -9,10 +9,11 @@ from django.http import HttpRequest, HttpResponseRedirect
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils.html import format_html
-from unfold.admin import ModelAdmin, TabularInline
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.forms.widgets import WysiwygWidget
 from unfold.widgets import CHECKBOX_CLASSES, UnfoldAdminTextInputWidget
 
+from common.admin_localization import ModelAdmin, TabularInline
 from notifications.models import EmailSuppression, Notification, NotificationDelivery, NotificationPreference
 from notifications.service import system_announcement
 
@@ -96,7 +97,7 @@ class NotificationAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (
-            "Basic Information",
+            _("Basic Information"),
             {
                 "fields": (
                     "id",
@@ -108,7 +109,7 @@ class NotificationAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Context & Attachments",
+            _("Context & Attachments"),
             {
                 "fields": (
                     "context",
@@ -118,7 +119,7 @@ class NotificationAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Status",
+            _("Status"),
             {
                 "fields": (
                     "read_at",
@@ -127,7 +128,7 @@ class NotificationAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Timestamps",
+            _("Timestamps"),
             {
                 "fields": (
                     "created_at",
@@ -261,7 +262,7 @@ class NotificationDeliveryAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (
-            "Delivery Information",
+            _("Delivery Information"),
             {
                 "fields": (
                     "id",
@@ -272,7 +273,7 @@ class NotificationDeliveryAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Tracking",
+            _("Tracking"),
             {
                 "fields": (
                     "attempted_at",
@@ -282,7 +283,7 @@ class NotificationDeliveryAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Error Information",
+            _("Error Information"),
             {
                 "fields": (
                     "error_message",
@@ -292,7 +293,7 @@ class NotificationDeliveryAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Timestamps",
+            _("Timestamps"),
             {
                 "fields": (
                     "created_at",
@@ -359,11 +360,11 @@ class NotificationPreferenceAdmin(ModelAdmin):  # type: ignore[misc]
 
     fieldsets = (
         (
-            "User",
+            _("User"),
             {"fields": ("user",)},
         ),
         (
-            "Global Settings",
+            _("Global Settings"),
             {
                 "fields": (
                     "silence_all_notifications",
@@ -372,7 +373,7 @@ class NotificationPreferenceAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Digest Settings",
+            _("Digest Settings"),
             {
                 "fields": (
                     "digest_frequency",
@@ -381,22 +382,22 @@ class NotificationPreferenceAdmin(ModelAdmin):  # type: ignore[misc]
             },
         ),
         (
-            "Event Settings",
+            _("Event Settings"),
             {"fields": ("event_reminders_enabled",)},
         ),
         (
-            "Organization mutes",
+            _("Organization mutes"),
             {"fields": ("muted_organizations",)},
         ),
         (
-            "Advanced",
+            _("Advanced"),
             {
                 "fields": ("notification_type_settings",),
                 "classes": ("collapse",),
             },
         ),
         (
-            "Timestamps",
+            _("Timestamps"),
             {
                 "fields": (
                     "id",
@@ -426,7 +427,7 @@ class NotificationPreferenceAdmin(ModelAdmin):  # type: ignore[misc]
         qs: QuerySet[NotificationPreference] = super().get_queryset(request)
         return qs.annotate(_muted_org_count=Count("muted_organizations"))
 
-    @admin.display(description="Muted orgs", ordering="_muted_org_count")
+    @admin.display(description=_("Muted orgs"), ordering="_muted_org_count")
     def muted_org_count(self, obj: NotificationPreference) -> int:
         """Number of organizations whose announcements this user muted."""
         return obj._muted_org_count  # type: ignore[attr-defined,no-any-return]

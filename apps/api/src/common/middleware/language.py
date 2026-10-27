@@ -2,12 +2,13 @@
 
 import typing as t
 
+from django.conf import settings
 from django.http import HttpRequest, HttpResponse
 from django.utils import translation
 
 
 class UserLanguageMiddleware:
-    """Middleware to activate user's preferred language for session-based authentication.
+    """Keep the administration in Spanish and honor account language elsewhere.
 
     NOTE: This middleware is NOT used for JWT authentication. For JWT-authenticated requests,
     language activation happens in the I18nJWTAuth authentication class (see common.authentication).
@@ -37,8 +38,13 @@ class UserLanguageMiddleware:
         Returns:
             The HTTP response
         """
-        # If user is authenticated, use their language preference
-        if hasattr(request, "user") and request.user.is_authenticated:
+        admin_prefix = "/" + settings.ADMIN_URL.strip("/") + "/"
+        if settings.ADMIN_URL and (
+            request.path_info == admin_prefix.rstrip("/") or request.path_info.startswith(admin_prefix)
+        ):
+            translation.activate("es")
+            request.LANGUAGE_CODE = "es"
+        elif hasattr(request, "user") and request.user.is_authenticated:
             user_language = getattr(request.user, "language", None)
             if user_language:
                 translation.activate(user_language)

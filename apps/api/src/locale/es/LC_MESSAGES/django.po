@@ -6598,3 +6598,1628 @@ msgstr ""
 #: events/models/ticket.py
 msgid "Create a new ticket tier to change currency after tickets have been issued."
 msgstr "Crea un nuevo tipo de entrada para cambiar la moneda después de emitir entradas."
+
+# CaudalTickets: administración en español.
+
+msgid "Administration"
+msgstr "Administración"
+
+msgid "{site_name} administration"
+msgstr "Administración de {site_name}"
+
+msgid "Welcome to {site_name} administration"
+msgstr "Bienvenido a la administración de {site_name}"
+
+msgid "CaudalTickets dashboard"
+msgstr "Panel de control de CaudalTickets"
+
+msgid "Go to Frontend"
+msgstr "Ir al sitio web"
+
+msgid "Total Users"
+msgstr "Total de usuarios"
+
+msgid "Total Organizations"
+msgstr "Total de organizaciones"
+
+msgid "Total Events"
+msgstr "Total de eventos"
+
+msgid "Connected Telegram"
+msgstr "Cuentas conectadas a Telegram"
+
+msgid "Connected Stripe"
+msgstr "Organizaciones conectadas a Stripe"
+
+msgid "Online payment"
+msgstr "Con pago en línea"
+
+msgid "User Growth (Last 30 Days)"
+msgstr "Crecimiento de usuarios (últimos 30 días)"
+
+msgid "Pronoun Distribution"
+msgstr "Distribución de pronombres"
+
+msgid "No pronoun data available"
+msgstr "No hay datos de pronombres disponibles"
+
+msgid "Not specified"
+msgstr "Sin especificar"
+
+msgid "Events by Ticket Requirement"
+msgstr "Eventos según tipo de inscripción"
+
+msgid "RSVP-Based"
+msgstr "Con confirmación de asistencia"
+
+msgid "Ticket Required"
+msgstr "Con entrada"
+
+msgid "Events by Visibility"
+msgstr "Eventos según visibilidad"
+
+msgid "Events by Type"
+msgstr "Eventos según tipo"
+
+msgid "No events yet"
+msgstr "Todavía no hay eventos"
+
+msgid "Top Organizations by Traction"
+msgstr "Organizaciones con mayor participación"
+
+msgid "Distinct users reached in the last 12 months (RSVP yes/maybe, or an active, checked-in or pending ticket)"
+msgstr "Personas únicas alcanzadas en los últimos 12 meses (asistencia confirmada o posible, o una entrada activa, validada o pendiente)"
+
+msgid "No organization traction data available"
+msgstr "Todavía no hay datos de participación por organización"
+
+msgid "Distinct users"
+msgstr "Personas únicas"
+
+msgid "Organization"
+msgstr "Organización"
+
+msgid "New Users"
+msgstr "Nuevos usuarios"
+
+msgid "Failed tasks"
+msgstr "Tareas fallidas"
+
+msgid "Failed deliveries"
+msgstr "Envíos fallidos"
+
+msgid "Recent Failures:"
+msgstr "Errores recientes:"
+
+msgid "By Channel:"
+msgstr "Por canal:"
+
+msgid "Dashboard data could not be loaded."
+msgstr "No se pudieron cargar los datos del panel."
+
+msgid "Maintenance Banner Active"
+msgstr "Aviso de mantenimiento activo"
+
+msgid "Starts:"
+msgstr "Inicio:"
+
+msgid "Ends:"
+msgstr "Fin:"
+
+msgid "System Health (Last %(days)s Days)"
+msgstr "Estado del sistema (últimos %(days)s días)"
+
+msgid "Failed Notifications (Last %(days)s Days)"
+msgstr "Notificaciones fallidas (últimos %(days)s días)"
+
+msgid "Public"
+msgstr "Público"
+
+msgid "Private"
+msgstr "Privado"
+
+msgid "Unlisted"
+msgstr "No listado"
+
+msgid "Members only"
+msgstr "Solo miembros"
+
+msgid "Members-only"
+msgstr "Solo miembros"
+
+msgid "Staff-only"
+msgstr "Solo equipo"
+
+msgid "Search apps and models..."
+msgstr "Buscar aplicaciones y modelos…"
+
+msgid "Search apps and models"
+msgstr "Buscar aplicaciones y modelos"
+
+msgid "All applications"
+msgstr "Todas las aplicaciones"
+
+msgid "Search..."
+msgstr "Buscar…"
+
+msgid "Search"
+msgstr "Buscar"
+
+msgid "Apply Filters"
+msgstr "Aplicar filtros"
+
+msgid "Reset Filters"
+msgstr "Restablecer filtros"
+
+msgid "2FA Active"
+msgstr "Doble factor activo"
+
+msgid "Advanced"
+msgstr "Avanzado"
+
+msgid "Aggregate Stats"
+msgstr "Estadísticas generales"
+
+msgid "Amount"
+msgstr "Importe"
+
+msgid "Amount (gross)"
+msgstr "Importe bruto"
+
+msgid "Amounts"
+msgstr "Importes"
+
+msgid "Assignee"
+msgstr "Persona asignada"
+
+msgid "Attendees"
+msgstr "Participantes"
+
+msgid "Authentication & Security"
+msgstr "Autenticación y seguridad"
+
+msgid "Auto-Evaluated"
+msgstr "Evaluado automáticamente"
+
+msgid "Ban Details"
+msgstr "Detalles del bloqueo"
+
+msgid "Basic Information"
+msgstr "Información básica"
+
+msgid "Billing"
+msgstr "Facturación"
+
+msgid "Billing Snapshot"
+msgstr "Datos de facturación registrados"
+
+msgid "Bind to platform Stripe account (superuser only)"
+msgstr "Vincular a la cuenta Stripe de la plataforma (solo superusuarios)"
+
+msgid "Buyer Snapshot"
+msgstr "Datos del comprador registrados"
+
+msgid "Cancellation"
+msgstr "Cancelación"
+
+msgid "Check-in"
+msgstr "Control de acceso"
+
+msgid "City"
+msgstr "Comuna"
+
+msgid "Clear stale Stripe Connect account (superuser only)"
+msgstr "Desvincular una cuenta Stripe Connect obsoleta (solo superusuarios)"
+
+msgid "Configuration"
+msgstr "Configuración"
+
+msgid "Content"
+msgstr "Contenido"
+
+msgid "Context & Attachments"
+msgstr "Contexto y archivos adjuntos"
+
+msgid "Created By"
+msgstr "Creado por"
+
+msgid "Data Management"
+msgstr "Gestión de datos"
+
+msgid "Dates"
+msgstr "Fechas"
+
+msgid "Decided By"
+msgstr "Decisión tomada por"
+
+msgid "Delivery"
+msgstr "Envío"
+
+msgid "Delivery Information"
+msgstr "Información del envío"
+
+msgid "Details"
+msgstr "Detalles"
+
+msgid "Digest Settings"
+msgstr "Configuración de resúmenes"
+
+msgid "Discount"
+msgstr "Descuento"
+
+msgid "Display Configuration"
+msgstr "Configuración de visualización"
+
+msgid "Error"
+msgstr "Error"
+
+msgid "Error Information"
+msgstr "Información del error"
+
+msgid "Evaluation"
+msgstr "Evaluación"
+
+msgid "Evaluation Details"
+msgstr "Detalles de la evaluación"
+
+msgid "Event"
+msgstr "Evento"
+
+msgid "Event Participation"
+msgstr "Participación en eventos"
+
+msgid "Event Settings"
+msgstr "Configuración del evento"
+
+msgid "Fee (gross)"
+msgstr "Comisión bruta"
+
+msgid "Fee Breakdown"
+msgstr "Desglose de comisiones"
+
+msgid "File Details"
+msgstr "Detalles del archivo"
+
+msgid "File Settings"
+msgstr "Configuración de archivos"
+
+msgid "Files"
+msgstr "Archivos"
+
+msgid "Global Settings"
+msgstr "Configuración general"
+
+msgid "Hard Identifiers"
+msgstr "Identificadores exactos"
+
+msgid "Has LLM Guidelines"
+msgstr "Tiene instrucciones de evaluación con IA"
+
+msgid "ID"
+msgstr "ID"
+
+msgid "Issuer"
+msgstr "Emisor"
+
+msgid "Linked Records"
+msgstr "Registros vinculados"
+
+msgid "Location"
+msgstr "Ubicación"
+
+msgid "Maintenance Banner"
+msgstr "Aviso de mantenimiento"
+
+msgid "Matched"
+msgstr "Coincide"
+
+msgid "Matched Entries"
+msgstr "Coincidencias"
+
+msgid "Max Size"
+msgstr "Tamaño máximo"
+
+msgid "Metadata"
+msgstr "Metadatos"
+
+msgid "Muted orgs"
+msgstr "Organizaciones silenciadas"
+
+msgid "Name"
+msgstr "Nombre"
+
+msgid "Name Fields (for fuzzy matching)"
+msgstr "Campos de nombre (coincidencia aproximada)"
+
+msgid "Organization Participation"
+msgstr "Participación en organizaciones"
+
+msgid "Organization Snapshot"
+msgstr "Datos de la organización registrados"
+
+msgid "Organization mutes"
+msgstr "Organizaciones silenciadas"
+
+msgid "P. Fee"
+msgstr "Comisión de plataforma"
+
+msgid "PDF"
+msgstr "PDF"
+
+msgid "Participation Summary"
+msgstr "Resumen de participación"
+
+msgid "Payment & Discounts"
+msgstr "Pago y descuentos"
+
+msgid "Payout"
+msgstr "Liquidación"
+
+msgid "People"
+msgstr "Personas"
+
+msgid "Period"
+msgstr "Período"
+
+msgid "Permissions"
+msgstr "Permisos"
+
+msgid "Personal Information"
+msgstr "Información personal"
+
+msgid "Platform Billing"
+msgstr "Facturación de la plataforma"
+
+msgid "Platform Fee"
+msgstr "Comisión de la plataforma"
+
+msgid "Platform Snapshot"
+msgstr "Datos de la plataforma registrados"
+
+msgid "Position & Properties"
+msgstr "Posición y propiedades"
+
+msgid "Preview"
+msgstr "Vista previa"
+
+msgid "Previews"
+msgstr "Vistas previas"
+
+msgid "Profile Picture"
+msgstr "Imagen de perfil"
+
+msgid "Profile Picture Preview"
+msgstr "Vista previa de la imagen de perfil"
+
+msgid "Proposed Status"
+msgstr "Estado propuesto"
+
+msgid "Public Links"
+msgstr "Enlaces públicos"
+
+msgid "Question"
+msgstr "Pregunta"
+
+msgid "Questionnaire"
+msgstr "Cuestionario"
+
+msgid "Questions"
+msgstr "Preguntas"
+
+msgid "RC"
+msgstr "IVA con inversión del sujeto pasivo"
+
+msgid "Referral"
+msgstr "Referido"
+
+msgid "Referral Code"
+msgstr "Código de referido"
+
+msgid "Referral Program"
+msgstr "Programa de referidos"
+
+msgid "Referrer Snapshot"
+msgstr "Datos de quien refiere registrados"
+
+msgid "Refund"
+msgstr "Devolución"
+
+msgid "Retry delivery (clear undeliverable state)"
+msgstr "Reintentar el envío (restablecer el estado de entrega)"
+
+msgid "Reviewer Notes"
+msgstr "Notas de revisión"
+
+msgid "Scope (leave empty for org-wide)"
+msgstr "Alcance (vacío para toda la organización)"
+
+msgid "Score"
+msgstr "Puntaje"
+
+msgid "Scoring"
+msgstr "Puntuación"
+
+msgid "Scoring & AI"
+msgstr "Puntuación e IA"
+
+msgid "Seat"
+msgstr "Asiento"
+
+msgid "Seating"
+msgstr "Distribución de asientos"
+
+msgid "Section"
+msgstr "Sección"
+
+msgid "Sector"
+msgstr "Sector"
+
+msgid "Seller Snapshot"
+msgstr "Datos del vendedor registrados"
+
+msgid "Send password reset email"
+msgstr "Enviar correo para restablecer contraseña"
+
+msgid "Send verification email"
+msgstr "Enviar correo de verificación"
+
+msgid "Sender"
+msgstr "Remitente"
+
+msgid "Settings"
+msgstr "Configuración"
+
+msgid "Size"
+msgstr "Tamaño"
+
+msgid "Social"
+msgstr "Redes sociales"
+
+msgid "Sold"
+msgstr "Vendidas"
+
+msgid "Source"
+msgstr "Origen"
+
+msgid "Stripe"
+msgstr "Stripe"
+
+msgid "Stripe Connect"
+msgstr "Stripe Connect"
+
+msgid "Stripe Session"
+msgstr "Sesión de Stripe"
+
+msgid "Target"
+msgstr "Destino"
+
+msgid "Targeting"
+msgstr "Destinatarios"
+
+msgid "Technical"
+msgstr "Información técnica"
+
+msgid "Thumbnail"
+msgstr "Miniatura"
+
+msgid "Ticket"
+msgstr "Entrada"
+
+msgid "Tier"
+msgstr "Tarifa"
+
+msgid "Tiers"
+msgstr "Tarifas"
+
+msgid "Timestamps"
+msgstr "Fechas de registro"
+
+msgid "Total"
+msgstr "Total"
+
+msgid "Tracking"
+msgstr "Seguimiento"
+
+msgid "URLs & Emails"
+msgstr "Direcciones web y correos"
+
+msgid "Unbind platform Stripe account (superuser only)"
+msgstr "Desvincular la cuenta Stripe de la plataforma (solo superusuarios)"
+
+msgid "Uploader"
+msgstr "Cargado por"
+
+msgid "Usage"
+msgstr "Uso"
+
+msgid "Usage Limits"
+msgstr "Límites de uso"
+
+msgid "Used"
+msgstr "Utilizado"
+
+msgid "User"
+msgstr "Usuario"
+
+msgid "Uses"
+msgstr "Usos"
+
+msgid "VAT"
+msgstr "IVA"
+
+msgid "Validity"
+msgstr "Vigencia"
+
+msgid "Viewer"
+msgstr "Persona que visualiza"
+
+msgid "Waitlist"
+msgstr "Lista de espera"
+
+msgid "Workflow Information"
+msgstr "Información del proceso"
+
+msgid "Slug"
+msgstr "Identificador URL"
+
+msgid "Description"
+msgstr "Descripción"
+
+msgid "Logo"
+msgstr "Logotipo"
+
+msgid "Cover art"
+msgstr "Imagen de portada"
+
+msgid "Address"
+msgstr "Dirección"
+
+msgid "Start"
+msgstr "Inicio"
+
+msgid "End"
+msgstr "Fin"
+
+msgid "Created at"
+msgstr "Fecha de creación"
+
+msgid "Updated at"
+msgstr "Última actualización"
+
+msgid "Event type"
+msgstr "Tipo de evento"
+
+msgid "Visibility"
+msgstr "Visibilidad"
+
+msgid "Requires ticket"
+msgstr "Requiere entrada"
+
+msgid "Is template"
+msgstr "Es plantilla"
+
+msgid "Max attendees"
+msgstr "Cupo máximo"
+
+msgid "Max tickets per user"
+msgstr "Máximo de entradas por persona"
+
+msgid "Organization member"
+msgstr "Miembro de organización"
+
+msgid "Revel user"
+msgstr "Usuario"
+
+msgid "Revel users"
+msgstr "Usuarios"
+
+msgid "Ticket tier"
+msgstr "Tarifa de entrada"
+
+msgid "Ticket tiers"
+msgstr "Tarifas de entrada"
+
+msgid "Event series"
+msgstr "Series de eventos"
+
+msgid "Venue"
+msgstr "Lugar"
+
+msgid "Venue sector"
+msgstr "Sector del lugar"
+
+msgid "Venue sectors"
+msgstr "Sectores del lugar"
+
+msgid "Venue seat"
+msgstr "Asiento del lugar"
+
+msgid "Venue seats"
+msgstr "Asientos del lugar"
+
+msgid "Price category"
+msgstr "Categoría de precio"
+
+msgid "Price categories"
+msgstr "Categorías de precio"
+
+msgid "Ticket number"
+msgstr "Número de entrada"
+
+msgid "Price paid"
+msgstr "Precio pagado"
+
+msgid "Payment method"
+msgstr "Medio de pago"
+
+msgid "Currency"
+msgstr "Moneda"
+
+msgid "Total quantity"
+msgstr "Cantidad total"
+
+msgid "Quantity sold"
+msgstr "Cantidad vendida"
+
+msgid "Sales paused"
+msgstr "Ventas pausadas"
+
+msgid "Sales start at"
+msgstr "Inicio de ventas"
+
+msgid "Sales end at"
+msgstr "Fin de ventas"
+
+msgid "Purchasable by"
+msgstr "Quién puede comprar"
+
+msgid "At the door"
+msgstr "Pago en puerta"
+
+msgid "Online"
+msgstr "En línea"
+
+msgid "Offline"
+msgstr "Presencial"
+
+msgid "Checked in"
+msgstr "Ingreso validado"
+
+msgid "Closed"
+msgstr "Cerrado"
+
+msgid "Maybe"
+msgstr "Tal vez"
+
+msgid "First name"
+msgstr "Nombre"
+
+msgid "Last name"
+msgstr "Apellido"
+
+msgid "Username"
+msgstr "Nombre de usuario"
+
+msgid "Preferred name"
+msgstr "Nombre preferido"
+
+msgid "Language"
+msgstr "Idioma"
+
+msgid "Pronouns"
+msgstr "Pronombres"
+
+msgid "Phone number"
+msgstr "Número de teléfono"
+
+msgid "Date joined"
+msgstr "Fecha de registro"
+
+msgid "Last login"
+msgstr "Último acceso"
+
+msgid "Email verified"
+msgstr "Correo verificado"
+
+msgid "Is staff"
+msgstr "Pertenece al equipo"
+
+msgid "Is active"
+msgstr "Activo"
+
+msgid "Is superuser"
+msgstr "Superusuario"
+
+msgid "Password"
+msgstr "Contraseña"
+
+msgid "User permissions"
+msgstr "Permisos del usuario"
+
+msgid "Token"
+msgstr "Token"
+
+msgid "Tokens"
+msgstr "Tokens"
+
+msgid "Payment"
+msgstr "Pago"
+
+msgid "Invoice number"
+msgstr "Número de documento"
+
+msgid "Discount code"
+msgstr "Código de descuento"
+
+msgid "Discount codes"
+msgstr "Códigos de descuento"
+
+msgid "Event invitation"
+msgstr "Invitación al evento"
+
+msgid "Event invitations"
+msgstr "Invitaciones a eventos"
+
+msgid "Event RSVP"
+msgstr "Confirmación de asistencia"
+
+msgid "Event RSVPs"
+msgstr "Confirmaciones de asistencia"
+
+msgid "Event rsvp"
+msgstr "Confirmación de asistencia"
+
+msgid "Event rsvps"
+msgstr "Confirmaciones de asistencia"
+
+msgid "Event wait list"
+msgstr "Lista de espera del evento"
+
+msgid "Event wait lists"
+msgstr "Listas de espera de eventos"
+
+msgid "Organization staff"
+msgstr "Equipo de la organización"
+
+msgid "Organization members"
+msgstr "Miembros de organizaciones"
+
+msgid "Organization owner"
+msgstr "Responsable de la organización"
+
+msgid "Site settings"
+msgstr "Configuración del sitio"
+
+msgid "Common Settings"
+msgstr "Configuración general"
+
+msgid "Citys"
+msgstr "Comunas"
+
+msgid "Timezone"
+msgstr "Zona horaria"
+
+msgid "Country"
+msgstr "País"
+
+msgid "Population"
+msgstr "Población"
+
+msgid "Admin name"
+msgstr "Región"
+
+msgid "Iso2"
+msgstr "Código de país"
+
+msgid "Ascii name"
+msgstr "Nombre sin acentos"
+
+msgid "Capital"
+msgstr "Capital"
+
+msgid "Stripe connected"
+msgstr "Stripe conectado"
+
+msgid "Full name"
+msgstr "Nombre completo"
+
+msgid "Event count"
+msgstr "Cantidad de eventos"
+
+msgid "Attendee count"
+msgstr "Cantidad de participantes"
+
+msgid "Info"
+msgstr "Información"
+
+msgid "Debug"
+msgstr "Depuración"
+
+msgid "Critical"
+msgstr "Crítico"
+
+msgid "In_app"
+msgstr "En la plataforma"
+
+msgid "Common"
+msgstr "General"
+
+msgid "Position"
+msgstr "Posición"
+
+msgid "OAuth"
+msgstr "OAuth"
+
+msgid "Filters"
+msgstr "Filtros"
+
+msgid "Filter"
+msgstr "Filtro"
+
+msgid "Type to search"
+msgstr "Escribe para buscar"
+
+msgid "Apply filters"
+msgstr "Aplicar filtros"
+
+msgid "Reset filters"
+msgstr "Restablecer filtros"
+
+msgid "Failed Tasks (Last %(days)s Days)"
+msgstr "Tareas fallidas (últimos %(days)s días)"
+
+msgid "Accept invitation requests"
+msgstr "Aceptar solicitudes de invitación"
+
+msgid "Accept membership requests"
+msgstr "Aceptar solicitudes de membresía"
+
+msgid "Accept rsvp notes"
+msgstr "Aceptar notas de asistencia"
+
+msgid "Allow user cancellation"
+msgstr "Permitir cancelaciones del usuario"
+
+msgid "Apply before"
+msgstr "Plazo para solicitar participación"
+
+msgid "Attribution"
+msgstr "Origen de la visita"
+
+msgid "Billing address"
+msgstr "Dirección de facturación"
+
+msgid "Billing email"
+msgstr "Correo de facturación"
+
+msgid "Billing name"
+msgstr "Nombre de facturación"
+
+msgid "Bio"
+msgstr "Biografía"
+
+msgid "Can attend without login"
+msgstr "Permitir asistencia sin iniciar sesión"
+
+msgid "Cancellation deadline hours"
+msgstr "Plazo de cancelación en horas"
+
+msgid "Cancellation reason"
+msgstr "Motivo de cancelación"
+
+msgid "Cancellation source"
+msgstr "Origen de la cancelación"
+
+msgid "Cancelled at"
+msgstr "Fecha de cancelación"
+
+msgid "Cancelled by"
+msgstr "Cancelado por"
+
+msgid "Capacity"
+msgstr "Capacidad"
+
+msgid "Category prices"
+msgstr "Precios por categoría"
+
+msgid "Chart version"
+msgstr "Versión del plano"
+
+msgid "Check in closes offset"
+msgstr "Desfase de cierre del control de acceso"
+
+msgid "Check in ends at"
+msgstr "Fin del control de acceso"
+
+msgid "Check in opens offset"
+msgstr "Desfase de apertura del control de acceso"
+
+msgid "Check in starts at"
+msgstr "Inicio del control de acceso"
+
+msgid "Checked in at"
+msgstr "Fecha de ingreso"
+
+msgid "Checked in by"
+msgstr "Ingreso validado por"
+
+msgid "Contact email"
+msgstr "Correo de contacto"
+
+msgid "Contact email verified"
+msgstr "Correo de contacto verificado"
+
+msgid "Contact method"
+msgstr "Medio de contacto"
+
+msgid "Cover art social"
+msgstr "Portada para redes sociales"
+
+msgid "Cover art thumbnail"
+msgstr "Miniatura de portada"
+
+msgid "Credentials changed at"
+msgstr "Último cambio de credenciales"
+
+msgid "Default membership questionnaire"
+msgstr "Cuestionario de membresía predeterminado"
+
+msgid "Default requires membership approval"
+msgstr "Exigir aprobación de membresía por defecto"
+
+msgid "Discount amount"
+msgstr "Importe del descuento"
+
+msgid "Display order"
+msgstr "Orden de visualización"
+
+msgid "File content hash"
+msgstr "Huella del contenido del archivo"
+
+msgid "Guest"
+msgstr "Invitado"
+
+msgid "Guest name"
+msgstr "Nombre del invitado"
+
+msgid "Held pass"
+msgstr "Abono adquirido"
+
+msgid "Id"
+msgstr "ID"
+
+msgid "Invitation message"
+msgstr "Mensaje de invitación"
+
+msgid "Invoicing mode"
+msgstr "Modalidad de facturación"
+
+msgid "Is modified"
+msgstr "Modificado"
+
+msgid "Is open ended"
+msgstr "Sin hora de término"
+
+msgid "Is virtual"
+msgstr "Actividad virtual"
+
+msgid "Issued at"
+msgstr "Fecha de emisión"
+
+msgid "Last revenue report sent period"
+msgstr "Período del último informe de ingresos enviado"
+
+msgid "Location maps embed"
+msgstr "Mapa insertado de la ubicación"
+
+msgid "Location maps url"
+msgstr "Enlace al mapa de la ubicación"
+
+msgid "Logo thumbnail"
+msgstr "Miniatura del logotipo"
+
+msgid "Manual payment instructions"
+msgstr "Instrucciones de pago presencial"
+
+msgid "Membership grace period days"
+msgstr "Días de gracia de la membresía"
+
+msgid "Membership refund policy"
+msgstr "Política de devolución de membresías"
+
+msgid "Membership subscription revival window days"
+msgstr "Días para reactivar una suscripción de membresía"
+
+msgid "Occurrence index"
+msgstr "Número de sesión"
+
+msgid "Offline refund amount"
+msgstr "Importe de devolución presencial"
+
+msgid "Owner"
+msgstr "Responsable"
+
+msgid "Pdf file"
+msgstr "Archivo PDF"
+
+msgid "Pkpass file"
+msgstr "Archivo de pase digital"
+
+msgid "Platform fee fixed"
+msgstr "Comisión fija de la plataforma"
+
+msgid "Platform fee percent"
+msgstr "Porcentaje de comisión de la plataforma"
+
+msgid "Potluck open"
+msgstr "Aportes compartidos abiertos"
+
+msgid "Price type"
+msgstr "Tipo de precio"
+
+msgid "Profile picture"
+msgstr "Imagen de perfil"
+
+msgid "Profile picture preview"
+msgstr "Vista previa de la imagen de perfil"
+
+msgid "Profile picture thumbnail"
+msgstr "Miniatura de perfil"
+
+msgid "Pwyc max"
+msgstr "Aporte voluntario máximo"
+
+msgid "Pwyc min"
+msgstr "Aporte voluntario mínimo"
+
+msgid "Refund policy"
+msgstr "Política de devolución"
+
+msgid "Refund policy snapshot"
+msgstr "Política de devolución registrada al comprar"
+
+msgid "Require ticket names"
+msgstr "Exigir nombre en las entradas"
+
+msgid "Requires full profile"
+msgstr "Exigir perfil completo"
+
+msgid "Restrict purchase to linked invitations"
+msgstr "Limitar compra a invitaciones vinculadas"
+
+msgid "Restrict visibility to linked invitations"
+msgstr "Limitar visibilidad a invitaciones vinculadas"
+
+msgid "Revenue report cadence"
+msgstr "Frecuencia del informe de ingresos"
+
+msgid "Rsvp before"
+msgstr "Plazo de confirmación de asistencia"
+
+msgid "Sale source"
+msgstr "Origen de la venta"
+
+msgid "Schedule"
+msgstr "Programación"
+
+msgid "Seat assignment mode"
+msgstr "Modalidad de asignación de asientos"
+
+msgid "Stripe account email"
+msgstr "Correo de la cuenta Stripe"
+
+msgid "Stripe account id"
+msgstr "ID de la cuenta Stripe"
+
+msgid "Stripe charges enabled"
+msgstr "Cobros Stripe habilitados"
+
+msgid "Stripe details submitted"
+msgstr "Datos de Stripe enviados"
+
+msgid "Ticket series"
+msgstr "Serie de entradas"
+
+msgid "Tickets refund started at"
+msgstr "Inicio de devolución de entradas"
+
+msgid "Totp active"
+msgstr "Autenticación TOTP activa"
+
+msgid "Totp secret"
+msgstr "Secreto TOTP"
+
+msgid "Vat country code"
+msgstr "Código de país del IVA"
+
+msgid "Vat id"
+msgstr "Identificador tributario del IVA"
+
+msgid "Vat id validated"
+msgstr "Identificador tributario validado"
+
+msgid "Vat id validated at"
+msgstr "Fecha de validación tributaria"
+
+msgid "Vat rate"
+msgstr "Tasa de IVA"
+
+msgid "Vies request identifier"
+msgstr "Identificador de consulta VIES"
+
+msgid "Visibility settings"
+msgstr "Configuración de visibilidad"
+
+msgid "Waitlist batch size"
+msgstr "Cantidad por lote de lista de espera"
+
+msgid "Waitlist cutoff date"
+msgstr "Fecha límite de lista de espera"
+
+msgid "Waitlist lottery mode"
+msgstr "Sorteo de lista de espera"
+
+msgid "Waitlist open"
+msgstr "Lista de espera abierta"
+
+msgid "Waitlist time window"
+msgstr "Plazo de la oferta de lista de espera"
+
+msgid "Access token"
+msgstr "Token de acceso"
+
+msgid "Access tokens"
+msgstr "Tokens de acceso"
+
+msgid "Account otp"
+msgstr "Código de un solo uso"
+
+msgid "Account otps"
+msgstr "Códigos de un solo uso"
+
+msgid "Additional resource"
+msgstr "Recurso adicional"
+
+msgid "Additional resources"
+msgstr "Recursos adicionales"
+
+msgid "Attendee invoice"
+msgstr "Factura del participante"
+
+msgid "Attendee invoices"
+msgstr "Facturas de participantes"
+
+msgid "Attendee invoice credit note"
+msgstr "Nota de crédito del participante"
+
+msgid "Attendee invoice credit notes"
+msgstr "Notas de crédito de participantes"
+
+msgid "Attendee visibility flag"
+msgstr "Regla de visibilidad del participante"
+
+msgid "Attendee visibility flags"
+msgstr "Reglas de visibilidad de participantes"
+
+msgid "Blacklist Entry"
+msgstr "Registro de lista de bloqueo"
+
+msgid "Blacklist Entries"
+msgstr "Registros de lista de bloqueo"
+
+msgid "Blacklisted token"
+msgstr "Token bloqueado"
+
+msgid "Blacklisted tokens"
+msgstr "Tokens bloqueados"
+
+msgid "Crontab"
+msgstr "Programación cron"
+
+msgid "Crontabs"
+msgstr "Programaciones cron"
+
+msgid "Customer profile"
+msgstr "Perfil de cliente"
+
+msgid "Customer profiles"
+msgstr "Perfiles de clientes"
+
+msgid "Email log"
+msgstr "Registro de correo"
+
+msgid "Email logs"
+msgstr "Registros de correo"
+
+msgid "Event bookmark"
+msgstr "Evento favorito"
+
+msgid "Event bookmarks"
+msgstr "Eventos favoritos"
+
+msgid "Event invitation request"
+msgstr "Solicitud de invitación a evento"
+
+msgid "Event invitation requests"
+msgstr "Solicitudes de invitación a eventos"
+
+msgid "Event link"
+msgstr "Vínculo de evento"
+
+msgid "Event links"
+msgstr "Vínculos de eventos"
+
+msgid "Event questionnaire submission"
+msgstr "Respuesta al cuestionario de evento"
+
+msgid "Event questionnaire submissions"
+msgstr "Respuestas a cuestionarios de eventos"
+
+msgid "Event series follow"
+msgstr "Seguimiento de serie de eventos"
+
+msgid "Event series follows"
+msgstr "Seguimientos de series de eventos"
+
+msgid "Event token"
+msgstr "Token de evento"
+
+msgid "Event tokens"
+msgstr "Tokens de eventos"
+
+msgid "Exchange rate"
+msgstr "Tipo de cambio"
+
+msgid "Exchange rates"
+msgstr "Tipos de cambio"
+
+msgid "File export"
+msgstr "Exportación de archivo"
+
+msgid "File exports"
+msgstr "Exportaciones de archivos"
+
+msgid "File upload audit"
+msgstr "Auditoría de carga de archivo"
+
+msgid "File upload audits"
+msgstr "Auditorías de carga de archivos"
+
+msgid "File upload question"
+msgstr "Pregunta con archivo adjunto"
+
+msgid "File upload questions"
+msgstr "Preguntas con archivos adjuntos"
+
+msgid "Free text question"
+msgstr "Pregunta de texto libre"
+
+msgid "Free text questions"
+msgstr "Preguntas de texto libre"
+
+msgid "Google SSO User"
+msgstr "Usuario de acceso con Google"
+
+msgid "Google SSO Users"
+msgstr "Usuarios de acceso con Google"
+
+msgid "Grant"
+msgstr "Autorización concedida"
+
+msgid "Grants"
+msgstr "Autorizaciones concedidas"
+
+msgid "Group result"
+msgstr "Resultado de grupo"
+
+msgid "Group results"
+msgstr "Resultados de grupos"
+
+msgid "Held series pass"
+msgstr "Abono adquirido"
+
+msgid "Held series passs"
+msgstr "Abonos adquiridos"
+
+msgid "Id token"
+msgstr "Token de identidad"
+
+msgid "Id tokens"
+msgstr "Tokens de identidad"
+
+msgid "Import job"
+msgstr "Tarea de importación"
+
+msgid "Import jobs"
+msgstr "Tareas de importación"
+
+msgid "Membership payment"
+msgstr "Pago de membresía"
+
+msgid "Membership payments"
+msgstr "Pagos de membresías"
+
+msgid "Membership subscription"
+msgstr "Suscripción de membresía"
+
+msgid "Membership subscriptions"
+msgstr "Suscripciones de membresía"
+
+msgid "Membership subscription plan"
+msgstr "Plan de suscripción de membresía"
+
+msgid "Membership subscription plans"
+msgstr "Planes de suscripción de membresía"
+
+msgid "Membership tier"
+msgstr "Nivel de membresía"
+
+msgid "Membership tiers"
+msgstr "Niveles de membresía"
+
+msgid "Multiple choice option"
+msgstr "Opción de selección múltiple"
+
+msgid "Multiple choice options"
+msgstr "Opciones de selección múltiple"
+
+msgid "Multiple choice question"
+msgstr "Pregunta de selección múltiple"
+
+msgid "Multiple choice questions"
+msgstr "Preguntas de selección múltiple"
+
+msgid "O auth application"
+msgstr "Aplicación OAuth"
+
+msgid "O auth applications"
+msgstr "Aplicaciones OAuth"
+
+msgid "Organization contact message"
+msgstr "Mensaje de contacto de organización"
+
+msgid "Organization contact messages"
+msgstr "Mensajes de contacto de organizaciones"
+
+msgid "Organization follow"
+msgstr "Seguimiento de organización"
+
+msgid "Organization follows"
+msgstr "Seguimientos de organizaciones"
+
+msgid "Organization membership request"
+msgstr "Solicitud de membresía de organización"
+
+msgid "Organization membership requests"
+msgstr "Solicitudes de membresía de organizaciones"
+
+msgid "Organization nudge"
+msgstr "Recordatorio de organización"
+
+msgid "Organization nudges"
+msgstr "Recordatorios de organizaciones"
+
+msgid "Organization questionnaire"
+msgstr "Cuestionario de organización"
+
+msgid "Organization questionnaires"
+msgstr "Cuestionarios de organizaciones"
+
+msgid "Organization token"
+msgstr "Token de organización"
+
+msgid "Organization tokens"
+msgstr "Tokens de organizaciones"
+
+msgid "Outstanding token"
+msgstr "Token vigente"
+
+msgid "Outstanding tokens"
+msgstr "Tokens vigentes"
+
+msgid "Pending event invitation"
+msgstr "Invitación a evento pendiente"
+
+msgid "Pending event invitations"
+msgstr "Invitaciones a eventos pendientes"
+
+msgid "Platform connection"
+msgstr "Conexión de plataforma"
+
+msgid "Platform connections"
+msgstr "Conexiones de plataforma"
+
+msgid "Platform fee credit note"
+msgstr "Nota de crédito por comisión de plataforma"
+
+msgid "Platform fee credit notes"
+msgstr "Notas de crédito por comisiones de plataforma"
+
+msgid "Platform fee invoice"
+msgstr "Factura por comisión de plataforma"
+
+msgid "Platform fee invoices"
+msgstr "Facturas por comisiones de plataforma"
+
+msgid "Potluck item"
+msgstr "Aporte compartido"
+
+msgid "Potluck items"
+msgstr "Aportes compartidos"
+
+msgid "Quarantined file"
+msgstr "Archivo en cuarentena"
+
+msgid "Quarantined files"
+msgstr "Archivos en cuarentena"
+
+msgid "Questionnaire evaluation"
+msgstr "Evaluación de cuestionario"
+
+msgid "Questionnaire evaluations"
+msgstr "Evaluaciones de cuestionarios"
+
+msgid "Questionnaire file"
+msgstr "Archivo de cuestionario"
+
+msgid "Questionnaire files"
+msgstr "Archivos de cuestionarios"
+
+msgid "Questionnaire section"
+msgstr "Sección de cuestionario"
+
+msgid "Questionnaire sections"
+msgstr "Secciones de cuestionarios"
+
+msgid "Questionnaire submission"
+msgstr "Respuesta a cuestionario"
+
+msgid "Questionnaire submissions"
+msgstr "Respuestas a cuestionarios"
+
+msgid "Recurrence rule"
+msgstr "Regla de recurrencia"
+
+msgid "Recurrence rules"
+msgstr "Reglas de recurrencia"
+
+msgid "Referral application"
+msgstr "Solicitud al programa de referidos"
+
+msgid "Referral applications"
+msgstr "Solicitudes al programa de referidos"
+
+msgid "Referral code"
+msgstr "Código de referido"
+
+msgid "Referral codes"
+msgstr "Códigos de referidos"
+
+msgid "Referral payout"
+msgstr "Liquidación de referidos"
+
+msgid "Referral payouts"
+msgstr "Liquidaciones de referidos"
+
+msgid "Referral payout statement"
+msgstr "Comprobante de liquidación de referidos"
+
+msgid "Referral payout statements"
+msgstr "Comprobantes de liquidaciones de referidos"
+
+msgid "Refresh token"
+msgstr "Token de renovación"
+
+msgid "Refresh tokens"
+msgstr "Tokens de renovación"
+
+msgid "Reserved slug token"
+msgstr "Reserva de identificador URL"
+
+msgid "Reserved slug tokens"
+msgstr "Reservas de identificadores URL"
+
+msgid "Series pass"
+msgstr "Abono de serie"
+
+msgid "Series passs"
+msgstr "Abonos de serie"
+
+msgid "Series pass tier link"
+msgstr "Vínculo entre abono y tarifa"
+
+msgid "Series pass tier links"
+msgstr "Vínculos entre abonos y tarifas"
+
+msgid "Stripe webhook event"
+msgstr "Evento de webhook de Stripe"
+
+msgid "Stripe webhook events"
+msgstr "Eventos de webhook de Stripe"
+
+msgid "Tag assignment"
+msgstr "Asignación de etiqueta"
+
+msgid "Tag assignments"
+msgstr "Asignaciones de etiquetas"
+
+msgid "Task result"
+msgstr "Resultado de tarea"
+
+msgid "Task results"
+msgstr "Resultados de tareas"
+
+msgid "Telegram user"
+msgstr "Usuario de Telegram"
+
+msgid "Telegram users"
+msgstr "Usuarios de Telegram"
+
+msgid "Tier link"
+msgstr "Vínculo de tarifa"
+
+msgid "Tier links"
+msgstr "Vínculos de tarifas"
+
+msgid "User data export"
+msgstr "Exportación de datos de usuario"
+
+msgid "User data exports"
+msgstr "Exportaciones de datos de usuarios"
+
+msgid "Waitlist offer"
+msgstr "Oferta de lista de espera"
+
+msgid "Waitlist offers"
+msgstr "Ofertas de lista de espera"
+
+msgid "Webhook delivery"
+msgstr "Entrega de webhook"
+
+msgid "Webhook deliverys"
+msgstr "Entregas de webhooks"
+
+msgid "Announcement"
+msgstr "Comunicado"
+
+msgid "Default User Preferences"
+msgstr "Preferencias predeterminadas de usuarios"
+
+msgid "Email Suppression"
+msgstr "Supresión de correo"
+
+msgid "Email Verification Reminder Tracking"
+msgstr "Seguimiento de recordatorios de verificación de correo"
+
+msgid "Event seriess"
+msgstr "Series de eventos"
+
+msgid "Impersonation Log"
+msgstr "Registro de suplantación administrativa"
+
+msgid "Legal Documentss"
+msgstr "Documentos legales"
+
+msgid "Notification"
+msgstr "Notificación"
+
+msgid "Notification Delivery"
+msgstr "Entrega de notificación"
+
+msgid "Notification Preference"
+msgstr "Preferencia de notificación"
+
+msgid "Organization staffs"
+msgstr "Equipos de organizaciones"
+
+msgid "Poll"
+msgstr "Encuesta"
+
+msgid "Tag"
+msgstr "Etiqueta"
+
+msgid "User Billing Profile"
+msgstr "Perfil de facturación de usuario"
+
+msgid "Whitelist Request"
+msgstr "Solicitud de lista de admitidos"

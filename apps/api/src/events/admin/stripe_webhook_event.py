@@ -2,8 +2,8 @@
 
 from django.contrib import admin
 from django.http import HttpRequest
-from unfold.admin import ModelAdmin
 
+from common.admin_localization import ModelAdmin
 from events import models
 
 

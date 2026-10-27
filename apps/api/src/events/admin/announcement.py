@@ -5,9 +5,10 @@ import typing as t
 
 from django.contrib import admin
 from django.utils.safestring import mark_safe
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
+from common.admin_localization import ModelAdmin
 from events import models
 from events.admin.base import (
     EventLinkMixin,
@@ -43,13 +44,13 @@ class AnnouncementAdmin(ModelAdmin, OrganizationLinkMixin, EventLinkMixin):  # t
     date_hierarchy = "created_at"
     fieldsets = [
         (None, {"fields": ["organization", "title", "body", "created_by"]}),
-        ("Targeting", {"fields": ["event", "target_all_members", "target_tiers", "target_staff_only"]}),
-        ("Settings", {"fields": ["past_visibility"]}),
-        ("Status", {"fields": ["status", "sent_at", "recipient_count"]}),
-        ("Metadata", {"fields": [("created_at", "updated_at")]}),
+        (_("Targeting"), {"fields": ["event", "target_all_members", "target_tiers", "target_staff_only"]}),
+        (_("Settings"), {"fields": ["past_visibility"]}),
+        (_("Status"), {"fields": ["status", "sent_at", "recipient_count"]}),
+        (_("Metadata"), {"fields": [("created_at", "updated_at")]}),
     ]
 
-    @admin.display(description="Target")
+    @admin.display(description=_("Target"))
     def target_display(self, obj: models.Announcement) -> str:
         if obj.event:
             name = obj.event.name[:30]
@@ -65,7 +66,7 @@ class AnnouncementAdmin(ModelAdmin, OrganizationLinkMixin, EventLinkMixin):  # t
             return f"{tier_count} tier(s)"
         return "—"
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.Announcement) -> str:
         colors: dict[str, str] = {
             models.Announcement.AnnouncementStatus.DRAFT: "orange",

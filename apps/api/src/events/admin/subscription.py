@@ -2,8 +2,8 @@
 
 from django.contrib import admin
 from simple_history.admin import SimpleHistoryAdmin
-from unfold.admin import ModelAdmin
 
+from common.admin_localization import ModelAdmin
 from events import models
 from events.admin.base import OrganizationLinkMixin, UserLinkMixin
 

@@ -6,8 +6,9 @@ import typing as t
 from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 
+from common.admin_localization import ModelAdmin
 from common.signing import get_file_url
 from events import models
 from events.admin.base import EmailDeliveryAdminMixin, OrganizationLinkMixin
@@ -82,36 +83,36 @@ class AttendeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationLink
             {"fields": ["id", "invoice_number", "organization", "event", "user", "status", "issued_at", "pdf_link"]},
         ),
         (
-            "Delivery",
+            _("Delivery"),
             {"fields": ["email_sent_at", "email_delivery_failed_at", "email_delivery_error"]},
         ),
         (
-            "Amounts",
+            _("Amounts"),
             {"fields": ["total_net", "total_vat", "vat_rate", "total_gross", "currency", "reverse_charge"]},
         ),
         (
-            "Discount",
+            _("Discount"),
             {"fields": ["discount_code_text", "discount_amount_total"]},
         ),
         (
-            "Seller Snapshot",
+            _("Seller Snapshot"),
             {"fields": ["seller_name", "seller_vat_id", "seller_vat_country", "seller_address", "seller_email"]},
         ),
         (
-            "Buyer Snapshot",
+            _("Buyer Snapshot"),
             {"fields": ["buyer_name", "buyer_vat_id", "buyer_vat_country", "buyer_address", "buyer_email"]},
         ),
         (
-            "Technical",
+            _("Technical"),
             {"fields": ["stripe_session_id", "line_items"]},
         ),
     ]
 
-    @admin.display(description="Total")
+    @admin.display(description=_("Total"))
     def total_display(self, obj: models.AttendeeInvoice) -> str:
         return f"{obj.total_gross} {obj.currency}"
 
-    @admin.display(description="VAT")
+    @admin.display(description=_("VAT"))
     def vat_display(self, obj: models.AttendeeInvoice) -> str:
         if obj.reverse_charge:
             return "RC"
@@ -121,7 +122,7 @@ class AttendeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationLink
             return f"{obj.total_vat} (mixed)"
         return f"{obj.total_vat} ({obj.vat_rate}%)"
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.AttendeeInvoice) -> str:
         colors: dict[t.Any, str] = {
             models.AttendeeInvoice.InvoiceStatus.DRAFT: "gray",
@@ -131,11 +132,11 @@ class AttendeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationLink
         color = colors.get(obj.status, "gray")
         return format_html('<span style="color: {};">{}</span>', color, obj.get_status_display())
 
-    @admin.display(description="RC", boolean=True)
+    @admin.display(description=_("RC"), boolean=True)
     def reverse_charge_display(self, obj: models.AttendeeInvoice) -> bool:
         return obj.reverse_charge
 
-    @admin.display(description="PDF")
+    @admin.display(description=_("PDF"))
     def pdf_link(self, obj: models.AttendeeInvoice) -> str:
         if url := get_file_url(obj.pdf_file):
             return format_html('<a href="{}" target="_blank" rel="noopener noreferrer">Download PDF</a>', url)
@@ -186,11 +187,11 @@ class AttendeeInvoiceCreditNoteAdmin(ModelAdmin, EmailDeliveryAdminMixin):  # ty
 
         deliver_attendee_credit_note_task.delay(str(obj.id))
 
-    @admin.display(description="Invoice")
+    @admin.display(description=_("Invoice"))
     def invoice_link(self, obj: models.AttendeeInvoiceCreditNote) -> str:
         url = reverse("admin:events_attendeeinvoice_change", args=[obj.invoice_id])
         return format_html('<a href="{}">{}</a>', url, obj.invoice.invoice_number)
 
-    @admin.display(description="Amount (gross)")
+    @admin.display(description=_("Amount (gross)"))
     def amount_display(self, obj: models.AttendeeInvoiceCreditNote) -> str:
         return f"{obj.amount_gross} {obj.invoice.currency}"

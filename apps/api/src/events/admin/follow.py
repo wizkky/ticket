@@ -1,8 +1,8 @@
 """Admin classes for the organization/event-series follow models."""
 
 from django.contrib import admin
-from unfold.admin import ModelAdmin
 
+from common.admin_localization import ModelAdmin
 from events import models
 from events.admin.base import OrganizationLinkMixin, UserLinkMixin
 

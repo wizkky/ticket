@@ -46,13 +46,13 @@ SYSTEM_TESTING = config("SYSTEM_TESTING", default=False, cast=bool)
 # Application definition
 
 INSTALLED_APPS = [
-    "unfold",  # needs to be at the top
+    "unfold.apps.BasicAppConfig",  # custom admin site configured below
     "unfold.contrib.filters",
     "unfold.contrib.forms",
     "unfold.contrib.inlines",
     "unfold.contrib.guardian",
     "unfold.contrib.simple_history",
-    "django.contrib.admin",
+    "common.admin_site.CaudalAdminConfig",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
@@ -206,7 +206,7 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/5.2/topics/i18n/
 
-LANGUAGE_CODE = "en"
+LANGUAGE_CODE = "es"
 
 LANGUAGES = [
     ("en", "English"),

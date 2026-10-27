@@ -1,0 +1,7 @@
+{# Adapted from django-unfold (MIT); Spanish presentation labels. #}
+{% load admin_labels %}
+{% load unfold %}
+
+<label for="{{ field.id_for_label }}" class="block {% if field.field.widget|class_name != "UnfoldBooleanWidget" %}font-semibold text-important whitespace-nowrap{% endif %}">
+    {% if has_label %}{% if label %}{{ label|caudal_label }}{% endif %}{% else %}{{ field.label|caudal_label }}{% endif %}{% if field.field.required %}<span class="text-red-600 dark:text-red-500">*</span>{% endif %}
+</label>

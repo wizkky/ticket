@@ -21,12 +21,14 @@ from django.contrib import admin
 from django.http import HttpRequest, HttpResponseRedirect
 from django.shortcuts import redirect
 from django.urls import include, path, reverse
+from django.utils.text import format_lazy
+from django.utils.translation import gettext_lazy as _
 
 from api.api import api
 
 admin.site.name = f"{settings.SITE_NAME} v{settings.VERSION}"
-admin.site.index_title = f"Welcome to {settings.SITE_NAME} v{settings.VERSION} Admin"
-admin.site.site_title = f"{settings.SITE_NAME} v{settings.VERSION} Admin"
+admin.site.index_title = format_lazy(_("Welcome to {site_name} administration"), site_name=settings.SITE_NAME)
+admin.site.site_title = format_lazy(_("{site_name} administration"), site_name=settings.SITE_NAME)
 
 
 def redirect_to_docs(request: HttpRequest) -> HttpResponseRedirect:

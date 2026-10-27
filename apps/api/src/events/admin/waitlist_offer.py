@@ -1,8 +1,8 @@
 """Django admin for WaitlistOffer."""
 
 from django.contrib import admin
-from unfold.admin import ModelAdmin
 
+from common.admin_localization import ModelAdmin
 from events import models
 
 from .base import EventLinkMixin, UserLinkMixin

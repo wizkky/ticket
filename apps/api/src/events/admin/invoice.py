@@ -7,8 +7,9 @@ from django.contrib import admin
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 
+from common.admin_localization import ModelAdmin
 from common.signing import get_file_url
 from events import models
 from events.admin.base import EmailDeliveryAdminMixin, OrganizationLinkMixin
@@ -67,38 +68,38 @@ class PlatformFeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationL
 
     fieldsets = [
         (None, {"fields": ["id", "invoice_number", "organization", "status", "issued_at", "pdf_link"]}),
-        ("Delivery", {"fields": ["email_sent_at", "email_delivery_failed_at", "email_delivery_error"]}),
-        ("Period", {"fields": ["period_start", "period_end", "currency"]}),
+        (_("Delivery"), {"fields": ["email_sent_at", "email_delivery_failed_at", "email_delivery_error"]}),
+        (_("Period"), {"fields": ["period_start", "period_end", "currency"]}),
         (
-            "Fee Breakdown",
+            _("Fee Breakdown"),
             {"fields": ["fee_net", "fee_vat", "fee_vat_rate", "fee_gross", "reverse_charge"]},
         ),
         (
-            "Organization Snapshot",
+            _("Organization Snapshot"),
             {"fields": ["org_name", "org_vat_id", "org_vat_country", "org_address"]},
         ),
         (
-            "Platform Snapshot",
+            _("Platform Snapshot"),
             {"fields": ["platform_business_name", "platform_business_address", "platform_vat_id"]},
         ),
-        ("Aggregate Stats", {"fields": ["total_tickets", "total_ticket_revenue"]}),
+        (_("Aggregate Stats"), {"fields": ["total_tickets", "total_ticket_revenue"]}),
     ]
 
-    @admin.display(description="Period")
+    @admin.display(description=_("Period"))
     def period_label(self, obj: models.PlatformFeeInvoice) -> str:
         return obj.period_start.strftime("%B %Y")
 
-    @admin.display(description="Fee (gross)")
+    @admin.display(description=_("Fee (gross)"))
     def fee_display(self, obj: models.PlatformFeeInvoice) -> str:
         return f"{obj.fee_gross} {obj.currency}"
 
-    @admin.display(description="VAT")
+    @admin.display(description=_("VAT"))
     def vat_display(self, obj: models.PlatformFeeInvoice) -> str:
         if obj.reverse_charge:
             return "RC"
         return f"{obj.fee_vat} ({obj.fee_vat_rate}%)"
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.PlatformFeeInvoice) -> str:
         colors: dict[t.Any, str] = {
             models.PlatformFeeInvoice.InvoiceStatus.DRAFT: "gray",
@@ -109,11 +110,11 @@ class PlatformFeeInvoiceAdmin(ModelAdmin, EmailDeliveryAdminMixin, OrganizationL
         color = colors.get(obj.status, "gray")
         return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
 
-    @admin.display(description="RC", boolean=True)
+    @admin.display(description=_("RC"), boolean=True)
     def reverse_charge_display(self, obj: models.PlatformFeeInvoice) -> bool:
         return obj.reverse_charge
 
-    @admin.display(description="PDF")
+    @admin.display(description=_("PDF"))
     def pdf_link(self, obj: models.PlatformFeeInvoice) -> str:
         if url := get_file_url(obj.pdf_file):
             return format_html('<a href="{}" target="_blank" rel="noopener noreferrer">Download PDF</a>', url)
@@ -154,11 +155,11 @@ class PlatformFeeCreditNoteAdmin(ModelAdmin):  # type: ignore[misc]
     date_hierarchy = "created_at"
     ordering = ["-created_at"]
 
-    @admin.display(description="Invoice")
+    @admin.display(description=_("Invoice"))
     def invoice_link(self, obj: models.PlatformFeeCreditNote) -> str:
         url = reverse("admin:events_platformfeeinvoice_change", args=[obj.invoice_id])
         return format_html('<a href="{}">{}</a>', url, obj.invoice.invoice_number)
 
-    @admin.display(description="Fee (gross)")
+    @admin.display(description=_("Fee (gross)"))
     def fee_display(self, obj: models.PlatformFeeCreditNote) -> str:
         return str(obj.fee_gross)

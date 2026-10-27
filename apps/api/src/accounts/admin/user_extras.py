@@ -9,9 +9,9 @@ from django.contrib import admin
 from django.db.models import Exists, OuterRef, QuerySet
 from django.http import HttpRequest
 from django.utils.translation import gettext_lazy as _
-from unfold.admin import TabularInline
 
 from accounts.models import ExternalIdentity, GlobalBan, ReferralCode, RevelUser
+from common.admin_localization import TabularInline
 
 
 class ReferralCodeInline(TabularInline):  # type: ignore[misc]

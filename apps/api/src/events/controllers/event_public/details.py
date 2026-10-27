@@ -96,23 +96,6 @@ class EventPublicDetailsController(EventPublicBaseController):
         return params.filter(qs).distinct()
 
     @route.get(
-        "/{uuid:event_id}/dietary-summary",
-        url_name="event_dietary_summary",
-        response=schema.EventDietarySummarySchema,
-        auth=I18nJWTAuth(),
-    )
-    def get_dietary_summary(self, event_id: UUID) -> schema.EventDietarySummarySchema:
-        """Get aggregated dietary restrictions and preferences for event attendees.
-
-        Returns de-identified, aggregated dietary information to help with meal planning for events
-        and potlucks. Event organizers/staff see all dietary data (public + private). Regular attendees
-        only see data marked as public by other attendees. Data includes counts of restrictions/preferences
-        and non-empty notes/comments, but no user associations for privacy.
-        """
-        event = self.get_one(event_id)
-        return event_service.get_event_dietary_summary(event, self.user())
-
-    @route.get(
         "/{uuid:event_id}/pronoun-distribution",
         url_name="event_pronoun_distribution",
         response=schema.EventPronounDistributionSchema,

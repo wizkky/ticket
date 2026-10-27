@@ -1,9 +1,9 @@
 """Django admin for the polls app."""
 
 from django.contrib import admin
-from unfold.admin import ModelAdmin
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
+from common.admin_localization import ModelAdmin
 from polls.models import Poll
 
 

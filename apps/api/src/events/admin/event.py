@@ -9,9 +9,10 @@ from django.db.models.functions import Coalesce
 from django.urls import reverse
 from django.utils.html import format_html
 from django.utils.safestring import mark_safe
-from unfold.admin import ModelAdmin
+from django.utils.translation import gettext_lazy as _
 from unfold.contrib.filters.admin import AutocompleteSelectFilter
 
+from common.admin_localization import ModelAdmin
 from events import models
 from events.admin.base import (
     EventInvitationInline,
@@ -60,14 +61,14 @@ class EventAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
     ordering = ["-start"]
 
     tabs = [
-        ("Details", ["Details"]),
-        ("Attendees", ["RSVPs", "Tickets", "Invitations", "Waitlist"]),
-        ("Configuration", ["Tiers & Resources"]),
+        (_("Details"), ["Details"]),
+        (_("Attendees"), ["RSVPs", "Tickets", "Invitations", "Waitlist"]),
+        (_("Configuration"), ["Tiers & Resources"]),
     ]
 
     fieldsets = [
         (
-            "Details",
+            _("Details"),
             {
                 "fields": (
                     "organization",
@@ -81,7 +82,7 @@ class EventAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Configuration",
+            _("Configuration"),
             {
                 "fields": (
                     ("event_type", "visibility", "status"),
@@ -105,7 +106,7 @@ class EventAdmin(ModelAdmin, OrganizationLinkMixin):  # type: ignore[misc]
             },
         ),
         (
-            "Waitlist",
+            _("Waitlist"),
             {
                 "fields": (
                     "waitlist_open",
@@ -161,7 +162,7 @@ class EventInvitationAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: 
         """Prefetch tiers to avoid N+1 queries in list display."""
         return super().get_queryset(request).prefetch_related("tiers")
 
-    @admin.display(description="Tiers")
+    @admin.display(description=_("Tiers"))
     def tier_names(self, obj: models.EventInvitation) -> str:
         names = [tier.name for tier in obj.tiers.all()]
         return ", ".join(names) if names else "—"
@@ -201,7 +202,7 @@ class PendingEventInvitationAdmin(ModelAdmin, EventLinkMixin):  # type: ignore[m
         """Prefetch tiers to avoid N+1 queries in list display."""
         return super().get_queryset(request).prefetch_related("tiers")
 
-    @admin.display(description="Tiers")
+    @admin.display(description=_("Tiers"))
     def tier_names(self, obj: models.PendingEventInvitation) -> str:
         names = [tier.name for tier in obj.tiers.all()]
         return ", ".join(names) if names else "—"
@@ -226,12 +227,12 @@ class EventTokenAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  # type: ignor
     readonly_fields = ["id", "created_at", "updated_at"]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Issuer")
+    @admin.display(description=_("Issuer"))
     def issuer_link(self, obj: models.EventToken) -> str:
         url = reverse("admin:accounts_reveluser_change", args=[obj.issuer.id])
         return format_html('<a href="{}">{}</a>', url, obj.issuer.username)
 
-    @admin.display(description="Uses")
+    @admin.display(description=_("Uses"))
     def uses_display(self, obj: models.EventToken) -> str:
         if obj.max_uses > 0:
             return f"{obj.uses} / {obj.max_uses}"
@@ -256,7 +257,7 @@ class EventInvitationRequestAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  #
     readonly_fields = ["created_at", "updated_at"]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Status")
+    @admin.display(description=_("Status"))
     def status_display(self, obj: models.EventInvitationRequest) -> str:
         colors: dict[t.Any, str] = {
             models.EventInvitationRequest.InvitationRequestStatus.PENDING: "orange",
@@ -266,7 +267,7 @@ class EventInvitationRequestAdmin(ModelAdmin, UserLinkMixin, EventLinkMixin):  #
         color = colors.get(obj.status, "gray")
         return mark_safe(f'<span style="color: {color};">{obj.get_status_display()}</span>')
 
-    @admin.display(description="Decided By")
+    @admin.display(description=_("Decided By"))
     def decided_by_link(self, obj: models.EventInvitationRequest) -> str | None:
         if not obj.decided_by:
             return "—"
@@ -327,7 +328,7 @@ class PotluckItemAdmin(ModelAdmin, EventLinkMixin):  # type: ignore[misc]
     readonly_fields = ["created_at", "updated_at"]
     date_hierarchy = "created_at"
 
-    @admin.display(description="Assignee")
+    @admin.display(description=_("Assignee"))
     def assignee_link(self, obj: models.PotluckItem) -> str | None:
         if not obj.assignee:
             return "Unassigned"

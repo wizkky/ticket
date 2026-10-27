@@ -4,9 +4,11 @@ from django.contrib import admin
 from django.db.models import F, OuterRef, Subquery
 from django.urls import reverse
 from django.utils.html import format_html
+from django.utils.translation import gettext_lazy as _
 from simple_history.admin import SimpleHistoryAdmin
 from solo.admin import SingletonModelAdmin
-from unfold.admin import ModelAdmin
+
+from common.admin_localization import ModelAdmin
 
 from . import models
 from .signing import get_file_url
@@ -63,11 +65,11 @@ class SiteSettingsAdmin(SingletonModelAdmin, SimpleHistoryAdmin, ModelAdmin):  #
     ]
     readonly_fields = ["created_at", "updated_at"]
     fieldsets = (
-        ("Notifications", {"fields": ("notify_user_joined", "notify_organization_created", "live_emails")}),
-        ("Data Management", {"fields": ("data_retention_days",)}),
-        ("URLs & Emails", {"fields": ("frontend_base_url", "internal_catchall_email")}),
+        (_("Notifications"), {"fields": ("notify_user_joined", "notify_organization_created", "live_emails")}),
+        (_("Data Management"), {"fields": ("data_retention_days",)}),
+        (_("URLs & Emails"), {"fields": ("frontend_base_url", "internal_catchall_email")}),
         (
-            "Platform Billing",
+            _("Platform Billing"),
             {
                 "fields": (
                     "platform_business_name",
@@ -79,10 +81,10 @@ class SiteSettingsAdmin(SingletonModelAdmin, SimpleHistoryAdmin, ModelAdmin):  #
                 ),
             },
         ),
-        ("Public Links", {"fields": ("demo_booking_url",)}),
-        ("Referral Program", {"fields": ("referral_applications_enabled",)}),
+        (_("Public Links"), {"fields": ("demo_booking_url",)}),
+        (_("Referral Program"), {"fields": ("referral_applications_enabled",)}),
         (
-            "Maintenance Banner",
+            _("Maintenance Banner"),
             {
                 "fields": (
                     "maintenance_message",
@@ -93,7 +95,7 @@ class SiteSettingsAdmin(SingletonModelAdmin, SimpleHistoryAdmin, ModelAdmin):  #
                 "description": "Configure a maintenance banner shown to all users. Leave the message blank to disable.",
             },
         ),
-        ("Timestamps", {"fields": ("created_at", "updated_at")}),
+        (_("Timestamps"), {"fields": ("created_at", "updated_at")}),
     )
 
 
@@ -146,7 +148,7 @@ class FileExportAdmin(ModelAdmin):  # type: ignore[misc]
     date_hierarchy = "created_at"
     ordering = ["-created_at"]
 
-    @admin.display(description="Error")
+    @admin.display(description=_("Error"))
     def error_preview(self, obj: models.FileExport) -> str:
         if obj.error_message:
             return obj.error_message[:80] + ("…" if len(obj.error_message) > 80 else "")

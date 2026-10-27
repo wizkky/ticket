@@ -1,8 +1,8 @@
 """Admin class for the event bookmark model."""
 
 from django.contrib import admin
-from unfold.admin import ModelAdmin
 
+from common.admin_localization import ModelAdmin
 from events import models
 from events.admin.base import EventLinkMixin, UserLinkMixin
 

@@ -16,8 +16,8 @@ from django.http import HttpRequest
 from django.utils.translation import gettext_lazy as _
 from oauth2_provider.admin import AccessTokenAdmin, ApplicationAdmin, GrantAdmin, IDTokenAdmin, RefreshTokenAdmin
 from oauth2_provider.settings import oauth2_settings
-from unfold.admin import ModelAdmin
 
+from common.admin_localization import ModelAdmin
 from oauth.models import OAuthApplication
 from oauth.service import token_service
 

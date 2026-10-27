@@ -11,9 +11,10 @@ from django.db.models import QuerySet
 from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.html import format_html
-from unfold.admin import TabularInline
+from django.utils.translation import gettext_lazy as _
 from unfold.widgets import CHECKBOX_CLASSES
 
+from common.admin_localization import TabularInline
 from events import models
 
 
@@ -54,7 +55,7 @@ class EmailDeliveryAdminMixin:
     # Fields to expose read-only on the change form (add to a "Delivery" fieldset).
     email_delivery_fields = ["email_sent_at", "email_delivery_failed_at", "email_delivery_error"]
 
-    @admin.display(description="Delivery")
+    @admin.display(description=_("Delivery"))
     def delivery_status(self, obj: t.Any) -> str:
         if obj.email_sent_at:
             return format_html('<span style="color: green;">Sent</span>')
@@ -69,7 +70,7 @@ class EmailDeliveryAdminMixin:
         """Re-dispatch the delivery task for ``obj``. Implemented per model."""
         raise NotImplementedError
 
-    @admin.action(description="Retry delivery (clear undeliverable state)")
+    @admin.action(description=_("Retry delivery (clear undeliverable state)"))
     def retry_delivery(self, request: HttpRequest, queryset: QuerySet[t.Any]) -> None:
         count = 0
         for obj in queryset.filter(email_delivery_failed_at__isnull=False):
